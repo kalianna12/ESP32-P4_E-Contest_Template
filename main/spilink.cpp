@@ -9,7 +9,8 @@
 #include "esp_lv_adapter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "lvgl.h"
+
+#include "ui/test_screen.h"
 
 namespace {
 
@@ -24,48 +25,49 @@ constexpr TickType_t SPI_RX_TIMEOUT_TICKS = pdMS_TO_TICKS(200);
 
 constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
-constexpr uint8_t kFrameTypeVoltageMv = 0x02;
-constexpr uint8_t kPayloadLen = 0x04;
+constexpr uint8_t kFrameTypeAdcStatus = 0x10;
+constexpr uint8_t kPayloadLen = 48;
 
-constexpr size_t kFrameLen = 9;
+constexpr size_t kFrameHeaderLen = 4;
+constexpr size_t kFrameLen = kFrameHeaderLen + kPayloadLen + 1;
 
-// 保留 64 字节 transaction buffer。
-// 不要改成 9 或 16。STM32 只发前 9 字节，P4 只解析前 9 字节。
 constexpr size_t kDmaAlign = 64;
 constexpr size_t kRxBufferLen = 64;
 constexpr size_t kTxBufferLen = 64;
-
-constexpr uint32_t kDisplayUpdateIntervalMs = 100;
 
 bool spi_ready = false;
 uint8_t *rx_buffer = nullptr;
 uint8_t *tx_buffer = nullptr;
 
-uint32_t last_value_mv = 0;
 uint32_t ok_count = 0;
 uint32_t err_count = 0;
 uint32_t timeout_count = 0;
 
-TickType_t last_display_tick = 0;
-
-lv_obj_t *line1_label = nullptr;
-lv_obj_t *line2_label = nullptr;
-lv_obj_t *line3_label = nullptr;
-
-uint8_t Checksum(const uint8_t *frame)
+uint8_t Checksum(const uint8_t *frame, size_t len)
 {
     uint8_t checksum = 0;
-
-    for (size_t i = 0; i < 8; ++i) {
+    for (size_t i = 0; i < len; ++i) {
         checksum ^= frame[i];
     }
-
     return checksum;
 }
 
-bool ParseVoltageMvFrame(const uint8_t *frame, size_t len, uint32_t *value_mv)
+uint32_t GetU32(const uint8_t *buffer, size_t offset)
 {
-    if (frame == nullptr || value_mv == nullptr || len < kFrameLen) {
+    return static_cast<uint32_t>(buffer[offset + 0]) |
+           (static_cast<uint32_t>(buffer[offset + 1]) << 8) |
+           (static_cast<uint32_t>(buffer[offset + 2]) << 16) |
+           (static_cast<uint32_t>(buffer[offset + 3]) << 24);
+}
+
+int32_t GetI32(const uint8_t *buffer, size_t offset)
+{
+    return static_cast<int32_t>(GetU32(buffer, offset));
+}
+
+bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
+{
+    if (frame == nullptr || out == nullptr || len < kFrameLen) {
         return false;
     }
 
@@ -73,121 +75,42 @@ bool ParseVoltageMvFrame(const uint8_t *frame, size_t len, uint32_t *value_mv)
         return false;
     }
 
-    if (frame[2] != kFrameTypeVoltageMv || frame[3] != kPayloadLen) {
+    if (frame[2] != kFrameTypeAdcStatus || frame[3] != kPayloadLen) {
         return false;
     }
 
-    if (frame[8] != Checksum(frame)) {
+    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
+
+    if (rx_checksum != expected_checksum) {
         return false;
     }
 
-    *value_mv = static_cast<uint32_t>(frame[4]) |
-                (static_cast<uint32_t>(frame[5]) << 8) |
-                (static_cast<uint32_t>(frame[6]) << 16) |
-                (static_cast<uint32_t>(frame[7]) << 24);
+    size_t o = 4;
+
+    out->sample_index = GetU32(frame, o);       o += 4;
+    out->total_samples = GetU32(frame, o);      o += 4;
+    out->input_mv = GetU32(frame, o);           o += 4;
+    out->adc_code = GetU32(frame, o);           o += 4;
+    out->adc_bits = GetU32(frame, o);           o += 4;
+    out->progress_permille = GetU32(frame, o);  o += 4;
+
+    out->offset_error_uv = GetI32(frame, o);    o += 4;
+    out->gain_error_ppm = GetI32(frame, o);     o += 4;
+    out->inl_lsb_x1000 = GetI32(frame, o);      o += 4;
+    out->dnl_lsb_x1000 = GetI32(frame, o);      o += 4;
+
+    out->missing_codes = GetU32(frame, o);      o += 4;
+    out->conversion_time_ns = GetU32(frame, o); o += 4;
 
     return true;
-}
-
-bool ShouldUpdateDisplay()
-{
-    const TickType_t now = xTaskGetTickCount();
-    const TickType_t interval = pdMS_TO_TICKS(kDisplayUpdateIntervalMs);
-
-    if ((now - last_display_tick) >= interval) {
-        last_display_tick = now;
-        return true;
-    }
-
-    return false;
-}
-
-void FormatMvAsVolt(char *buffer, size_t buffer_len, uint32_t value_mv)
-{
-    snprintf(buffer,
-             buffer_len,
-             "%lu.%03lu V",
-             static_cast<unsigned long>(value_mv / 1000U),
-             static_cast<unsigned long>(value_mv % 1000U));
-}
-
-void CreateDisplayIfNeeded()
-{
-    if (line1_label != nullptr) {
-        return;
-    }
-
-#if LVGL_VERSION_MAJOR >= 9
-    lv_obj_t *screen = lv_screen_active();
-#else
-    lv_obj_t *screen = lv_scr_act();
-#endif
-
-    lv_obj_t *panel = lv_obj_create(screen);
-    lv_obj_set_size(panel, 360, 150);
-    lv_obj_set_pos(panel, 640, 86);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(panel, 8, LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(panel, lv_color_hex(0x8FD6C8), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x111A24), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
-
-    line1_label = lv_label_create(panel);
-    line2_label = lv_label_create(panel);
-    line3_label = lv_label_create(panel);
-
-    lv_obj_t *labels[] = {line1_label, line2_label, line3_label};
-
-    for (size_t i = 0; i < 3; ++i) {
-        lv_obj_set_style_text_color(labels[i], lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-        lv_obj_set_style_text_font(labels[i], &lv_font_montserrat_20, LV_PART_MAIN);
-        lv_obj_set_pos(labels[i], 16, 16 + static_cast<int32_t>(i) * 40);
-    }
-}
-
-void SpiLink_DisplayText(const char *line1, const char *line2, const char *line3)
-{
-    if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
-        return;
-    }
-
-    CreateDisplayIfNeeded();
-
-    if (line1_label != nullptr && line2_label != nullptr && line3_label != nullptr) {
-        lv_label_set_text(line1_label, line1);
-        lv_label_set_text(line2_label, line2);
-        lv_label_set_text(line3_label, line3);
-    }
-
-    esp_lv_adapter_unlock();
-}
-
-void UpdateDisplay()
-{
-    char voltage_text[32];
-    FormatMvAsVolt(voltage_text, sizeof(voltage_text), last_value_mv);
-
-    char line1[96];
-    char line2[96];
-    char line3[96];
-
-    snprintf(line1, sizeof(line1), "RX: %s", voltage_text);
-    snprintf(line2, sizeof(line2), "mV: %lu",
-             static_cast<unsigned long>(last_value_mv));
-    snprintf(line3, sizeof(line3), "Packets: %lu",
-             static_cast<unsigned long>(ok_count));
-
-    SpiLink_DisplayText(line1, line2, line3);
 }
 
 void PrepareTxBuffer()
 {
     std::memset(tx_buffer, 0x00, kTxBufferLen);
-
-    // 当前 STM32 端可以先不解析 MISO。
     tx_buffer[0] = 0xAC;
-    tx_buffer[1] = 0x4B;  // 'K'
+    tx_buffer[1] = 0x4B;
 }
 
 void FreeBuffers()
@@ -203,22 +126,15 @@ void FreeBuffers()
     }
 }
 
-void HandleValidValue(uint32_t value_mv, size_t rx_bits)
+void UpdateUiWithLock(const adc_ui_status_t &status)
 {
-    last_value_mv = value_mv;
-    ++ok_count;
-
-    ESP_LOGI(TAG,
-             "RX=%lu mV packets=%lu err=%lu timeout=%lu bits=%u",
-             static_cast<unsigned long>(last_value_mv),
-             static_cast<unsigned long>(ok_count),
-             static_cast<unsigned long>(err_count),
-             static_cast<unsigned long>(timeout_count),
-             static_cast<unsigned>(rx_bits));
-
-    if (ShouldUpdateDisplay()) {
-        UpdateDisplay();
+    if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
+        return;
     }
+
+    test_screen_update_measurement(&status);
+
+    esp_lv_adapter_unlock();
 }
 
 }  // namespace
@@ -283,14 +199,10 @@ void SpiLink_Init(void)
         return;
     }
 
-    last_value_mv = 0;
     ok_count = 0;
     err_count = 0;
     timeout_count = 0;
-    last_display_tick = 0;
     spi_ready = true;
-
-    UpdateDisplay();
 
     ESP_LOGI(TAG,
              "SPI slave ready: host=SPI3 MOSI=%d MISO=%d SCLK=%d CS=%d rx_len=%u",
@@ -312,7 +224,7 @@ void SpiLink_Task(void)
     PrepareTxBuffer();
 
     spi_slave_transaction_t trans = {};
-    trans.length = kRxBufferLen * 8;  // 保留 64 字节 transaction
+    trans.length = kRxBufferLen * 8;
     trans.rx_buffer = rx_buffer;
     trans.tx_buffer = tx_buffer;
 
@@ -329,30 +241,40 @@ void SpiLink_Task(void)
 
     if (err != ESP_OK) {
         ++err_count;
-
         ESP_LOGW(TAG,
                  "spi_slave_transmit failed: %s err=%lu",
                  esp_err_to_name(err),
                  static_cast<unsigned long>(err_count));
-
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
 
-    uint32_t value_mv = 0;
+    adc_ui_status_t status = {};
     const size_t rx_bits = static_cast<size_t>(trans.trans_len);
 
-    // 不依赖 trans_len 判断有效性。
-    // 你之前日志里出现过 bits=0 但 rx_buffer 前 9 字节是完整正确帧。
-    if (ParseVoltageMvFrame(rx_buffer, kFrameLen, &value_mv)) {
-        HandleValidValue(value_mv, rx_bits);
+    if (ParseAdcStatusFrame(rx_buffer, kFrameLen, &status)) {
+        ++ok_count;
+
+        status.packets = ok_count;
+        status.frame_errors = err_count;
+        status.timeouts = timeout_count;
+
+        ESP_LOGI(TAG,
+                 "RX ADC status: sample=%lu/%lu vin=%lu mV code=%lu bits=%u",
+                 static_cast<unsigned long>(status.sample_index),
+                 static_cast<unsigned long>(status.total_samples),
+                 static_cast<unsigned long>(status.input_mv),
+                 static_cast<unsigned long>(status.adc_code),
+                 static_cast<unsigned>(rx_bits));
+
+        UpdateUiWithLock(status);
         return;
     }
 
     ++err_count;
 
     ESP_LOGW(TAG,
-             "Invalid SPI frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
+             "Invalid ADC status frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
              static_cast<unsigned>(rx_bits),
              rx_buffer[0],
              rx_buffer[1],
@@ -362,6 +284,5 @@ void SpiLink_Task(void)
              rx_buffer[5],
              rx_buffer[6],
              rx_buffer[7],
-             rx_buffer[8],
              static_cast<unsigned long>(err_count));
 }

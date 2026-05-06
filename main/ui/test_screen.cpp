@@ -7,163 +7,126 @@
 #define TEST_SCREEN_W 1024
 #define TEST_SCREEN_H 600
 
-static lv_obj_t *g_touch_label = nullptr;
-static lv_obj_t *g_log_label = nullptr;
-static lv_obj_t *g_button_count_label = nullptr;
-static lv_obj_t *g_slider_value_label = nullptr;
-static lv_obj_t *g_switch_state_label = nullptr;
+// 颜色
+#define COLOR_BG        0x0B1020
+#define COLOR_LINE      0x334155
+#define COLOR_TEXT      0xF8FAFC
+#define COLOR_SUBTEXT   0xCBD5E1
+#define COLOR_BLUE      0x93C5FD
+#define COLOR_GREEN     0x86EFAC
+#define COLOR_YELLOW    0xFBBF24
+#define COLOR_RED       0xFCA5A5
+
+// 顶部
+static lv_obj_t *g_title = nullptr;
+static lv_obj_t *g_status = nullptr;
+
+// 控制区
+static lv_obj_t *g_btn_start = nullptr;
+static lv_obj_t *g_btn_stop = nullptr;
+static lv_obj_t *g_btn_basic = nullptr;
+static lv_obj_t *g_btn_adv = nullptr;
+
+// 实时数据
+static lv_obj_t *g_input = nullptr;
+static lv_obj_t *g_adc_code = nullptr;
+static lv_obj_t *g_progress = nullptr;
 static lv_obj_t *g_bar = nullptr;
-static lv_obj_t *g_keyboard = nullptr;
+static lv_obj_t *g_sample = nullptr;
 
-static int g_button_count = 0;
+// 静态参数
+static lv_obj_t *g_offset = nullptr;
+static lv_obj_t *g_gain = nullptr;
+static lv_obj_t *g_inl = nullptr;
+static lv_obj_t *g_dnl = nullptr;
+static lv_obj_t *g_missing = nullptr;
+static lv_obj_t *g_conv_time = nullptr;
 
-static void set_log(const char *text)
-{
-    if (g_log_label != nullptr) {
-        lv_label_set_text(g_log_label, text);
-    }
-}
+// 底部
+static lv_obj_t *g_link = nullptr;
+static lv_obj_t *g_hint = nullptr;
 
-static lv_obj_t *create_panel(lv_obj_t *parent, int32_t w, int32_t h)
-{
-    lv_obj_t *panel = lv_obj_create(parent);
-    lv_obj_set_size(panel, w, h);
-    lv_obj_set_style_radius(panel, 12, LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(panel, lv_color_hex(0x3A4658), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x18212F), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    return panel;
-}
-
-static lv_obj_t *create_caption(lv_obj_t *parent, const char *text, int32_t x, int32_t y)
+static lv_obj_t *create_label(lv_obj_t *parent,
+                              const char *text,
+                              int32_t x,
+                              int32_t y,
+                              int32_t w,
+                              const lv_font_t *font,
+                              uint32_t color)
 {
     lv_obj_t *label = lv_label_create(parent);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_color(label, lv_color_hex(0xC8D2E0), LV_PART_MAIN);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_pos(label, x, y);
+    lv_obj_set_width(label, w);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_hex(color), LV_PART_MAIN);
     return label;
 }
 
-static void touch_area_event_cb(lv_event_t *event)
+static void create_hline(lv_obj_t *parent, int32_t y)
 {
-    lv_event_code_t code = lv_event_get_code(event);
-
-    if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING || code == LV_EVENT_CLICKED) {
-        lv_indev_t *indev = lv_indev_get_act();
-        lv_point_t point = {0, 0};
-
-        if (indev != nullptr) {
-            lv_indev_get_point(indev, &point);
-
-            char buf[96];
-            snprintf(buf, sizeof(buf), "Touch X: %d    Y: %d", (int)point.x, (int)point.y);
-
-            if (g_touch_label != nullptr) {
-                lv_label_set_text(g_touch_label, buf);
-            }
-
-            char log_buf[128];
-            snprintf(log_buf, sizeof(log_buf), "Last event: Touch area X=%d, Y=%d", (int)point.x, (int)point.y);
-            set_log(log_buf);
-        }
-    }
+    lv_obj_t *line = lv_obj_create(parent);
+    lv_obj_set_pos(line, 20, y);
+    lv_obj_set_size(line, 984, 2);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(line, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(line, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
 }
 
-static void button_event_cb(lv_event_t *event)
+static void create_vline(lv_obj_t *parent, int32_t x, int32_t y, int32_t h)
 {
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
-        g_button_count++;
-
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Button Count: %d", g_button_count);
-
-        if (g_button_count_label != nullptr) {
-            lv_label_set_text(g_button_count_label, buf);
-        }
-
-        set_log("Last event: Button clicked");
-    }
+    lv_obj_t *line = lv_obj_create(parent);
+    lv_obj_set_pos(line, x, y);
+    lv_obj_set_size(line, 2, h);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(line, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(line, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
 }
 
-static void slider_event_cb(lv_event_t *event)
+static lv_obj_t *create_button(lv_obj_t *parent, const char *text, int32_t x, int32_t y)
 {
-    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(event);
-    int32_t value = lv_slider_get_value(slider);
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_size(btn, 132, 48);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "Slider: %ld%%", (long)value);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_center(label);
 
-    if (g_slider_value_label != nullptr) {
-        lv_label_set_text(g_slider_value_label, buf);
-    }
-
-    if (g_bar != nullptr) {
-        lv_bar_set_value(g_bar, value, LV_ANIM_OFF);
-    }
-
-    char log_buf[96];
-    snprintf(log_buf, sizeof(log_buf), "Last event: Slider changed to %ld%%", (long)value);
-    set_log(log_buf);
+    return btn;
 }
 
-static void switch_event_cb(lv_event_t *event)
+static void format_voltage(char *buf, size_t len, uint32_t mv)
 {
-    lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(event);
-
-    bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
-
-    if (g_switch_state_label != nullptr) {
-        lv_label_set_text(g_switch_state_label, checked ? "Switch: ON" : "Switch: OFF");
-    }
-
-    set_log(checked ? "Last event: Switch ON" : "Last event: Switch OFF");
+    snprintf(buf,
+             len,
+             "%lu.%03lu V",
+             static_cast<unsigned long>(mv / 1000U),
+             static_cast<unsigned long>(mv % 1000U));
 }
 
-static void dropdown_event_cb(lv_event_t *event)
+static void format_lsb_x1000(char *buf, size_t len, int32_t value)
 {
-    lv_obj_t *dropdown = (lv_obj_t *)lv_event_get_target(event);
+    const char *sign = "";
+    int32_t v = value;
 
-    if (lv_event_get_code(event) == LV_EVENT_VALUE_CHANGED) {
-        char selected[64];
-        lv_dropdown_get_selected_str(dropdown, selected, sizeof(selected));
-
-        char log_buf[128];
-        snprintf(log_buf, sizeof(log_buf), "Last event: Dropdown selected [%s]", selected);
-        set_log(log_buf);
+    if (v < 0) {
+        sign = "-";
+        v = -v;
     }
-}
 
-static void checkbox_event_cb(lv_event_t *event)
-{
-    lv_obj_t *checkbox = (lv_obj_t *)lv_event_get_target(event);
-
-    bool checked = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
-    set_log(checked ? "Last event: Checkbox checked" : "Last event: Checkbox unchecked");
-}
-
-static void textarea_event_cb(lv_event_t *event)
-{
-    lv_obj_t *textarea = (lv_obj_t *)lv_event_get_target(event);
-    lv_event_code_t code = lv_event_get_code(event);
-
-    if (code == LV_EVENT_FOCUSED) {
-        if (g_keyboard != nullptr) {
-            lv_keyboard_set_textarea(g_keyboard, textarea);
-            lv_obj_clear_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
-        }
-        set_log("Last event: Textarea focused");
-    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        if (g_keyboard != nullptr) {
-            lv_obj_add_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
-            lv_keyboard_set_textarea(g_keyboard, nullptr);
-        }
-        set_log("Last event: Textarea input finished");
-    } else if (code == LV_EVENT_VALUE_CHANGED) {
-        set_log("Last event: Textarea value changed");
-    }
+    snprintf(buf,
+             len,
+             "%s%ld.%03ld LSB",
+             sign,
+             static_cast<long>(v / 1000),
+             static_cast<long>(v % 1000));
 }
 
 void test_screen_create(void)
@@ -177,142 +140,255 @@ void test_screen_create(void)
     lv_obj_clean(screen);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x101820), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
-    lv_obj_t *title_bar = lv_obj_create(screen);
-    lv_obj_set_size(title_bar, 1024, 60);
-    lv_obj_set_pos(title_bar, 0, 0);
-    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(title_bar, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(title_bar, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(title_bar, lv_color_hex(0x0B1220), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(title_bar, LV_OPA_COVER, LV_PART_MAIN);
+    // 0 ~ 64：标题区
+    g_title = create_label(screen,
+                           "ADC Characteristic Test",
+                           24,
+                           16,
+                           430,
+                           &lv_font_montserrat_24,
+                           COLOR_TEXT);
 
-    lv_obj_t *title = lv_label_create(title_bar);
-    lv_label_set_text(title, "ESP32-P4 LCD & Touch Test");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, 24, 0);
+    g_status = create_label(screen,
+                            "Basic 8-bit SAR | Waiting",
+                            530,
+                            18,
+                            470,
+                            &lv_font_montserrat_20,
+                            COLOR_BLUE);
 
-    lv_obj_t *resolution = lv_label_create(title_bar);
-    lv_label_set_text(resolution, "1024 x 600");
-    lv_obj_set_style_text_color(resolution, lv_color_hex(0x8FD6C8), LV_PART_MAIN);
-    lv_obj_set_style_text_font(resolution, &lv_font_montserrat_18, LV_PART_MAIN);
-    lv_obj_align(resolution, LV_ALIGN_RIGHT_MID, -24, 0);
+    create_hline(screen, 64);
 
-    lv_obj_t *touch_panel = create_panel(screen, 360, 450);
-    lv_obj_set_pos(touch_panel, 20, 80);
-    lv_obj_add_flag(touch_panel, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(touch_panel, touch_area_event_cb, LV_EVENT_ALL, nullptr);
+    // 64 ~ 138：控制区
+    g_btn_start = create_button(screen, "Start", 24, 78);
+    g_btn_stop  = create_button(screen, "Stop", 174, 78);
+    g_btn_basic = create_button(screen, "8-bit", 324, 78);
+    g_btn_adv   = create_button(screen, "12-bit", 474, 78);
 
-    lv_obj_t *touch_title = lv_label_create(touch_panel);
-    lv_label_set_text(touch_title, "Touch Area");
-    lv_obj_set_style_text_color(touch_title, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(touch_title, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_align(touch_title, LV_ALIGN_TOP_MID, 0, 28);
+    create_label(screen,
+                 "Press Start once, then auto refresh",
+                 640,
+                 88,
+                 360,
+                 &lv_font_montserrat_20,
+                 COLOR_YELLOW);
 
-    g_touch_label = lv_label_create(touch_panel);
-    lv_label_set_text(g_touch_label, "Touch X: --    Y: --");
-    lv_obj_set_style_text_color(g_touch_label, lv_color_hex(0x8FD6C8), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_touch_label, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(g_touch_label, LV_ALIGN_CENTER, 0, -10);
+    create_hline(screen, 144);
 
-    lv_obj_t *touch_hint = lv_label_create(touch_panel);
-    lv_label_set_text(touch_hint, "Press or drag here\nto test touch position");
-    lv_obj_set_style_text_color(touch_hint, lv_color_hex(0xA9B4C3), LV_PART_MAIN);
-    lv_obj_set_style_text_align(touch_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_style_text_font(touch_hint, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(touch_hint, LV_ALIGN_BOTTOM_MID, 0, -32);
+    // 144 ~ 470：主显示区
+    create_label(screen,
+                 "Live Data",
+                 24,
+                 162,
+                 460,
+                 &lv_font_montserrat_24,
+                 COLOR_BLUE);
 
-    lv_obj_t *control_panel = create_panel(screen, 604, 450);
-    lv_obj_set_pos(control_panel, 400, 80);
+    create_label(screen,
+                 "Static Parameters",
+                 540,
+                 162,
+                 460,
+                 &lv_font_montserrat_24,
+                 COLOR_BLUE);
 
-    create_caption(control_panel, "Button Test", 24, 24);
+    create_vline(screen, 512, 154, 316);
 
-    lv_obj_t *button = lv_button_create(control_panel);
-    lv_obj_set_size(button, 160, 52);
-    lv_obj_set_pos(button, 24, 56);
-    lv_obj_add_event_cb(button, button_event_cb, LV_EVENT_CLICKED, nullptr);
+    // 左侧 Live Data，x=24, 宽 460
+    g_input = create_label(screen,
+                           "Input: ---.--- V",
+                           24,
+                           214,
+                           460,
+                           &lv_font_montserrat_24,
+                           COLOR_GREEN);
 
-    lv_obj_t *button_label = lv_label_create(button);
-    lv_label_set_text(button_label, "Click Me");
-    lv_obj_center(button_label);
+    g_adc_code = create_label(screen,
+                              "ADC: --- / ---",
+                              24,
+                              262,
+                              460,
+                              &lv_font_montserrat_24,
+                              COLOR_TEXT);
 
-    g_button_count_label = lv_label_create(control_panel);
-    lv_label_set_text(g_button_count_label, "Button Count: 0");
-    lv_obj_set_style_text_color(g_button_count_label, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_button_count_label, &lv_font_montserrat_18, LV_PART_MAIN);
-    lv_obj_set_pos(g_button_count_label, 210, 70);
+    g_progress = create_label(screen,
+                              "Progress: 0.0%",
+                              24,
+                              310,
+                              460,
+                              &lv_font_montserrat_24,
+                              COLOR_SUBTEXT);
 
-    create_caption(control_panel, "Slider / Progress Test", 24, 128);
+    g_sample = create_label(screen,
+                            "Sample: 0 / 0",
+                            24,
+                            358,
+                            460,
+                            &lv_font_montserrat_24,
+                            COLOR_SUBTEXT);
 
-    lv_obj_t *slider = lv_slider_create(control_panel);
-    lv_obj_set_size(slider, 300, 24);
-    lv_obj_set_pos(slider, 24, 166);
-    lv_slider_set_range(slider, 0, 100);
-    lv_slider_set_value(slider, 50, LV_ANIM_OFF);
-    lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    g_bar = lv_bar_create(screen);
+    lv_obj_set_pos(g_bar, 24, 418);
+    lv_obj_set_size(g_bar, 440, 28);
+    lv_bar_set_range(g_bar, 0, 1000);
+    lv_bar_set_value(g_bar, 0, LV_ANIM_OFF);
 
-    g_slider_value_label = lv_label_create(control_panel);
-    lv_label_set_text(g_slider_value_label, "Slider: 50%");
-    lv_obj_set_style_text_color(g_slider_value_label, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_slider_value_label, &lv_font_montserrat_18, LV_PART_MAIN);
-    lv_obj_set_pos(g_slider_value_label, 350, 158);
+    // 右侧 Static Parameters，x=540, 宽 460
+    g_offset = create_label(screen,
+                            "Offset: -- uV",
+                            540,
+                            214,
+                            460,
+                            &lv_font_montserrat_24,
+                            COLOR_TEXT);
 
-    g_bar = lv_bar_create(control_panel);
-    lv_obj_set_size(g_bar, 300, 22);
-    lv_obj_set_pos(g_bar, 24, 212);
-    lv_bar_set_range(g_bar, 0, 100);
-    lv_bar_set_value(g_bar, 50, LV_ANIM_OFF);
+    g_gain = create_label(screen,
+                          "Gain: -- ppm",
+                          540,
+                          258,
+                          460,
+                          &lv_font_montserrat_24,
+                          COLOR_TEXT);
 
-    create_caption(control_panel, "Switch / Dropdown / Checkbox", 24, 260);
+    g_inl = create_label(screen,
+                         "INL: -- LSB",
+                         540,
+                         302,
+                         460,
+                         &lv_font_montserrat_24,
+                         COLOR_TEXT);
 
-    lv_obj_t *sw = lv_switch_create(control_panel);
-    lv_obj_set_pos(sw, 24, 296);
-    lv_obj_add_event_cb(sw, switch_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    g_dnl = create_label(screen,
+                         "DNL: -- LSB",
+                         540,
+                         346,
+                         460,
+                         &lv_font_montserrat_24,
+                         COLOR_TEXT);
 
-    g_switch_state_label = lv_label_create(control_panel);
-    lv_label_set_text(g_switch_state_label, "Switch: OFF");
-    lv_obj_set_style_text_color(g_switch_state_label, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_switch_state_label, &lv_font_montserrat_18, LV_PART_MAIN);
-    lv_obj_set_pos(g_switch_state_label, 100, 300);
+    g_missing = create_label(screen,
+                             "Missing: --",
+                             540,
+                             390,
+                             460,
+                             &lv_font_montserrat_24,
+                             COLOR_TEXT);
 
-    lv_obj_t *dropdown = lv_dropdown_create(control_panel);
-    lv_dropdown_set_options(dropdown,
-                            "Option 1\n"
-                            "Option 2\n"
-                            "Option 3\n"
-                            "Touch Test");
-    lv_obj_set_size(dropdown, 180, 46);
-    lv_obj_set_pos(dropdown, 260, 286);
-    lv_obj_add_event_cb(dropdown, dropdown_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    g_conv_time = create_label(screen,
+                               "Conv Time: -- ns",
+                               540,
+                               434,
+                               460,
+                               &lv_font_montserrat_24,
+                               COLOR_TEXT);
 
-    lv_obj_t *checkbox = lv_checkbox_create(control_panel);
-    lv_checkbox_set_text(checkbox, "Check me");
-    lv_obj_set_pos(checkbox, 460, 298);
-    lv_obj_set_style_text_color(checkbox, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
-    lv_obj_add_event_cb(checkbox, checkbox_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    create_hline(screen, 486);
 
-    create_caption(control_panel, "Textarea Test", 24, 358);
+    // 486 ~ 600：底部状态区
+    g_link = create_label(screen,
+                          "SPI: packets=0  err=0  timeout=0",
+                          24,
+                          506,
+                          960,
+                          &lv_font_montserrat_24,
+                          COLOR_BLUE);
 
-    lv_obj_t *textarea = lv_textarea_create(control_panel);
-    lv_obj_set_size(textarea, 360, 54);
-    lv_obj_set_pos(textarea, 24, 386);
-    lv_textarea_set_placeholder_text(textarea, "Tap here to input...");
-    lv_textarea_set_one_line(textarea, true);
-    lv_obj_add_event_cb(textarea, textarea_event_cb, LV_EVENT_ALL, nullptr);
+    g_hint = create_label(screen,
+                          "Target: 8-bit static test <=120s | INL DNL Offset Gain Missing Code",
+                          24,
+                          552,
+                          960,
+                          &lv_font_montserrat_20,
+                          COLOR_YELLOW);
+}
 
-    g_log_label = lv_label_create(screen);
-    lv_label_set_text(g_log_label, "Last event: UI created");
-    lv_obj_set_size(g_log_label, 980, 40);
-    lv_obj_set_pos(g_log_label, 24, 548);
-    lv_obj_set_style_text_color(g_log_label, lv_color_hex(0xFFD166), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_log_label, &lv_font_montserrat_18, LV_PART_MAIN);
-    lv_label_set_long_mode(g_log_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+void test_screen_update_measurement(const adc_ui_status_t *s)
+{
+    if (s == nullptr) {
+        return;
+    }
 
-    g_keyboard = lv_keyboard_create(screen);
-    lv_obj_set_size(g_keyboard, 1024, 180);
-    lv_obj_align(g_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_add_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
+    char buf[128];
+
+    char vin[32];
+    format_voltage(vin, sizeof(vin), s->input_mv);
+
+    snprintf(buf, sizeof(buf), "Input: %s", vin);
+    lv_label_set_text(g_input, buf);
+
+    const uint32_t max_code =
+        (s->adc_bits >= 31U) ? 0xFFFFFFFFU : ((1UL << s->adc_bits) - 1U);
+
+    snprintf(buf,
+             sizeof(buf),
+             "ADC: %lu / %lu (%lu-bit)",
+             static_cast<unsigned long>(s->adc_code),
+             static_cast<unsigned long>(max_code),
+             static_cast<unsigned long>(s->adc_bits));
+    lv_label_set_text(g_adc_code, buf);
+
+    snprintf(buf,
+             sizeof(buf),
+             "Progress: %lu.%lu%%",
+             static_cast<unsigned long>(s->progress_permille / 10U),
+             static_cast<unsigned long>(s->progress_permille % 10U));
+    lv_label_set_text(g_progress, buf);
+
+    snprintf(buf,
+             sizeof(buf),
+             "Sample: %lu / %lu",
+             static_cast<unsigned long>(s->sample_index),
+             static_cast<unsigned long>(s->total_samples));
+    lv_label_set_text(g_sample, buf);
+
+    lv_bar_set_value(g_bar, s->progress_permille, LV_ANIM_OFF);
+
+    snprintf(buf,
+             sizeof(buf),
+             "Offset: %ld uV",
+             static_cast<long>(s->offset_error_uv));
+    lv_label_set_text(g_offset, buf);
+
+    snprintf(buf,
+             sizeof(buf),
+             "Gain: %ld ppm",
+             static_cast<long>(s->gain_error_ppm));
+    lv_label_set_text(g_gain, buf);
+
+    char inl[32];
+    char dnl[32];
+
+    format_lsb_x1000(inl, sizeof(inl), s->inl_lsb_x1000);
+    format_lsb_x1000(dnl, sizeof(dnl), s->dnl_lsb_x1000);
+
+    snprintf(buf, sizeof(buf), "INL: %s", inl);
+    lv_label_set_text(g_inl, buf);
+
+    snprintf(buf, sizeof(buf), "DNL: %s", dnl);
+    lv_label_set_text(g_dnl, buf);
+
+    snprintf(buf,
+             sizeof(buf),
+             "Missing: %lu",
+             static_cast<unsigned long>(s->missing_codes));
+    lv_label_set_text(g_missing, buf);
+
+    snprintf(buf,
+             sizeof(buf),
+             "Conv Time: %lu ns",
+             static_cast<unsigned long>(s->conversion_time_ns));
+    lv_label_set_text(g_conv_time, buf);
+
+    snprintf(buf,
+             sizeof(buf),
+             "SPI: packets=%lu  err=%lu  timeout=%lu",
+             static_cast<unsigned long>(s->packets),
+             static_cast<unsigned long>(s->frame_errors),
+             static_cast<unsigned long>(s->timeouts));
+    lv_label_set_text(g_link, buf);
+
+    lv_label_set_text(g_status, "Basic 8-bit SAR | Running");
 }
