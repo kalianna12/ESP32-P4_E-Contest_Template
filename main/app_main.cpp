@@ -14,6 +14,7 @@
 #include "lvgl_adapter_init.h"
 
 #include "ui/test_screen.h"
+#include "spilink.h"
 
 #include "wifi/template_wifi.h"
 #include "storage/template_sdcard.h"
@@ -21,6 +22,15 @@
 #include <assert.h>
 
 static const char *TAG = "template";
+
+static void spi_link_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        SpiLink_Task();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
 
 static esp_err_t template_nvs_init(void)
 {
@@ -56,6 +66,9 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_lv_adapter_lock(-1));
     test_screen_create();
     esp_lv_adapter_unlock();
+
+    SpiLink_Init();
+    xTaskCreatePinnedToCore(spi_link_task, "spi_link_rx", 4096, nullptr, 4, nullptr, 1);
 
     ESP_ERROR_CHECK(template_wifi_init());
 

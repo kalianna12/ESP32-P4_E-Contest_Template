@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         app_main.cpp
+        spilink.cpp
         lvgl_adapter_init.c
         wifi/template_wifi.c
         storage/template_sdcard.c
