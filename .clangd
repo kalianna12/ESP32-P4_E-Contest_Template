@@ -1,0 +1,3 @@
+CompilationDatabase: build
+CompileFlags:
+    Remove: [-f*, -m*]

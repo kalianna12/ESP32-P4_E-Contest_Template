@@ -1,0 +1,27 @@
+menu "ESP32-P4 Electric Contest Template"
+
+    config TEMPLATE_ENABLE_SDCARD
+        bool "Enable SD card at boot"
+        default n
+        help
+            Disabled by default. When enabled, app_main mounts the SD card
+            through the existing board BSP.
+
+    config TEMPLATE_WIFI_AUTO_CONNECT
+        bool "Auto connect Wi-Fi at boot"
+        default n
+        help
+            When disabled, Wi-Fi STA is initialized and started without
+            connecting to an AP.
+
+    config TEMPLATE_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        depends on TEMPLATE_WIFI_AUTO_CONNECT
+
+    config TEMPLATE_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        depends on TEMPLATE_WIFI_AUTO_CONNECT
+
+endmenu

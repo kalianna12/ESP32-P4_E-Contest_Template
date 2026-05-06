@@ -1,0 +1,19 @@
+# ESP-IDF .gitignore
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+
+# VS Code settings
+.vscode/
+
+# Temporary files
+*.tmp
+*.log
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
