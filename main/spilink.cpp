@@ -26,14 +26,14 @@ constexpr TickType_t SPI_RX_TIMEOUT_TICKS = pdMS_TO_TICKS(200);
 constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
 constexpr uint8_t kFrameTypeAdcStatus = 0x10;
-constexpr uint8_t kPayloadLen = 48;
+constexpr uint8_t kPayloadLen = 112;
 
 constexpr size_t kFrameHeaderLen = 4;
 constexpr size_t kFrameLen = kFrameHeaderLen + kPayloadLen + 1;
 
 constexpr size_t kDmaAlign = 64;
-constexpr size_t kRxBufferLen = 64;
-constexpr size_t kTxBufferLen = 64;
+constexpr size_t kRxBufferLen = 128;
+constexpr size_t kTxBufferLen = 128;
 
 bool spi_ready = false;
 uint8_t *rx_buffer = nullptr;
@@ -88,20 +88,39 @@ bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
 
     size_t o = 4;
 
+    out->state = static_cast<uint8_t>(GetU32(frame, o));       o += 4;
+    out->mode = static_cast<uint8_t>(GetU32(frame, o));        o += 4;
+    out->source = static_cast<uint8_t>(GetU32(frame, o));      o += 4;
+    out->monitor_ok = static_cast<uint8_t>(GetU32(frame, o));  o += 4;
+    out->progress_permille = GetU32(frame, o);                 o += 4;
+    out->elapsed_ms = GetU32(frame, o);                        o += 4;
+
     out->sample_index = GetU32(frame, o);       o += 4;
     out->total_samples = GetU32(frame, o);      o += 4;
+
+    out->dut_adc_code = GetU32(frame, o);       o += 4;
+    out->dut_adc_bits = GetU32(frame, o);       o += 4;
+    out->dut_adc_avg_x1000 = GetU32(frame, o);  o += 4;
+    out->dut_conversion_time_ns = GetU32(frame, o); o += 4;
+
     out->input_mv = GetU32(frame, o);           o += 4;
-    out->adc_code = GetU32(frame, o);           o += 4;
-    out->adc_bits = GetU32(frame, o);           o += 4;
-    out->progress_permille = GetU32(frame, o);  o += 4;
+    out->stm32_adc_raw12 = GetU32(frame, o);    o += 4;
+    out->stm32_adc_mv = GetU32(frame, o);       o += 4;
 
-    out->offset_error_uv = GetI32(frame, o);    o += 4;
-    out->gain_error_ppm = GetI32(frame, o);     o += 4;
-    out->inl_lsb_x1000 = GetI32(frame, o);      o += 4;
-    out->dnl_lsb_x1000 = GetI32(frame, o);      o += 4;
+    out->offset_error_lsb_x1000 = GetI32(frame, o); o += 4;
+    out->gain_error_lsb_x1000 = GetI32(frame, o);   o += 4;
+    out->gain_error_ppm = GetI32(frame, o);         o += 4;
+    out->dnl_min_x1000 = GetI32(frame, o);          o += 4;
+    out->dnl_max_x1000 = GetI32(frame, o);          o += 4;
+    out->inl_min_x1000 = GetI32(frame, o);          o += 4;
+    out->inl_max_x1000 = GetI32(frame, o);          o += 4;
+    out->missing_codes = GetU32(frame, o);          o += 4;
 
-    out->missing_codes = GetU32(frame, o);      o += 4;
-    out->conversion_time_ns = GetU32(frame, o); o += 4;
+    out->snr_db_x100 = GetI32(frame, o);       o += 4;
+    out->sinad_db_x100 = GetI32(frame, o);     o += 4;
+    out->enob_x100 = GetI32(frame, o);         o += 4;
+    out->sfdr_db_x100 = GetI32(frame, o);      o += 4;
+    out->thd_db_x100 = GetI32(frame, o);       o += 4;
 
     return true;
 }
@@ -260,11 +279,11 @@ void SpiLink_Task(void)
         status.timeouts = timeout_count;
 
         ESP_LOGI(TAG,
-                 "RX ADC status: sample=%lu/%lu vin=%lu mV code=%lu bits=%u",
+                 "RX ADC status: sample=%lu/%lu vin=%lu mV dut=%lu bits=%u",
                  static_cast<unsigned long>(status.sample_index),
                  static_cast<unsigned long>(status.total_samples),
                  static_cast<unsigned long>(status.input_mv),
-                 static_cast<unsigned long>(status.adc_code),
+                 static_cast<unsigned long>(status.dut_adc_code),
                  static_cast<unsigned>(rx_bits));
 
         UpdateUiWithLock(status);
