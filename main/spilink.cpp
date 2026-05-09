@@ -30,10 +30,17 @@ constexpr uint8_t kPayloadLen = 112;
 
 constexpr size_t kFrameHeaderLen = 4;
 constexpr size_t kFrameLen = kFrameHeaderLen + kPayloadLen + 1;
+constexpr size_t kSpiTransferLen = 128;
 
 constexpr size_t kDmaAlign = 64;
 constexpr size_t kRxBufferLen = 128;
 constexpr size_t kTxBufferLen = 128;
+
+static_assert((kRxBufferLen % 4) == 0, "SPI DMA RX buffer length must be 4-byte aligned");
+static_assert((kTxBufferLen % 4) == 0, "SPI DMA TX buffer length must be 4-byte aligned");
+static_assert(kFrameLen == 117, "ADC status logical frame must stay 117 bytes");
+static_assert(kRxBufferLen == kSpiTransferLen, "SPI RX transaction must be fixed at 128 bytes");
+static_assert(kTxBufferLen == kSpiTransferLen, "SPI TX transaction must be fixed at 128 bytes");
 
 bool spi_ready = false;
 uint8_t *rx_buffer = nullptr;
@@ -128,6 +135,7 @@ bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
 void PrepareTxBuffer()
 {
     std::memset(tx_buffer, 0x00, kTxBufferLen);
+    // Future P4-to-STM32 command frames must also occupy a fixed 128-byte SPI transaction.
     tx_buffer[0] = 0xAC;
     tx_buffer[1] = 0x4B;
 }
@@ -198,6 +206,8 @@ void SpiLink_Init(void)
     bus_cfg.max_transfer_sz = kRxBufferLen;
 
     spi_slave_interface_config_t slave_cfg = {};
+    // Mode 0 is kept for now. With ESP-IDF SPI slave DMA, MISO timing can be tighter in mode 0;
+    // if STM32 command readback is unstable later, switch both sides to SPI mode 1 together.
     slave_cfg.mode = 0;
     slave_cfg.spics_io_num = SPI_RX_CS;
     slave_cfg.queue_size = 1;
@@ -270,6 +280,15 @@ void SpiLink_Task(void)
 
     adc_ui_status_t status = {};
     const size_t rx_bits = static_cast<size_t>(trans.trans_len);
+    if (rx_bits != (kSpiTransferLen * 8U)) {
+        ++err_count;
+        ESP_LOGW(TAG,
+                 "Unexpected SPI transaction length: bits=%u expected=%u err=%lu",
+                 static_cast<unsigned>(rx_bits),
+                 static_cast<unsigned>(kSpiTransferLen * 8U),
+                 static_cast<unsigned long>(err_count));
+        return;
+    }
 
     if (ParseAdcStatusFrame(rx_buffer, kFrameLen, &status)) {
         ++ok_count;
