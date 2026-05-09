@@ -26,7 +26,9 @@ constexpr TickType_t SPI_RX_TIMEOUT_TICKS = pdMS_TO_TICKS(200);
 constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
 constexpr uint8_t kFrameTypeAdcStatus = 0x10;
+constexpr uint8_t kFrameTypeCommand = 0x80;
 constexpr uint8_t kPayloadLen = 112;
+constexpr uint8_t kCommandPayloadLen = 16;
 
 constexpr size_t kFrameHeaderLen = 4;
 constexpr size_t kFrameLen = kFrameHeaderLen + kPayloadLen + 1;
@@ -50,6 +52,13 @@ uint32_t ok_count = 0;
 uint32_t err_count = 0;
 uint32_t timeout_count = 0;
 
+portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
+uint32_t g_cmd_seq = 0;
+uint32_t g_pending_cmd = 0;
+uint32_t g_pending_arg0 = 0;
+uint32_t g_pending_arg1 = 0;
+bool g_has_pending_cmd = false;
+
 uint8_t Checksum(const uint8_t *frame, size_t len)
 {
     uint8_t checksum = 0;
@@ -70,6 +79,14 @@ uint32_t GetU32(const uint8_t *buffer, size_t offset)
 int32_t GetI32(const uint8_t *buffer, size_t offset)
 {
     return static_cast<int32_t>(GetU32(buffer, offset));
+}
+
+void PutU32(uint8_t *buffer, size_t offset, uint32_t value)
+{
+    buffer[offset + 0] = static_cast<uint8_t>((value >> 0) & 0xFFU);
+    buffer[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xFFU);
+    buffer[offset + 2] = static_cast<uint8_t>((value >> 16) & 0xFFU);
+    buffer[offset + 3] = static_cast<uint8_t>((value >> 24) & 0xFFU);
 }
 
 bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
@@ -135,9 +152,35 @@ bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
 void PrepareTxBuffer()
 {
     std::memset(tx_buffer, 0x00, kTxBufferLen);
-    // Future P4-to-STM32 command frames must also occupy a fixed 128-byte SPI transaction.
-    tx_buffer[0] = 0xAC;
-    tx_buffer[1] = 0x4B;
+
+    uint32_t seq = 0;
+    uint32_t cmd = 0;
+    uint32_t arg0 = 0;
+    uint32_t arg1 = 0;
+
+    portENTER_CRITICAL(&g_cmd_lock);
+    seq = g_cmd_seq;
+    if (g_has_pending_cmd) {
+        cmd = g_pending_cmd;
+        arg0 = g_pending_arg0;
+        arg1 = g_pending_arg1;
+        g_has_pending_cmd = false;
+    }
+    portEXIT_CRITICAL(&g_cmd_lock);
+
+    tx_buffer[0] = kFrameMagic0;
+    tx_buffer[1] = kFrameMagic1;
+    tx_buffer[2] = kFrameTypeCommand;
+    tx_buffer[3] = kCommandPayloadLen;
+
+    size_t o = kFrameHeaderLen;
+    PutU32(tx_buffer, o, seq);  o += 4;
+    PutU32(tx_buffer, o, cmd);  o += 4;
+    PutU32(tx_buffer, o, arg0); o += 4;
+    PutU32(tx_buffer, o, arg1); o += 4;
+
+    tx_buffer[kFrameHeaderLen + kCommandPayloadLen] =
+        Checksum(tx_buffer, kFrameHeaderLen + kCommandPayloadLen);
 }
 
 void FreeBuffers()
@@ -240,6 +283,20 @@ void SpiLink_Init(void)
              static_cast<int>(SPI_RX_SCLK),
              static_cast<int>(SPI_RX_CS),
              static_cast<unsigned>(kRxBufferLen));
+}
+
+void SpiLink_SetPendingCommand(uint32_t cmd, uint32_t arg0, uint32_t arg1)
+{
+    portENTER_CRITICAL(&g_cmd_lock);
+    ++g_cmd_seq;
+    if (g_cmd_seq == 0) {
+        ++g_cmd_seq;
+    }
+    g_pending_cmd = cmd;
+    g_pending_arg0 = arg0;
+    g_pending_arg1 = arg1;
+    g_has_pending_cmd = true;
+    portEXIT_CRITICAL(&g_cmd_lock);
 }
 
 void SpiLink_Task(void)

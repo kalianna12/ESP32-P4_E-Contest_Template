@@ -1,6 +1,7 @@
 #include "test_screen.h"
 
 #include "lvgl.h"
+#include "spilink.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,13 @@
 #define COLOR_RED       0xFCA5A5
 
 #define DYNAMIC_INVALID INT32_MIN
+
+#define CMD_START      1U
+#define CMD_STOP       2U
+#define CMD_SET_MODE   4U
+
+#define ADC_TEST_MODE_STATIC_8BIT  0U
+#define ADC_TEST_MODE_STATIC_12BIT 1U
 
 static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_status = nullptr;
@@ -117,7 +125,36 @@ static const char *state_text(uint8_t state)
     case 2: return "Calculating";
     case 3: return "Done";
     case 4: return "Error";
+    case 5: return "Stopped";
     default: return "Unknown";
+    }
+}
+
+static void start_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        SpiLink_SetPendingCommand(CMD_START, 0U, 0U);
+    }
+}
+
+static void stop_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        SpiLink_SetPendingCommand(CMD_STOP, 0U, 0U);
+    }
+}
+
+static void basic_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        SpiLink_SetPendingCommand(CMD_SET_MODE, ADC_TEST_MODE_STATIC_8BIT, 0U);
+    }
+}
+
+static void adv_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        SpiLink_SetPendingCommand(CMD_SET_MODE, ADC_TEST_MODE_STATIC_12BIT, 0U);
     }
 }
 
@@ -291,6 +328,11 @@ void test_screen_create(void)
     g_btn_stop  = create_button(screen, "Stop", 160, 78);
     g_btn_basic = create_button(screen, "8-bit", 296, 78);
     g_btn_adv   = create_button(screen, "12-bit", 432, 78);
+
+    lv_obj_add_event_cb(g_btn_start, start_button_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_btn_stop, stop_button_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_btn_basic, basic_button_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_btn_adv, adv_button_event_cb, LV_EVENT_CLICKED, nullptr);
 
     g_source = create_label(screen,
                             "Source: AD9767",
