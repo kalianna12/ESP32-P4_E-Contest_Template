@@ -14,7 +14,7 @@
 
 namespace {
 
-constexpr char TAG[] = "SSVEPSpiLink";
+constexpr char TAG[] = "FreqRespSpiLink";
 
 constexpr spi_host_device_t SPI_RX_HOST = SPI3_HOST;
 constexpr gpio_num_t SPI_RX_MOSI = GPIO_NUM_21;
@@ -25,7 +25,7 @@ constexpr TickType_t SPI_RX_TIMEOUT_TICKS = pdMS_TO_TICKS(200);
 
 constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
-constexpr uint8_t kFrameTypeAdcStatus = 0x10;
+constexpr uint8_t kFrameTypeFreqRespStatus = 0x10;
 constexpr uint8_t kFrameTypeCommand = 0x80;
 constexpr uint8_t kPayloadLen = 112;
 constexpr uint8_t kCommandPayloadLen = 16;
@@ -37,12 +37,19 @@ constexpr size_t kSpiTransferLen = 128;
 constexpr size_t kDmaAlign = 64;
 constexpr size_t kRxBufferLen = 128;
 constexpr size_t kTxBufferLen = 128;
+constexpr size_t kCommandQueueLen = 16;
 
-static_assert((kRxBufferLen % 4) == 0, "SPI DMA RX buffer length must be 4-byte aligned");
-static_assert((kTxBufferLen % 4) == 0, "SPI DMA TX buffer length must be 4-byte aligned");
-static_assert(kFrameLen == 117, "ADC status logical frame must stay 117 bytes");
-static_assert(kRxBufferLen == kSpiTransferLen, "SPI RX transaction must be fixed at 128 bytes");
-static_assert(kTxBufferLen == kSpiTransferLen, "SPI TX transaction must be fixed at 128 bytes");
+static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
+static_assert((kTxBufferLen % 64) == 0, "SPI TX buffer length must be a 64-byte multiple");
+static_assert(kFrameLen == 117, "Status logical frame is header + 112-byte payload + checksum");
+static_assert(kRxBufferLen == kSpiTransferLen, "SPI RX transaction must stay fixed at 128 bytes");
+static_assert(kTxBufferLen == kSpiTransferLen, "SPI TX transaction must stay fixed at 128 bytes");
+
+typedef struct {
+    uint32_t cmd;
+    uint32_t arg0;
+    uint32_t arg1;
+} pending_command_t;
 
 bool spi_ready = false;
 uint8_t *rx_buffer = nullptr;
@@ -54,10 +61,10 @@ uint32_t timeout_count = 0;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_cmd_seq = 0;
-uint32_t g_pending_cmd = 0;
-uint32_t g_pending_arg0 = 0;
-uint32_t g_pending_arg1 = 0;
-bool g_has_pending_cmd = false;
+pending_command_t g_cmd_queue[kCommandQueueLen] = {};
+size_t g_cmd_head = 0;
+size_t g_cmd_tail = 0;
+size_t g_cmd_count = 0;
 
 uint8_t Checksum(const uint8_t *frame, size_t len)
 {
@@ -89,7 +96,23 @@ void PutU32(uint8_t *buffer, size_t offset, uint32_t value)
     buffer[offset + 3] = static_cast<uint8_t>((value >> 24) & 0xFFU);
 }
 
-bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
+bool PopPendingCommand(pending_command_t *out)
+{
+    bool has_cmd = false;
+
+    portENTER_CRITICAL(&g_cmd_lock);
+    if (g_cmd_count > 0U) {
+        *out = g_cmd_queue[g_cmd_head];
+        g_cmd_head = (g_cmd_head + 1U) % kCommandQueueLen;
+        --g_cmd_count;
+        has_cmd = true;
+    }
+    portEXIT_CRITICAL(&g_cmd_lock);
+
+    return has_cmd;
+}
+
+bool ParseFreqRespStatusFrame(const uint8_t *frame, size_t len, freqresp_ui_status_t *out)
 {
     if (frame == nullptr || out == nullptr || len < kFrameLen) {
         return false;
@@ -99,52 +122,42 @@ bool ParseAdcStatusFrame(const uint8_t *frame, size_t len, adc_ui_status_t *out)
         return false;
     }
 
-    if (frame[2] != kFrameTypeAdcStatus || frame[3] != kPayloadLen) {
+    if (frame[2] != kFrameTypeFreqRespStatus || frame[3] != kPayloadLen) {
         return false;
     }
 
     const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
     const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
-
     if (rx_checksum != expected_checksum) {
         return false;
     }
 
-    size_t o = 4;
+    size_t o = kFrameHeaderLen;
 
     out->state = static_cast<uint8_t>(GetU32(frame, o));       o += 4;
     out->mode = static_cast<uint8_t>(GetU32(frame, o));        o += 4;
-    out->source = static_cast<uint8_t>(GetU32(frame, o));      o += 4;
-    out->monitor_ok = static_cast<uint8_t>(GetU32(frame, o));  o += 4;
+    out->filter_type = static_cast<uint8_t>(GetU32(frame, o)); o += 4;
+    out->link_ok = static_cast<uint8_t>(GetU32(frame, o));     o += 4;
+
     out->progress_permille = GetU32(frame, o);                 o += 4;
-    out->elapsed_ms = GetU32(frame, o);                        o += 4;
 
-    out->sample_index = GetU32(frame, o);       o += 4;
-    out->total_samples = GetU32(frame, o);      o += 4;
+    out->start_freq_hz = GetU32(frame, o);                     o += 4;
+    out->stop_freq_hz = GetU32(frame, o);                      o += 4;
+    out->step_freq_hz = GetU32(frame, o);                      o += 4;
+    out->single_freq_hz = GetU32(frame, o);                    o += 4;
 
-    out->dut_adc_code = GetU32(frame, o);       o += 4;
-    out->dut_adc_bits = GetU32(frame, o);       o += 4;
-    out->dut_adc_avg_x1000 = GetU32(frame, o);  o += 4;
-    out->dut_conversion_time_ns = GetU32(frame, o); o += 4;
+    out->current_freq_hz = GetU32(frame, o);                   o += 4;
+    out->point_index = GetU32(frame, o);                       o += 4;
+    out->total_points = GetU32(frame, o);                      o += 4;
 
-    out->input_mv = GetU32(frame, o);           o += 4;
-    out->stm32_adc_raw12 = GetU32(frame, o);    o += 4;
-    out->stm32_adc_mv = GetU32(frame, o);       o += 4;
+    out->vin_mv = GetI32(frame, o);                            o += 4;
+    out->vout_mv = GetI32(frame, o);                           o += 4;
+    out->gain_x1000 = GetI32(frame, o);                        o += 4;
+    out->theory_gain_x1000 = GetI32(frame, o);                 o += 4;
+    out->error_x10 = GetI32(frame, o);                         o += 4;
+    out->phase_deg_x10 = GetI32(frame, o);                     o += 4;
 
-    out->offset_error_lsb_x1000 = GetI32(frame, o); o += 4;
-    out->gain_error_lsb_x1000 = GetI32(frame, o);   o += 4;
-    out->gain_error_ppm = GetI32(frame, o);         o += 4;
-    out->dnl_min_x1000 = GetI32(frame, o);          o += 4;
-    out->dnl_max_x1000 = GetI32(frame, o);          o += 4;
-    out->inl_min_x1000 = GetI32(frame, o);          o += 4;
-    out->inl_max_x1000 = GetI32(frame, o);          o += 4;
-    out->missing_codes = GetU32(frame, o);          o += 4;
-
-    out->snr_db_x100 = GetI32(frame, o);       o += 4;
-    out->sinad_db_x100 = GetI32(frame, o);     o += 4;
-    out->enob_x100 = GetI32(frame, o);         o += 4;
-    out->sfdr_db_x100 = GetI32(frame, o);      o += 4;
-    out->thd_db_x100 = GetI32(frame, o);       o += 4;
+    out->cutoff_freq_hz = GetU32(frame, o);                    o += 4;
 
     return true;
 }
@@ -153,31 +166,30 @@ void PrepareTxBuffer()
 {
     std::memset(tx_buffer, 0x00, kTxBufferLen);
 
-    uint32_t seq = 0;
-    uint32_t cmd = 0;
-    uint32_t arg0 = 0;
-    uint32_t arg1 = 0;
-
-    portENTER_CRITICAL(&g_cmd_lock);
-    seq = g_cmd_seq;
-    if (g_has_pending_cmd) {
-        cmd = g_pending_cmd;
-        arg0 = g_pending_arg0;
-        arg1 = g_pending_arg1;
-        g_has_pending_cmd = false;
-    }
-    portEXIT_CRITICAL(&g_cmd_lock);
+    pending_command_t pending = {};
+    const bool has_cmd = PopPendingCommand(&pending);
 
     tx_buffer[0] = kFrameMagic0;
     tx_buffer[1] = kFrameMagic1;
     tx_buffer[2] = kFrameTypeCommand;
     tx_buffer[3] = kCommandPayloadLen;
 
+    uint32_t seq = 0;
+    if (has_cmd) {
+        portENTER_CRITICAL(&g_cmd_lock);
+        ++g_cmd_seq;
+        if (g_cmd_seq == 0U) {
+            ++g_cmd_seq;
+        }
+        seq = g_cmd_seq;
+        portEXIT_CRITICAL(&g_cmd_lock);
+    }
+
     size_t o = kFrameHeaderLen;
-    PutU32(tx_buffer, o, seq);  o += 4;
-    PutU32(tx_buffer, o, cmd);  o += 4;
-    PutU32(tx_buffer, o, arg0); o += 4;
-    PutU32(tx_buffer, o, arg1); o += 4;
+    PutU32(tx_buffer, o, seq);          o += 4;
+    PutU32(tx_buffer, o, pending.cmd);  o += 4;
+    PutU32(tx_buffer, o, pending.arg0); o += 4;
+    PutU32(tx_buffer, o, pending.arg1); o += 4;
 
     tx_buffer[kFrameHeaderLen + kCommandPayloadLen] =
         Checksum(tx_buffer, kFrameHeaderLen + kCommandPayloadLen);
@@ -196,7 +208,7 @@ void FreeBuffers()
     }
 }
 
-void UpdateUiWithLock(const adc_ui_status_t &status)
+void UpdateUiWithLock(const freqresp_ui_status_t &status)
 {
     if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
         return;
@@ -249,8 +261,6 @@ void SpiLink_Init(void)
     bus_cfg.max_transfer_sz = kRxBufferLen;
 
     spi_slave_interface_config_t slave_cfg = {};
-    // Mode 0 is kept for now. With ESP-IDF SPI slave DMA, MISO timing can be tighter in mode 0;
-    // if STM32 command readback is unstable later, switch both sides to SPI mode 1 together.
     slave_cfg.mode = 0;
     slave_cfg.spics_io_num = SPI_RX_CS;
     slave_cfg.queue_size = 1;
@@ -288,14 +298,18 @@ void SpiLink_Init(void)
 void SpiLink_SetPendingCommand(uint32_t cmd, uint32_t arg0, uint32_t arg1)
 {
     portENTER_CRITICAL(&g_cmd_lock);
-    ++g_cmd_seq;
-    if (g_cmd_seq == 0) {
-        ++g_cmd_seq;
+
+    if (g_cmd_count >= kCommandQueueLen) {
+        g_cmd_head = (g_cmd_head + 1U) % kCommandQueueLen;
+        --g_cmd_count;
     }
-    g_pending_cmd = cmd;
-    g_pending_arg0 = arg0;
-    g_pending_arg1 = arg1;
-    g_has_pending_cmd = true;
+
+    g_cmd_queue[g_cmd_tail].cmd = cmd;
+    g_cmd_queue[g_cmd_tail].arg0 = arg0;
+    g_cmd_queue[g_cmd_tail].arg1 = arg1;
+    g_cmd_tail = (g_cmd_tail + 1U) % kCommandQueueLen;
+    ++g_cmd_count;
+
     portEXIT_CRITICAL(&g_cmd_lock);
 }
 
@@ -335,7 +349,7 @@ void SpiLink_Task(void)
         return;
     }
 
-    adc_ui_status_t status = {};
+    freqresp_ui_status_t status = {};
     const size_t rx_bits = static_cast<size_t>(trans.trans_len);
     if (rx_bits != (kSpiTransferLen * 8U)) {
         ++err_count;
@@ -347,7 +361,7 @@ void SpiLink_Task(void)
         return;
     }
 
-    if (ParseAdcStatusFrame(rx_buffer, kFrameLen, &status)) {
+    if (ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status)) {
         ++ok_count;
 
         status.packets = ok_count;
@@ -355,12 +369,13 @@ void SpiLink_Task(void)
         status.timeouts = timeout_count;
 
         ESP_LOGI(TAG,
-                 "RX ADC status: sample=%lu/%lu vin=%lu mV dut=%lu bits=%u",
-                 static_cast<unsigned long>(status.sample_index),
-                 static_cast<unsigned long>(status.total_samples),
-                 static_cast<unsigned long>(status.input_mv),
-                 static_cast<unsigned long>(status.dut_adc_code),
-                 static_cast<unsigned>(rx_bits));
+                 "RX freq response: point=%lu/%lu freq=%luHz vin=%ldmV vout=%ldmV gain=%ld",
+                 static_cast<unsigned long>(status.point_index),
+                 static_cast<unsigned long>(status.total_points),
+                 static_cast<unsigned long>(status.current_freq_hz),
+                 static_cast<long>(status.vin_mv),
+                 static_cast<long>(status.vout_mv),
+                 static_cast<long>(status.gain_x1000));
 
         UpdateUiWithLock(status);
         return;
@@ -369,7 +384,7 @@ void SpiLink_Task(void)
     ++err_count;
 
     ESP_LOGW(TAG,
-             "Invalid ADC status frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
+             "Invalid freq response frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
              static_cast<unsigned>(rx_bits),
              rx_buffer[0],
              rx_buffer[1],

@@ -6,47 +6,82 @@
 extern "C" {
 #endif
 
+#define MAX_POINTS 512
+
+typedef enum {
+    FREQRESP_STATE_IDLE = 0,
+    FREQRESP_STATE_SCANNING = 1,
+    FREQRESP_STATE_DONE = 2,
+    FREQRESP_STATE_ERROR = 3,
+} freqresp_state_t;
+
+typedef enum {
+    MODE_SWEEP = 0,
+    MODE_SINGLE = 1,
+} freqresp_mode_t;
+
+typedef enum {
+    FILTER_TYPE_UNKNOWN = 0,
+    FILTER_TYPE_LOW_PASS = 1,
+    FILTER_TYPE_HIGH_PASS = 2,
+    FILTER_TYPE_BAND_PASS = 3,
+    FILTER_TYPE_BAND_STOP = 4,
+} freqresp_filter_type_t;
+
+typedef enum {
+    CMD_START = 1,
+    CMD_STOP = 2,
+    CMD_SET_MODE = 3,
+    CMD_SET_START_FREQ = 4,
+    CMD_SET_STOP_FREQ = 5,
+    CMD_SET_STEP_FREQ = 6,
+    CMD_SET_SINGLE_FREQ = 7,
+    CMD_CLEAR_TABLE = 8,
+} freqresp_command_t;
+
+typedef struct {
+    uint32_t freq_hz;
+    int32_t vin_mv;
+    int32_t vout_mv;
+    int32_t gain_x1000;
+    int32_t theory_gain_x1000;
+    int32_t error_x10;
+    int32_t phase_deg_x10;
+} freq_point_t;
+
 typedef struct {
     uint32_t packets;
     uint32_t frame_errors;
     uint32_t timeouts;
+
+    uint8_t link_ok;
     uint8_t state;
     uint8_t mode;
-    uint8_t source;
-    uint8_t monitor_ok;
+    uint8_t filter_type;
+
     uint32_t progress_permille;
-    uint32_t elapsed_ms;
 
-    uint32_t sample_index;
-    uint32_t total_samples;
+    uint32_t start_freq_hz;
+    uint32_t stop_freq_hz;
+    uint32_t step_freq_hz;
+    uint32_t single_freq_hz;
 
-    uint32_t dut_adc_code;
-    uint32_t dut_adc_bits;
-    uint32_t dut_adc_avg_x1000;
-    uint32_t dut_conversion_time_ns;
+    uint32_t current_freq_hz;
+    uint32_t point_index;
+    uint32_t total_points;
 
-    uint32_t input_mv;
-    uint32_t stm32_adc_raw12;
-    uint32_t stm32_adc_mv;
+    int32_t vin_mv;
+    int32_t vout_mv;
+    int32_t gain_x1000;
+    int32_t theory_gain_x1000;
+    int32_t error_x10;
+    int32_t phase_deg_x10;
 
-    int32_t offset_error_lsb_x1000;
-    int32_t gain_error_lsb_x1000;
-    int32_t gain_error_ppm;
-    int32_t dnl_min_x1000;
-    int32_t dnl_max_x1000;
-    int32_t inl_min_x1000;
-    int32_t inl_max_x1000;
-    uint32_t missing_codes;
-
-    int32_t snr_db_x100;
-    int32_t sinad_db_x100;
-    int32_t enob_x100;
-    int32_t sfdr_db_x100;
-    int32_t thd_db_x100;
-} adc_ui_status_t;
+    uint32_t cutoff_freq_hz;
+} freqresp_ui_status_t;
 
 void test_screen_create(void);
-void test_screen_update_measurement(const adc_ui_status_t *status);
+void test_screen_update_measurement(const freqresp_ui_status_t *status);
 
 #ifdef __cplusplus
 }
