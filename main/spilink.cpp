@@ -12,6 +12,10 @@
 
 #include "ui/test_screen.h"
 
+#ifndef ENABLE_SPI_STRING_TEST
+#define ENABLE_SPI_STRING_TEST 1
+#endif
+
 namespace {
 
 constexpr char TAG[] = "FreqRespSpiLink";
@@ -27,8 +31,11 @@ constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
 constexpr uint8_t kFrameTypeFreqRespStatus = 0x10;
 constexpr uint8_t kFrameTypeCommand = 0x80;
+constexpr uint8_t kFrameTypePynqToEspText = 0xE1;
+constexpr uint8_t kFrameTypeEspToPynqText = 0xE2;
 constexpr uint8_t kPayloadLen = 112;
 constexpr uint8_t kCommandPayloadLen = 16;
+constexpr size_t kTextMaxLen = 104;
 
 constexpr size_t kFrameHeaderLen = 4;
 constexpr size_t kFrameLen = kFrameHeaderLen + kPayloadLen + 1;
@@ -66,6 +73,13 @@ size_t g_cmd_head = 0;
 size_t g_cmd_tail = 0;
 size_t g_cmd_count = 0;
 
+#if ENABLE_SPI_STRING_TEST
+portMUX_TYPE g_text_lock = portMUX_INITIALIZER_UNLOCKED;
+uint32_t g_rx_text_seq = 0;
+uint32_t g_tx_text_seq = 0;
+char g_tx_text[kTextMaxLen + 1] = {};
+#endif
+
 uint8_t Checksum(const uint8_t *frame, size_t len)
 {
     uint8_t checksum = 0;
@@ -94,6 +108,15 @@ void PutU32(uint8_t *buffer, size_t offset, uint32_t value)
     buffer[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xFFU);
     buffer[offset + 2] = static_cast<uint8_t>((value >> 16) & 0xFFU);
     buffer[offset + 3] = static_cast<uint8_t>((value >> 24) & 0xFFU);
+}
+
+size_t TextLen104(const char *text)
+{
+    size_t len = 0;
+    while (len < kTextMaxLen && text[len] != '\0') {
+        ++len;
+    }
+    return len;
 }
 
 bool PopPendingCommand(pending_command_t *out)
@@ -162,9 +185,95 @@ bool ParseFreqRespStatusFrame(const uint8_t *frame, size_t len, freqresp_ui_stat
     return true;
 }
 
+#if ENABLE_SPI_STRING_TEST
+bool ParseTextFrame(const uint8_t *frame, size_t len, uint8_t expected_type, uint32_t *seq, char *text, size_t text_len)
+{
+    if (frame == nullptr || seq == nullptr || text == nullptr || text_len == 0U || len < kSpiTransferLen) {
+        return false;
+    }
+
+    text[0] = '\0';
+
+    if (frame[0] != kFrameMagic0 || frame[1] != kFrameMagic1) {
+        return false;
+    }
+
+    if (frame[2] != expected_type || frame[3] != kPayloadLen) {
+        return false;
+    }
+
+    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
+    if (rx_checksum != expected_checksum) {
+        return false;
+    }
+
+    *seq = GetU32(frame, 4);
+    uint32_t rx_text_len = GetU32(frame, 8);
+    if (rx_text_len > kTextMaxLen) {
+        rx_text_len = kTextMaxLen;
+    }
+    if (rx_text_len >= text_len) {
+        rx_text_len = static_cast<uint32_t>(text_len - 1U);
+    }
+
+    std::memcpy(text, &frame[12], rx_text_len);
+    text[rx_text_len] = '\0';
+    return true;
+}
+
+void BuildTextFrame(uint8_t *frame)
+{
+    std::memset(frame, 0x00, kTxBufferLen);
+
+    char text[kTextMaxLen + 1] = {};
+    uint32_t seq = 0;
+
+    portENTER_CRITICAL(&g_text_lock);
+    seq = g_tx_text_seq;
+    std::memcpy(text, g_tx_text, sizeof(text));
+    portEXIT_CRITICAL(&g_text_lock);
+
+    frame[0] = kFrameMagic0;
+    frame[1] = kFrameMagic1;
+    frame[2] = kFrameTypeEspToPynqText;
+    frame[3] = kPayloadLen;
+
+    const uint32_t len = static_cast<uint32_t>(TextLen104(text));
+    PutU32(frame, 4, seq);
+    PutU32(frame, 8, len);
+    if (len > 0U) {
+        std::memcpy(&frame[12], text, len);
+    }
+
+    frame[kFrameHeaderLen + kPayloadLen] = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+}
+
+void UpdateSpiTextUiWithLock(const char *text, uint8_t link_state)
+{
+    if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
+        return;
+    }
+
+    test_screen_update_spi_text_test(text, link_state);
+
+    esp_lv_adapter_unlock();
+}
+#endif
+
 void PrepareTxBuffer()
 {
     std::memset(tx_buffer, 0x00, kTxBufferLen);
+
+#if ENABLE_SPI_STRING_TEST
+    portENTER_CRITICAL(&g_text_lock);
+    const bool has_text_frame = (g_tx_text_seq != 0U);
+    portEXIT_CRITICAL(&g_text_lock);
+    if (has_text_frame) {
+        BuildTextFrame(tx_buffer);
+        return;
+    }
+#endif
 
     pending_command_t pending = {};
     const bool has_cmd = PopPendingCommand(&pending);
@@ -313,6 +422,26 @@ void SpiLink_SetPendingCommand(uint32_t cmd, uint32_t arg0, uint32_t arg1)
     portEXIT_CRITICAL(&g_cmd_lock);
 }
 
+void SpiLink_SendTextToPynq(const char *text)
+{
+#if ENABLE_SPI_STRING_TEST
+    if (text == nullptr) {
+        return;
+    }
+
+    portENTER_CRITICAL(&g_text_lock);
+    ++g_tx_text_seq;
+    if (g_tx_text_seq == 0U) {
+        ++g_tx_text_seq;
+    }
+    std::memset(g_tx_text, 0x00, sizeof(g_tx_text));
+    std::strncpy(g_tx_text, text, kTextMaxLen);
+    portEXIT_CRITICAL(&g_text_lock);
+#else
+    (void)text;
+#endif
+}
+
 void SpiLink_Task(void)
 {
     if (!spi_ready || rx_buffer == nullptr || tx_buffer == nullptr) {
@@ -336,6 +465,9 @@ void SpiLink_Task(void)
 
     if (err == ESP_ERR_TIMEOUT) {
         ++timeout_count;
+#if ENABLE_SPI_STRING_TEST
+        UpdateSpiTextUiWithLock(nullptr, 0U);
+#endif
         return;
     }
 
@@ -349,7 +481,6 @@ void SpiLink_Task(void)
         return;
     }
 
-    freqresp_ui_status_t status = {};
     const size_t rx_bits = static_cast<size_t>(trans.trans_len);
     if (rx_bits != (kSpiTransferLen * 8U)) {
         ++err_count;
@@ -361,6 +492,33 @@ void SpiLink_Task(void)
         return;
     }
 
+#if ENABLE_SPI_STRING_TEST
+    uint32_t text_seq = 0;
+    char text[kTextMaxLen + 1] = {};
+    if (ParseTextFrame(rx_buffer, kSpiTransferLen, kFrameTypePynqToEspText, &text_seq, text, sizeof(text))) {
+        ++ok_count;
+
+        bool is_new_text = false;
+        portENTER_CRITICAL(&g_text_lock);
+        if (text_seq != 0U && text_seq != g_rx_text_seq) {
+            g_rx_text_seq = text_seq;
+            is_new_text = true;
+        }
+        portEXIT_CRITICAL(&g_text_lock);
+
+        if (is_new_text) {
+            ESP_LOGI(TAG, "RX text from PYNQ: seq=%lu text=%s",
+                     static_cast<unsigned long>(text_seq),
+                     text);
+            UpdateSpiTextUiWithLock(text, 1U);
+        } else {
+            UpdateSpiTextUiWithLock(nullptr, 1U);
+        }
+        return;
+    }
+#endif
+
+    freqresp_ui_status_t status = {};
     if (ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status)) {
         ++ok_count;
 
@@ -395,4 +553,7 @@ void SpiLink_Task(void)
              rx_buffer[6],
              rx_buffer[7],
              static_cast<unsigned long>(err_count));
+#if ENABLE_SPI_STRING_TEST
+    UpdateSpiTextUiWithLock(nullptr, 2U);
+#endif
 }

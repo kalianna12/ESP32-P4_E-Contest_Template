@@ -12,6 +12,10 @@
 #define ENABLE_FAKE_DATA_TEST 1
 #endif
 
+#ifndef ENABLE_SPI_TEST_WINDOW
+#define ENABLE_SPI_TEST_WINDOW 1
+#endif
+
 #define TEST_SCREEN_W 1024
 #define TEST_SCREEN_H 600
 
@@ -61,6 +65,7 @@ static lv_obj_t *g_open_table_btn = nullptr;
 static lv_obj_t *g_full_table = nullptr;
 static bool g_main_page_active = false;
 static bool g_reconstruction_page_active = false;
+static bool g_spi_test_page_active = false;
 
 static lv_obj_t *g_adv_status = nullptr;
 static lv_obj_t *g_adv_model_line = nullptr;
@@ -89,6 +94,15 @@ static circuit_model_t g_circuit_model = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
 static bool g_model_saved_for_current_sweep = false;
+
+#if ENABLE_SPI_TEST_WINDOW
+static lv_obj_t *g_spi_test_link = nullptr;
+static lv_obj_t *g_spi_test_rx = nullptr;
+static lv_obj_t *g_spi_test_tx = nullptr;
+static lv_obj_t *g_spi_test_input = nullptr;
+static char g_spi_test_last_rx[105] = {};
+static uint8_t g_spi_test_link_state = 0;
+#endif
 
 #if ENABLE_FAKE_DATA_TEST
 static lv_timer_t *g_fake_timer = nullptr;
@@ -815,7 +829,9 @@ static void keyboard_event_cb(lv_event_t *event)
 {
     const lv_event_code_t code = lv_event_get_code(event);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        read_and_validate_inputs();
+        if (g_main_page_active) {
+            read_and_validate_inputs();
+        }
         lv_keyboard_set_textarea(g_keyboard, nullptr);
         lv_obj_add_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
@@ -910,6 +926,164 @@ static void adv_back_event_cb(lv_event_t *event)
     }
 }
 
+#if ENABLE_SPI_TEST_WINDOW
+static void update_spi_test_labels(void)
+{
+    if (!g_spi_test_page_active) {
+        return;
+    }
+
+    if (g_spi_test_link != nullptr) {
+        const char *link_text = "Link: WAIT";
+        uint32_t link_color = COLOR_YELLOW;
+        if (g_spi_test_link_state == 1U) {
+            link_text = "Link: OK";
+            link_color = COLOR_GREEN;
+        } else if (g_spi_test_link_state == 2U) {
+            link_text = "Link: ERR";
+            link_color = COLOR_RED;
+        }
+
+        lv_label_set_text(g_spi_test_link, link_text);
+        lv_obj_set_style_text_color(g_spi_test_link,
+                                    lv_color_hex(link_color),
+                                    LV_PART_MAIN);
+    }
+
+    if (g_spi_test_rx != nullptr) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "RX From PYNQ: %s", g_spi_test_last_rx);
+        lv_label_set_text(g_spi_test_rx, buf);
+    }
+}
+
+static void spi_test_textarea_event_cb(lv_event_t *event)
+{
+    const lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t *ta = static_cast<lv_obj_t *>(lv_event_get_target(event));
+
+    if (code == LV_EVENT_FOCUSED || code == LV_EVENT_CLICKED) {
+        lv_keyboard_set_textarea(g_keyboard, ta);
+        lv_keyboard_set_mode(g_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_clear_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        lv_keyboard_set_textarea(g_keyboard, nullptr);
+        lv_obj_add_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_state(ta, LV_STATE_FOCUSED);
+    }
+}
+
+static void spi_test_send_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || g_spi_test_input == nullptr) {
+        return;
+    }
+
+    const char *text = lv_textarea_get_text(g_spi_test_input);
+    SpiLink_SendTextToPynq(text);
+
+    if (g_spi_test_tx != nullptr) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "TX To PYNQ: %s", text);
+        lv_label_set_text(g_spi_test_tx, buf);
+        lv_obj_set_style_text_color(g_spi_test_tx, lv_color_hex(COLOR_GREEN), LV_PART_MAIN);
+    }
+}
+
+static void spi_test_close_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        create_main_page();
+        if (g_have_last_status) {
+            render_basic_status(&g_last_status);
+        }
+    }
+}
+
+static lv_obj_t *create_spi_text_input(lv_obj_t *parent, int32_t x, int32_t y)
+{
+    lv_obj_t *ta = lv_textarea_create(parent);
+    lv_obj_set_pos(ta, x, y);
+    lv_obj_set_size(ta, 600, 42);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_max_length(ta, 104);
+    lv_textarea_set_placeholder_text(ta, "type text for PYNQ");
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ta, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(COLOR_INPUT), LV_PART_MAIN);
+    lv_obj_set_style_border_color(ta, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_style_radius(ta, 6, LV_PART_MAIN);
+    lv_obj_add_event_cb(ta, spi_test_textarea_event_cb, LV_EVENT_ALL, nullptr);
+    return ta;
+}
+
+static void create_spi_test_page(void)
+{
+#if LVGL_VERSION_MAJOR >= 9
+    lv_obj_t *screen = lv_screen_active();
+#else
+    lv_obj_t *screen = lv_scr_act();
+#endif
+
+    lv_obj_clean(screen);
+    g_main_page_active = false;
+    g_reconstruction_page_active = false;
+    g_spi_test_page_active = true;
+
+    g_top_status = nullptr;
+    g_msg = nullptr;
+    g_chart = nullptr;
+    g_chart_gain = nullptr;
+    g_latest = nullptr;
+    g_adv_status = nullptr;
+    g_adv_model_line = nullptr;
+    g_adv_model_range_line = nullptr;
+    g_adv_result = nullptr;
+    g_adv_output_chart = nullptr;
+    g_adv_output_series = nullptr;
+    g_adv_recon_chart = nullptr;
+    g_adv_recon_series = nullptr;
+    for (uint32_t i = 0; i < 6U; ++i) {
+        g_adv_harmonic_rows[i] = nullptr;
+    }
+
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+
+    create_label(screen, "SPI Text Test", 24, 18, 360, &lv_font_montserrat_24, COLOR_TEXT);
+    g_spi_test_link = create_label(screen, "Link: WAIT", 760, 22, 220, &lv_font_montserrat_20, COLOR_YELLOW);
+    create_hline(screen, 65);
+
+    g_spi_test_rx = create_label(screen, "RX From PYNQ: ", 40, 110, 900, &lv_font_montserrat_24, COLOR_BLUE);
+    create_label(screen, "TX To PYNQ:", 40, 190, 200, &lv_font_montserrat_20, COLOR_SUBTEXT);
+    g_spi_test_input = create_spi_text_input(screen, 40, 225);
+    lv_obj_t *send = create_button(screen, "Send", 670, 225, 120);
+    lv_obj_add_event_cb(send, spi_test_send_event_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_spi_test_tx = create_label(screen, "TX To PYNQ: ", 40, 290, 900, &lv_font_montserrat_20, COLOR_TEXT);
+
+    create_label(screen,
+                 "SPI: PYNQ Master -> ESP32-P4 Slave, mode 0, 128 bytes per transaction",
+                 40,
+                 370,
+                 900,
+                 &lv_font_montserrat_18,
+                 COLOR_SUBTEXT);
+
+    lv_obj_t *close = create_button(screen, "Close Test", 800, 520, 180);
+    lv_obj_add_event_cb(close, spi_test_close_event_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_keyboard = lv_keyboard_create(screen);
+    lv_keyboard_set_mode(g_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_add_event_cb(g_keyboard, keyboard_event_cb, LV_EVENT_ALL, nullptr);
+    lv_obj_add_flag(g_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    update_spi_test_labels();
+}
+#endif
+
 static lv_obj_t *create_wave_chart(lv_obj_t *parent,
                                    int32_t x,
                                    int32_t y,
@@ -947,12 +1121,19 @@ static void create_reconstruction_page(void)
     lv_obj_clean(screen);
     g_main_page_active = false;
     g_reconstruction_page_active = true;
+    g_spi_test_page_active = false;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
     g_chart_gain = nullptr;
     g_latest = nullptr;
     g_keyboard = nullptr;
+#if ENABLE_SPI_TEST_WINDOW
+    g_spi_test_link = nullptr;
+    g_spi_test_rx = nullptr;
+    g_spi_test_tx = nullptr;
+    g_spi_test_input = nullptr;
+#endif
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
     lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
@@ -1053,6 +1234,7 @@ static void create_main_page(void)
     lv_obj_clean(screen);
     g_main_page_active = true;
     g_reconstruction_page_active = false;
+    g_spi_test_page_active = false;
     g_adv_status = nullptr;
     g_adv_model_line = nullptr;
     g_adv_model_range_line = nullptr;
@@ -1064,6 +1246,12 @@ static void create_main_page(void)
     for (uint32_t i = 0; i < 6U; ++i) {
         g_adv_harmonic_rows[i] = nullptr;
     }
+#if ENABLE_SPI_TEST_WINDOW
+    g_spi_test_link = nullptr;
+    g_spi_test_rx = nullptr;
+    g_spi_test_tx = nullptr;
+    g_spi_test_input = nullptr;
+#endif
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
     lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
@@ -1178,7 +1366,11 @@ static void create_main_page(void)
 
 void test_screen_create(void)
 {
+#if ENABLE_SPI_TEST_WINDOW
+    create_spi_test_page();
+#else
     create_main_page();
+#endif
 
 #if ENABLE_FAKE_DATA_TEST
     g_fake_index = 0;
@@ -1264,6 +1456,22 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
     render_basic_status(s);
 }
 
+void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state)
+{
+#if ENABLE_SPI_TEST_WINDOW
+    g_spi_test_link_state = link_state;
+
+    if (rx_text != nullptr) {
+        snprintf(g_spi_test_last_rx, sizeof(g_spi_test_last_rx), "%s", rx_text);
+    }
+
+    update_spi_test_labels();
+#else
+    (void)rx_text;
+    (void)link_state;
+#endif
+}
+
 static void set_table_cell(lv_obj_t *table, uint32_t row, uint32_t col, const char *text)
 {
     lv_table_set_cell_value(table, row, col, text);
@@ -1281,11 +1489,18 @@ static void create_full_table_page(void)
     lv_obj_clean(screen);
     g_main_page_active = false;
     g_reconstruction_page_active = false;
+    g_spi_test_page_active = false;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
     g_chart_gain = nullptr;
     g_latest = nullptr;
+#if ENABLE_SPI_TEST_WINDOW
+    g_spi_test_link = nullptr;
+    g_spi_test_rx = nullptr;
+    g_spi_test_tx = nullptr;
+    g_spi_test_input = nullptr;
+#endif
     lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
     lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);

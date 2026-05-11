@@ -107,6 +107,7 @@ typedef struct {
 
 void test_screen_create(void);
 void test_screen_update_measurement(const freqresp_ui_status_t *status);
+void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state);
 
 #ifdef __cplusplus
 }
