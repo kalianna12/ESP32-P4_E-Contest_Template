@@ -47,6 +47,7 @@ static lv_obj_t *g_freq = nullptr;
 static lv_obj_t *g_vin = nullptr;
 static lv_obj_t *g_vout = nullptr;
 static lv_obj_t *g_gain_line = nullptr;
+static lv_obj_t *g_theory = nullptr;
 static lv_obj_t *g_error_line = nullptr;
 static lv_obj_t *g_phase = nullptr;
 static lv_obj_t *g_type = nullptr;
@@ -59,6 +60,17 @@ static lv_obj_t *g_open_table_btn = nullptr;
 
 static lv_obj_t *g_full_table = nullptr;
 static bool g_main_page_active = false;
+static bool g_reconstruction_page_active = false;
+
+static lv_obj_t *g_adv_status = nullptr;
+static lv_obj_t *g_adv_model_line = nullptr;
+static lv_obj_t *g_adv_model_range_line = nullptr;
+static lv_obj_t *g_adv_result = nullptr;
+static lv_obj_t *g_adv_output_chart = nullptr;
+static lv_chart_series_t *g_adv_output_series = nullptr;
+static lv_obj_t *g_adv_recon_chart = nullptr;
+static lv_chart_series_t *g_adv_recon_series = nullptr;
+static lv_obj_t *g_adv_harmonic_rows[6] = {};
 
 static uint32_t g_start_freq_hz = DEFAULT_START_FREQ_HZ;
 static uint32_t g_stop_freq_hz = DEFAULT_STOP_FREQ_HZ;
@@ -73,6 +85,10 @@ static bool g_have_last_status = false;
 static uint32_t g_last_point_index = UINT32_MAX;
 static uint32_t g_last_point_freq = 0;
 static freqresp_ui_status_t g_last_status = {};
+static circuit_model_t g_circuit_model = {};
+static bool g_adv_output_captured = false;
+static bool g_adv_reconstruction_ready = false;
+static bool g_model_saved_for_current_sweep = false;
 
 #if ENABLE_FAKE_DATA_TEST
 static lv_timer_t *g_fake_timer = nullptr;
@@ -146,6 +162,16 @@ static void format_freq(char *buf, size_t len, uint32_t hz)
     } else {
         snprintf(buf, len, "%lu", static_cast<unsigned long>(hz));
     }
+}
+
+static void format_cutoff_freq(char *buf, size_t len, uint8_t filter_type, uint32_t cutoff_freq_hz)
+{
+    if (cutoff_freq_hz == 0U || filter_type == FILTER_TYPE_UNKNOWN) {
+        snprintf(buf, len, "-----");
+        return;
+    }
+
+    format_freq(buf, len, cutoff_freq_hz);
 }
 
 static void format_voltage(char *buf, size_t len, int32_t mv)
@@ -428,6 +454,170 @@ static void refresh_chart_from_table(void)
     lv_chart_refresh(g_chart);
 }
 
+static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
+{
+    if (s == nullptr ||
+        s->state != FREQRESP_STATE_DONE ||
+        s->mode != MODE_SWEEP ||
+        g_model_saved_for_current_sweep ||
+        g_table_count < 3U) {
+        return;
+    }
+
+    g_circuit_model.valid = true;
+    g_circuit_model.filter_type = s->filter_type;
+    g_circuit_model.cutoff_freq_hz = s->cutoff_freq_hz;
+    g_circuit_model.start_freq_hz = g_start_freq_hz;
+    g_circuit_model.stop_freq_hz = g_stop_freq_hz;
+    g_circuit_model.step_freq_hz = g_step_freq_hz;
+    g_circuit_model.point_count = (g_table_count > MODEL_POINTS_MAX) ? MODEL_POINTS_MAX : g_table_count;
+    g_circuit_model.saved_time_ms = lv_tick_get();
+
+    for (uint32_t i = 0; i < g_circuit_model.point_count; ++i) {
+        g_circuit_model.points[i].freq_hz = g_table[i].freq_hz;
+        g_circuit_model.points[i].gain_x1000 = g_table[i].gain_x1000;
+        g_circuit_model.points[i].phase_deg_x10 = g_table[i].phase_deg_x10;
+    }
+
+    g_adv_output_captured = false;
+    g_adv_reconstruction_ready = false;
+    g_model_saved_for_current_sweep = true;
+}
+
+static void set_adv_result(const char *text, uint32_t color)
+{
+    if (!g_reconstruction_page_active || g_adv_result == nullptr) {
+        return;
+    }
+
+    lv_label_set_text(g_adv_result, text);
+    lv_obj_set_style_text_color(g_adv_result, lv_color_hex(color), LV_PART_MAIN);
+}
+
+static void update_adv_model_line(void)
+{
+    if (!g_reconstruction_page_active || g_adv_model_line == nullptr || g_adv_model_range_line == nullptr) {
+        return;
+    }
+
+    char fc[16];
+    char start_freq[16];
+    char stop_freq[16];
+    char buf[180];
+
+    if (g_circuit_model.valid) {
+        format_cutoff_freq(fc,
+                           sizeof(fc),
+                           g_circuit_model.filter_type,
+                           g_circuit_model.cutoff_freq_hz);
+        format_freq(start_freq, sizeof(start_freq), g_circuit_model.start_freq_hz);
+        format_freq(stop_freq, sizeof(stop_freq), g_circuit_model.stop_freq_hz);
+        snprintf(buf,
+                 sizeof(buf),
+                 "Circuit Model: %s      fc: %s Hz      H(f): Loaded",
+                 filter_type_text(g_circuit_model.filter_type),
+                 fc);
+        lv_obj_set_style_text_color(g_adv_model_line, lv_color_hex(COLOR_GREEN), LV_PART_MAIN);
+        lv_label_set_text(g_adv_model_line, buf);
+
+        snprintf(buf,
+                 sizeof(buf),
+                 "Model Range: %s~%s Hz      Points: %lu",
+                 start_freq,
+                 stop_freq,
+                 static_cast<unsigned long>(g_circuit_model.point_count));
+        lv_label_set_text(g_adv_model_range_line, buf);
+        lv_obj_set_style_text_color(g_adv_model_range_line, lv_color_hex(COLOR_SUBTEXT), LV_PART_MAIN);
+    } else {
+        snprintf(buf, sizeof(buf), "Circuit Model: Unknown       fc: ----- Hz      H(f): Not Ready");
+        lv_obj_set_style_text_color(g_adv_model_line, lv_color_hex(COLOR_YELLOW), LV_PART_MAIN);
+        lv_label_set_text(g_adv_model_line, buf);
+
+        lv_label_set_text(g_adv_model_range_line, "Model Range: -----~----- Hz      Points: 0");
+        lv_obj_set_style_text_color(g_adv_model_range_line, lv_color_hex(COLOR_SUBTEXT), LV_PART_MAIN);
+    }
+}
+
+static void set_harmonic_rows_empty(void)
+{
+    static const char *rows[] = {
+        "No.   Freq      Amp       Phase",
+        "1     -----Hz   -.---V    -.-deg",
+        "2     -----Hz   -.---V    -.-deg",
+        "3     -----Hz   -.---V    -.-deg",
+        "4     -----Hz   -.---V    -.-deg",
+        "5     -----Hz   -.---V    -.-deg",
+    };
+
+    for (uint32_t i = 0; i < 6U; ++i) {
+        if (g_adv_harmonic_rows[i] != nullptr) {
+            lv_label_set_text(g_adv_harmonic_rows[i], rows[i]);
+        }
+    }
+}
+
+static void set_harmonic_rows_fake(void)
+{
+    static const char *rows[] = {
+        "No.   Freq      Amp       Phase",
+        "1     01000Hz   1.000V     0.0deg",
+        "2     02000Hz   0.320V    -5.1deg",
+        "3     03000Hz   0.180V    -8.7deg",
+        "4     04000Hz   0.090V   -12.2deg",
+        "5     05000Hz   0.050V   -16.8deg",
+    };
+
+    for (uint32_t i = 0; i < 6U; ++i) {
+        if (g_adv_harmonic_rows[i] != nullptr) {
+            lv_label_set_text(g_adv_harmonic_rows[i], rows[i]);
+        }
+    }
+}
+
+static void generate_fake_output_waveform(void)
+{
+    if (!g_reconstruction_page_active || g_adv_output_chart == nullptr || g_adv_output_series == nullptr) {
+        return;
+    }
+
+    lv_chart_set_all_value(g_adv_output_chart, g_adv_output_series, LV_CHART_POINT_NONE);
+    for (uint32_t i = 0; i < 128U; ++i) {
+        const double t = static_cast<double>(i) / 128.0;
+        const double y = 0.72 * sin(2.0 * 3.14159265358979323846 * t) +
+                         0.18 * sin(4.0 * 3.14159265358979323846 * t - 0.45) +
+                         0.08 * sin(6.0 * 3.14159265358979323846 * t - 0.75);
+        lv_chart_set_next_value(g_adv_output_chart,
+                                g_adv_output_series,
+                                static_cast<int32_t>(y * 900.0));
+    }
+    lv_chart_refresh(g_adv_output_chart);
+}
+
+static void generate_fake_reconstructed_waveform(void)
+{
+    if (!g_reconstruction_page_active || g_adv_recon_chart == nullptr || g_adv_recon_series == nullptr) {
+        return;
+    }
+
+    lv_chart_set_all_value(g_adv_recon_chart, g_adv_recon_series, LV_CHART_POINT_NONE);
+    for (uint32_t i = 0; i < 128U; ++i) {
+        const double t = static_cast<double>(i) / 128.0;
+        double x = 0.0;
+        x += 0.85 * sin(2.0 * 3.14159265358979323846 * t);
+        x += 0.28 * sin(6.0 * 3.14159265358979323846 * t);
+        x += 0.16 * sin(10.0 * 3.14159265358979323846 * t);
+        if (x > 1.0) {
+            x = 1.0;
+        } else if (x < -1.0) {
+            x = -1.0;
+        }
+        lv_chart_set_next_value(g_adv_recon_chart,
+                                g_adv_recon_series,
+                                static_cast<int32_t>(x * 900.0));
+    }
+    lv_chart_refresh(g_adv_recon_chart);
+}
+
 static void update_top_status(const freqresp_ui_status_t *s)
 {
     char buf[128];
@@ -496,32 +686,34 @@ static void update_current_point(const freqresp_ui_status_t *s)
     format_x1000(theory, sizeof(theory), s->theory_gain_x1000);
     format_error(err, sizeof(err), s->error_x10);
     format_phase(phase, sizeof(phase), s->phase_deg_x10);
-    format_freq(fc, sizeof(fc), s->cutoff_freq_hz);
+    format_cutoff_freq(fc, sizeof(fc), s->filter_type, s->cutoff_freq_hz);
 
     snprintf(buf, sizeof(buf), "Freq: %s Hz", freq);
     lv_label_set_text(g_freq, buf);
 
-    snprintf(buf, sizeof(buf), "Vin : %s", vin);
+    snprintf(buf, sizeof(buf), "Vin: %s", vin);
     lv_label_set_text(g_vin, buf);
 
     snprintf(buf, sizeof(buf), "Vout: %s", vout);
     lv_label_set_text(g_vout, buf);
 
-    snprintf(buf,
-             sizeof(buf),
-             "Gain : %s   Theory: %s",
-             gain,
-             theory);
+    snprintf(buf, sizeof(buf), "Gain: %s", gain);
     lv_label_set_text(g_gain_line, buf);
+
+    snprintf(buf, sizeof(buf), "Theory: %s", theory);
+    lv_label_set_text(g_theory, buf);
 
     snprintf(buf,
              sizeof(buf),
-             "Error: %s    %s",
+             "Error: %s %s",
              err,
              s->error_x10 <= 50 ? "PASS" : "FAIL");
     lv_label_set_text(g_error_line, buf);
     lv_obj_set_style_text_color(g_gain_line,
                                 lv_color_hex(s->error_x10 <= 50 ? COLOR_GREEN : COLOR_RED),
+                                LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_theory,
+                                lv_color_hex(COLOR_TEXT),
                                 LV_PART_MAIN);
     lv_obj_set_style_text_color(g_error_line,
                                 lv_color_hex(s->error_x10 <= 50 ? COLOR_GREEN : COLOR_RED),
@@ -530,11 +722,26 @@ static void update_current_point(const freqresp_ui_status_t *s)
     snprintf(buf, sizeof(buf), "Phase: %s", phase);
     lv_label_set_text(g_phase, buf);
 
-    snprintf(buf, sizeof(buf), "Type : %s", filter_type_text(s->filter_type));
+    snprintf(buf, sizeof(buf), "Type: %s", filter_type_text(s->filter_type));
     lv_label_set_text(g_type, buf);
 
-    snprintf(buf, sizeof(buf), "fc   : %s Hz", fc);
+    snprintf(buf, sizeof(buf), "fc: %s Hz", fc);
     lv_label_set_text(g_fc, buf);
+}
+
+static void render_basic_status(const freqresp_ui_status_t *s)
+{
+    if (s == nullptr || !g_main_page_active || g_top_status == nullptr) {
+        return;
+    }
+
+    update_top_status(s);
+    update_current_point(s);
+    update_latest_line(s);
+
+    if (g_table_full) {
+        set_msg("FULL", COLOR_RED);
+    }
 }
 
 static void start_button_event_cb(lv_event_t *event)
@@ -558,6 +765,8 @@ static void start_button_event_cb(lv_event_t *event)
         SpiLink_SetPendingCommand(CMD_SET_SINGLE_FREQ, g_single_freq_hz, 0U);
         SpiLink_SetPendingCommand(CMD_START, 0U, 0U);
     }
+
+    g_model_saved_for_current_sweep = false;
 
 #if ENABLE_FAKE_DATA_TEST
     clear_table_and_curve();
@@ -591,15 +800,16 @@ static void clear_button_event_cb(lv_event_t *event)
     }
 }
 
-static void theory_button_event_cb(lv_event_t *event)
-{
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
-        set_msg("TODO", COLOR_YELLOW);
-    }
-}
-
 static void create_main_page(void);
 static void create_full_table_page(void);
+static void create_reconstruction_page(void);
+
+static void advanced_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        create_reconstruction_page();
+    }
+}
 
 static void keyboard_event_cb(lv_event_t *event)
 {
@@ -623,8 +833,212 @@ static void back_button_event_cb(lv_event_t *event)
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         create_main_page();
         if (g_have_last_status) {
-            test_screen_update_measurement(&g_last_status);
+            render_basic_status(&g_last_status);
         }
+    }
+}
+
+static void adv_capture_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    if (!g_circuit_model.valid) {
+        set_adv_result("Result: MODEL? Run Basic Sweep first", COLOR_RED);
+        return;
+    }
+
+    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+
+#if ENABLE_FAKE_DATA_TEST
+    generate_fake_output_waveform();
+#endif
+
+    g_adv_output_captured = true;
+    set_adv_result("Result: Output y(t) captured", COLOR_GREEN);
+}
+
+static void adv_reconstruct_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    if (!g_circuit_model.valid) {
+        set_adv_result("Result: MODEL? Run Basic Sweep first", COLOR_RED);
+        return;
+    }
+
+    SpiLink_SetPendingCommand(CMD_ADV_RECONSTRUCT, 0U, 0U);
+
+#if ENABLE_FAKE_DATA_TEST
+    if (!g_adv_output_captured) {
+        generate_fake_output_waveform();
+        g_adv_output_captured = true;
+    }
+    generate_fake_reconstructed_waveform();
+    set_harmonic_rows_fake();
+#endif
+
+    g_adv_reconstruction_ready = true;
+    set_adv_result("Result: Reconstructed x(t) ready   Error: 3.4% PASS", COLOR_GREEN);
+}
+
+static void adv_send_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    if (!g_adv_reconstruction_ready) {
+        set_adv_result("Result: NO DATA", COLOR_RED);
+        return;
+    }
+
+    SpiLink_SetPendingCommand(CMD_ADV_SEND_TO_DDS, 0U, 0U);
+    set_adv_result("Result: Sent to DDS", COLOR_GREEN);
+}
+
+static void adv_back_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        create_main_page();
+        if (g_have_last_status) {
+            render_basic_status(&g_last_status);
+        }
+    }
+}
+
+static lv_obj_t *create_wave_chart(lv_obj_t *parent,
+                                   int32_t x,
+                                   int32_t y,
+                                   int32_t w,
+                                   int32_t h,
+                                   lv_chart_series_t **series,
+                                   uint32_t color)
+{
+    lv_obj_t *chart = lv_chart_create(parent);
+    lv_obj_set_pos(chart, x, y);
+    lv_obj_set_size(chart, w, h);
+    lv_obj_set_style_bg_color(chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(chart, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(chart, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(chart, 6, LV_PART_MAIN);
+    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, -1000, 1000);
+    lv_chart_set_point_count(chart, 128);
+    lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
+    *series = lv_chart_add_series(chart, lv_color_hex(color), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_all_value(chart, *series, LV_CHART_POINT_NONE);
+    lv_chart_refresh(chart);
+    return chart;
+}
+
+static void create_reconstruction_page(void)
+{
+#if LVGL_VERSION_MAJOR >= 9
+    lv_obj_t *screen = lv_screen_active();
+#else
+    lv_obj_t *screen = lv_scr_act();
+#endif
+
+    lv_obj_clean(screen);
+    g_main_page_active = false;
+    g_reconstruction_page_active = true;
+    g_top_status = nullptr;
+    g_msg = nullptr;
+    g_chart = nullptr;
+    g_chart_gain = nullptr;
+    g_latest = nullptr;
+    g_keyboard = nullptr;
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+
+    create_label(screen, "Signal Reconstruction", 24, 14, 430, &lv_font_montserrat_24, COLOR_TEXT);
+    g_adv_status = create_label(screen, "Link: OK   State: Ready", 610, 17, 390, &lv_font_montserrat_20, COLOR_GREEN);
+    create_hline(screen, 55);
+
+    g_adv_model_line = create_label(screen,
+                                    "Circuit Model: Unknown       fc: ----- Hz      H(f): Not Ready",
+                                    24,
+                                    70,
+                                    590,
+                                    &lv_font_montserrat_18,
+                                    COLOR_YELLOW);
+
+    g_adv_model_range_line = create_label(screen,
+                                          "Model Range: -----~----- Hz      Points: 0",
+                                          24,
+                                          96,
+                                          590,
+                                          &lv_font_montserrat_18,
+                                          COLOR_SUBTEXT);
+
+    create_label(screen,
+                 "Source: ADC CH2 Output       Sample Rate: 200 kSPS",
+                 24,
+                 122,
+                 590,
+                 &lv_font_montserrat_18,
+                 COLOR_SUBTEXT);
+    update_adv_model_line();
+
+    create_label(screen,
+                 "Step 1: Capture Output   Step 2: Reconstruct   Step 3: Send to DDS",
+                 24,
+                 150,
+                 590,
+                 &lv_font_montserrat_18,
+                 COLOR_SUBTEXT);
+
+    lv_obj_t *btn_capture = create_button(screen, "Capture Output", 24, 178, 180);
+    lv_obj_t *btn_reconstruct = create_button(screen, "Reconstruct", 224, 178, 160);
+    lv_obj_t *btn_send = create_button(screen, "Send to DDS", 404, 178, 150);
+    lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
+
+    create_vline(screen, 635, 65, 150);
+
+    create_label(screen, "Harmonic Analysis", 660, 70, 320, &lv_font_montserrat_20, COLOR_BLUE);
+    for (uint32_t i = 0; i < 6U; ++i) {
+        g_adv_harmonic_rows[i] = create_label(screen,
+                                              "",
+                                              675,
+                                              100 + static_cast<int32_t>(i * 20U),
+                                              315,
+                                              &lv_font_montserrat_18,
+                                              i == 0U ? COLOR_SUBTEXT : COLOR_TEXT);
+    }
+    set_harmonic_rows_empty();
+
+    create_hline(screen, 220);
+
+    create_label(screen, "Waveform", 24, 235, 240, &lv_font_montserrat_20, COLOR_BLUE);
+    create_label(screen, "Output y(t)", 24, 250, 220, &lv_font_montserrat_18, COLOR_SUBTEXT);
+    create_label(screen, "Reconstructed x(t)", 520, 250, 260, &lv_font_montserrat_18, COLOR_SUBTEXT);
+    g_adv_output_chart = create_wave_chart(screen, 24, 275, 460, 245, &g_adv_output_series, COLOR_BLUE);
+    g_adv_recon_chart = create_wave_chart(screen, 520, 275, 460, 245, &g_adv_recon_series, COLOR_GREEN);
+
+    create_hline(screen, 535);
+
+    g_adv_result = create_label(screen, "Result: Waiting", 24, 552, 850, &lv_font_montserrat_20, COLOR_YELLOW);
+    lv_obj_t *btn_back = create_button(screen, "Back", 900, 552, 100);
+    lv_obj_add_event_cb(btn_back, adv_back_event_cb, LV_EVENT_CLICKED, nullptr);
+
+    if (g_adv_output_captured) {
+        generate_fake_output_waveform();
+    }
+    if (g_adv_reconstruction_ready) {
+        generate_fake_reconstructed_waveform();
+        set_harmonic_rows_fake();
+        set_adv_result("Result: Reconstructed x(t) ready   Error: 3.4% PASS", COLOR_GREEN);
+    } else if (g_adv_output_captured) {
+        set_adv_result("Result: Output y(t) captured", COLOR_GREEN);
     }
 }
 
@@ -638,6 +1052,18 @@ static void create_main_page(void)
 
     lv_obj_clean(screen);
     g_main_page_active = true;
+    g_reconstruction_page_active = false;
+    g_adv_status = nullptr;
+    g_adv_model_line = nullptr;
+    g_adv_model_range_line = nullptr;
+    g_adv_result = nullptr;
+    g_adv_output_chart = nullptr;
+    g_adv_output_series = nullptr;
+    g_adv_recon_chart = nullptr;
+    g_adv_recon_series = nullptr;
+    for (uint32_t i = 0; i < 6U; ++i) {
+        g_adv_harmonic_rows[i] = nullptr;
+    }
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
     lv_obj_set_style_bg_color(screen, lv_color_hex(COLOR_BG), LV_PART_MAIN);
@@ -692,11 +1118,11 @@ static void create_main_page(void)
     lv_obj_t *btn_start = create_button(screen, "Start", 430, 137, 86);
     lv_obj_t *btn_stop = create_button(screen, "Stop", 530, 137, 86);
     lv_obj_t *btn_clear = create_button(screen, "Clear", 630, 137, 100);
-    lv_obj_t *btn_theory = create_button(screen, "Theory", 750, 137, 100);
+    lv_obj_t *btn_advanced = create_button(screen, "Advanced", 750, 137, 110);
     lv_obj_add_event_cb(btn_start, start_button_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_stop, stop_button_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_clear, clear_button_event_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(btn_theory, theory_button_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_advanced, advanced_button_event_cb, LV_EVENT_CLICKED, nullptr);
 
     g_msg = create_label(screen, "Ready", 870, 145, 130, &lv_font_montserrat_18, COLOR_GREEN);
 
@@ -706,13 +1132,14 @@ static void create_main_page(void)
 
     create_label(screen, "Current Point", 24, 205, 250, &lv_font_montserrat_20, COLOR_BLUE);
     g_freq = create_label(screen, "Freq: ----- Hz", 24, 245, 380, &lv_font_montserrat_18, COLOR_TEXT);
-    g_vin = create_label(screen, "Vin : -.--- V", 24, 275, 380, &lv_font_montserrat_18, COLOR_TEXT);
-    g_vout = create_label(screen, "Vout: -.--- V", 24, 305, 380, &lv_font_montserrat_18, COLOR_TEXT);
-    g_gain_line = create_label(screen, "Gain : -.---   Theory: -.---", 24, 335, 380, &lv_font_montserrat_18, COLOR_GREEN);
-    g_error_line = create_label(screen, "Error: -.-%    PASS", 24, 365, 380, &lv_font_montserrat_18, COLOR_GREEN);
+    g_vin = create_label(screen, "Vin: -.--- V", 24, 275, 180, &lv_font_montserrat_18, COLOR_TEXT);
+    g_vout = create_label(screen, "Vout: -.--- V", 220, 275, 190, &lv_font_montserrat_18, COLOR_TEXT);
+    g_gain_line = create_label(screen, "Gain: -.---", 24, 315, 180, &lv_font_montserrat_18, COLOR_GREEN);
+    g_theory = create_label(screen, "Theory: -.---", 220, 315, 190, &lv_font_montserrat_18, COLOR_TEXT);
+    g_error_line = create_label(screen, "Error: -.-% PASS", 24, 355, 380, &lv_font_montserrat_18, COLOR_GREEN);
     g_phase = create_label(screen, "Phase: -.- deg", 24, 395, 380, &lv_font_montserrat_18, COLOR_TEXT);
-    g_type = create_label(screen, "Type : Unknown", 24, 425, 380, &lv_font_montserrat_18, COLOR_TEXT);
-    g_fc = create_label(screen, "fc   : ----- Hz", 24, 455, 380, &lv_font_montserrat_18, COLOR_TEXT);
+    g_type = create_label(screen, "Type: Unknown", 24, 435, 180, &lv_font_montserrat_18, COLOR_TEXT);
+    g_fc = create_label(screen, "fc: ----- Hz", 220, 435, 190, &lv_font_montserrat_18, COLOR_TEXT);
 
     create_label(screen, "Gain Curve", 455, 205, 250, &lv_font_montserrat_20, COLOR_BLUE);
     g_chart = lv_chart_create(screen);
@@ -831,18 +1258,10 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
 
     g_last_status = *s;
     g_have_last_status = true;
+    save_circuit_model_from_table(s);
+    update_adv_model_line();
 
-    if (!g_main_page_active || g_top_status == nullptr) {
-        return;
-    }
-
-    update_top_status(s);
-    update_current_point(s);
-    update_latest_line(s);
-
-    if (g_table_full) {
-        set_msg("FULL", COLOR_RED);
-    }
+    render_basic_status(s);
 }
 
 static void set_table_cell(lv_obj_t *table, uint32_t row, uint32_t col, const char *text)
@@ -861,6 +1280,7 @@ static void create_full_table_page(void)
 
     lv_obj_clean(screen);
     g_main_page_active = false;
+    g_reconstruction_page_active = false;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;

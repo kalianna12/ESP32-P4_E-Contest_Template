@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -7,6 +8,7 @@ extern "C" {
 #endif
 
 #define MAX_POINTS 512
+#define MODEL_POINTS_MAX 128
 
 typedef enum {
     FREQRESP_STATE_IDLE = 0,
@@ -37,6 +39,9 @@ typedef enum {
     CMD_SET_STEP_FREQ = 6,
     CMD_SET_SINGLE_FREQ = 7,
     CMD_CLEAR_TABLE = 8,
+    CMD_ADV_CAPTURE = 20,
+    CMD_ADV_RECONSTRUCT = 21,
+    CMD_ADV_SEND_TO_DDS = 22,
 } freqresp_command_t;
 
 typedef struct {
@@ -48,6 +53,26 @@ typedef struct {
     int32_t error_x10;
     int32_t phase_deg_x10;
 } freq_point_t;
+
+typedef struct {
+    uint32_t freq_hz;
+    int32_t gain_x1000;
+    int32_t phase_deg_x10;
+} model_point_t;
+
+typedef struct {
+    bool valid;
+    uint8_t filter_type;
+    uint32_t cutoff_freq_hz;
+    uint32_t point_count;
+    model_point_t points[MODEL_POINTS_MAX];
+
+    uint32_t start_freq_hz;
+    uint32_t stop_freq_hz;
+    uint32_t step_freq_hz;
+
+    uint32_t saved_time_ms;
+} circuit_model_t;
 
 typedef struct {
     uint32_t packets;
