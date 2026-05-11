@@ -13,7 +13,7 @@
 #include "ui/test_screen.h"
 
 #ifndef ENABLE_SPI_STRING_TEST
-#define ENABLE_SPI_STRING_TEST 1
+#define ENABLE_SPI_STRING_TEST 0
 #endif
 
 namespace {

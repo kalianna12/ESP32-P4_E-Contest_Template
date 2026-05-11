@@ -9,11 +9,11 @@
 #include <string.h>
 
 #ifndef ENABLE_FAKE_DATA_TEST
-#define ENABLE_FAKE_DATA_TEST 1
+#define ENABLE_FAKE_DATA_TEST 0
 #endif
 
 #ifndef ENABLE_SPI_TEST_WINDOW
-#define ENABLE_SPI_TEST_WINDOW 1
+#define ENABLE_SPI_TEST_WINDOW 0
 #endif
 
 #define TEST_SCREEN_W 1024
