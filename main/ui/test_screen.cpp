@@ -115,6 +115,7 @@ static int32_t g_adc_max_mv = 0;
 static int32_t g_adc_mean_mv = 0;
 static int32_t g_adc_vpp_mv = 0;
 static uint32_t g_adc_flags = 0;
+static uint32_t g_adc_expected_chunk_index = 0;
 
 #if ENABLE_SPI_TEST_WINDOW
 static lv_obj_t *g_spi_test_link = nullptr;
@@ -790,6 +791,7 @@ static void reset_adc_waveform_buffer(void)
     g_adc_received_count = 0;
     g_adc_total_samples = 0;
     g_adc_flags = 0;
+    g_adc_expected_chunk_index = 0;
 }
 
 static void render_adc_test_page(void)
@@ -803,6 +805,7 @@ static void render_adc_test_page(void)
     const bool done = (g_adc_flags & 0x2U) != 0U &&
                       g_adc_total_samples != 0U &&
                       g_adc_received_count >= g_adc_total_samples;
+    const bool raw_mode = (g_adc_flags & 0x8U) != 0U;
 
     if (g_adc_status != nullptr) {
         snprintf(buf,
@@ -827,14 +830,25 @@ static void render_adc_test_page(void)
     }
 
     if (g_adc_range != nullptr) {
-        snprintf(buf,
-                 sizeof(buf),
-                 "Min: %ld mV    Max: %ld mV    Mean: %ld mV    Vpp: %ld mV    Amp: %ld mV",
-                 static_cast<long>(g_adc_min_mv),
-                 static_cast<long>(g_adc_max_mv),
-                 static_cast<long>(g_adc_mean_mv),
-                 static_cast<long>(g_adc_vpp_mv),
-                 static_cast<long>(g_adc_vpp_mv / 2));
+        if (raw_mode) {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Min: %ld raw    Max: %ld raw    Mean: %ld raw    Vpp: %ld raw    Amp: %ld raw",
+                     static_cast<long>(g_adc_min_mv),
+                     static_cast<long>(g_adc_max_mv),
+                     static_cast<long>(g_adc_mean_mv),
+                     static_cast<long>(g_adc_vpp_mv),
+                     static_cast<long>(g_adc_vpp_mv / 2));
+        } else {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Min: %ld mV    Max: %ld mV    Mean: %ld mV    Vpp: %ld mV    Amp: %ld mV",
+                     static_cast<long>(g_adc_min_mv),
+                     static_cast<long>(g_adc_max_mv),
+                     static_cast<long>(g_adc_mean_mv),
+                     static_cast<long>(g_adc_vpp_mv),
+                     static_cast<long>(g_adc_vpp_mv / 2));
+        }
         lv_label_set_text(g_adc_range, buf);
     }
 
@@ -846,6 +860,7 @@ static void render_adc_test_page(void)
     }
 
     if (g_adc_chart != nullptr && g_adc_series != nullptr) {
+        lv_chart_set_range(g_adc_chart, LV_CHART_AXIS_PRIMARY_Y, raw_mode ? 0 : -5000, raw_mode ? 4095 : 5000);
         lv_chart_set_all_value(g_adc_chart, g_adc_series, LV_CHART_POINT_NONE);
         const uint32_t count = (g_adc_total_samples > ADC_TEST_SAMPLE_MAX) ?
             ADC_TEST_SAMPLE_MAX : g_adc_total_samples;
@@ -1703,6 +1718,18 @@ void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
     g_adc_mean_mv = chunk->mean_mv;
     g_adc_vpp_mv = chunk->vpp_mv;
     g_adc_flags = chunk->flags;
+
+    if (chunk->chunk_index != g_adc_expected_chunk_index) {
+        printf("ADC chunk discontinuity: seq=%lu got=%lu expected=%lu count=%lu\n",
+               static_cast<unsigned long>(chunk->seq),
+               static_cast<unsigned long>(chunk->chunk_index),
+               static_cast<unsigned long>(g_adc_expected_chunk_index),
+               static_cast<unsigned long>(chunk->chunk_count));
+    }
+    g_adc_expected_chunk_index = chunk->chunk_index + 1U;
+    if (g_adc_expected_chunk_index >= chunk->chunk_count) {
+        g_adc_expected_chunk_index = 0;
+    }
 
     for (uint32_t i = 0; i < 30U; ++i) {
         const uint32_t index = chunk->start_sample_index + i;

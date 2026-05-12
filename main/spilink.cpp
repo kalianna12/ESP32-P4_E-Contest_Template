@@ -616,6 +616,19 @@ void SpiLink_Task(void)
                  static_cast<long>(adc_chunk.vpp_mv),
                  static_cast<unsigned long>(adc_chunk.flags));
 
+        if ((adc_chunk.flags & 0x8U) != 0U) {
+            ESP_LOGI(TAG,
+                     "ADC raw first16: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+                     adc_chunk.samples[0], adc_chunk.samples[1],
+                     adc_chunk.samples[2], adc_chunk.samples[3],
+                     adc_chunk.samples[4], adc_chunk.samples[5],
+                     adc_chunk.samples[6], adc_chunk.samples[7],
+                     adc_chunk.samples[8], adc_chunk.samples[9],
+                     adc_chunk.samples[10], adc_chunk.samples[11],
+                     adc_chunk.samples[12], adc_chunk.samples[13],
+                     adc_chunk.samples[14], adc_chunk.samples[15]);
+        }
+
         UpdateAdcWaveformUiWithLock(adc_chunk);
         return;
     }
