@@ -410,6 +410,10 @@ static void clear_table_and_curve(void)
 
 static void append_table_point(const freqresp_ui_status_t *s)
 {
+    if (s->state != FREQRESP_STATE_SCANNING && s->state != FREQRESP_STATE_DONE) {
+        return;
+    }
+
     if (s->current_freq_hz == 0U) {
         return;
     }
@@ -782,8 +786,9 @@ static void start_button_event_cb(lv_event_t *event)
 
     g_model_saved_for_current_sweep = false;
 
-#if ENABLE_FAKE_DATA_TEST
     clear_table_and_curve();
+
+#if ENABLE_FAKE_DATA_TEST
     g_fake_index = 0;
     if (g_fake_timer != nullptr) {
         lv_timer_resume(g_fake_timer);
