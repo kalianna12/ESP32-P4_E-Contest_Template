@@ -124,8 +124,29 @@ typedef struct {
     int16_t samples[30];
 } adc_waveform_chunk_t;
 
+typedef struct {
+    uint32_t seq;
+    uint32_t sample_rate_hz;
+    uint32_t dds_freq_hz;
+    uint32_t capture_sample_count;
+    uint32_t display_sample_count;
+    uint32_t measured_freq_hz;
+    int32_t raw_min;
+    int32_t raw_max;
+    int32_t raw_mean;
+    int32_t raw_vpp;
+    int32_t raw_rms;
+    int32_t amp_peak_raw;
+    int32_t amp_rms_raw;
+    int32_t phase_deg_x10;
+    uint32_t flags;
+    uint32_t display_decimation;
+    uint32_t zero_cross_count;
+} adc_analysis_result_t;
+
 void test_screen_create(void);
 void test_screen_update_measurement(const freqresp_ui_status_t *status);
+void test_screen_update_adc_analysis_result(const adc_analysis_result_t *result);
 void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk);
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state);
 

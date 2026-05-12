@@ -116,6 +116,8 @@ static int32_t g_adc_mean_mv = 0;
 static int32_t g_adc_vpp_mv = 0;
 static uint32_t g_adc_flags = 0;
 static uint32_t g_adc_expected_chunk_index = 0;
+static adc_analysis_result_t g_adc_result = {};
+static bool g_adc_have_result = false;
 
 #if ENABLE_SPI_TEST_WINDOW
 static lv_obj_t *g_spi_test_link = nullptr;
@@ -792,9 +794,11 @@ static void reset_adc_waveform_buffer(void)
     g_adc_total_samples = 0;
     g_adc_flags = 0;
     g_adc_expected_chunk_index = 0;
+    g_adc_have_result = false;
+    memset(&g_adc_result, 0, sizeof(g_adc_result));
 }
 
-static void render_adc_test_page(void)
+static void render_adc_test_page(bool redraw_chart = true)
 {
     if (!g_adc_test_page_active) {
         return;
@@ -821,8 +825,9 @@ static void render_adc_test_page(void)
     if (g_adc_info != nullptr) {
         snprintf(buf,
                  sizeof(buf),
-                 "DDS Freq: %05lu Hz      Sample Rate: %lu SPS      Samples: %lu/%lu",
+                 "DDS: %05lu Hz   Meas: %05lu Hz   Fs: %lu SPS   Samples: %lu/%lu",
                  static_cast<unsigned long>(g_adc_dds_freq_hz),
+                 static_cast<unsigned long>(g_adc_result.measured_freq_hz),
                  static_cast<unsigned long>(g_adc_sample_rate_hz),
                  static_cast<unsigned long>(g_adc_received_count),
                  static_cast<unsigned long>(g_adc_total_samples));
@@ -853,20 +858,35 @@ static void render_adc_test_page(void)
     }
 
     if (g_adc_ora != nullptr) {
-        lv_label_set_text(g_adc_ora, overrange ? "ORA: OVER RANGE" : "ORA: OK");
+        const bool clip = (g_adc_flags & 0x10U) != 0U;
+        const bool dft_valid = (g_adc_flags & 0x40U) != 0U;
+        snprintf(buf,
+                 sizeof(buf),
+                 "ORA: %s   Clip: %s   DFT: %s   AmpPk: %ld   AmpRMS: %ld   Phase: %ld.%ld deg",
+                 overrange ? "OVER" : "OK",
+                 clip ? "YES" : "NO",
+                 dft_valid ? "YES" : "NO",
+                 static_cast<long>(g_adc_result.amp_peak_raw),
+                 static_cast<long>(g_adc_result.amp_rms_raw),
+                 static_cast<long>(g_adc_result.phase_deg_x10 / 10),
+                 static_cast<long>(g_adc_result.phase_deg_x10 >= 0 ? g_adc_result.phase_deg_x10 % 10 : -(g_adc_result.phase_deg_x10 % 10)));
+        lv_label_set_text(g_adc_ora, buf);
         lv_obj_set_style_text_color(g_adc_ora,
-                                    lv_color_hex(overrange ? COLOR_RED : COLOR_GREEN),
+                                    lv_color_hex(overrange || clip ? COLOR_RED : COLOR_GREEN),
                                     LV_PART_MAIN);
     }
 
-    if (g_adc_chart != nullptr && g_adc_series != nullptr) {
+    if (redraw_chart && g_adc_chart != nullptr && g_adc_series != nullptr) {
         lv_chart_set_range(g_adc_chart, LV_CHART_AXIS_PRIMARY_Y, raw_mode ? 0 : -5000, raw_mode ? 4095 : 5000);
         lv_chart_set_all_value(g_adc_chart, g_adc_series, LV_CHART_POINT_NONE);
         const uint32_t count = (g_adc_total_samples > ADC_TEST_SAMPLE_MAX) ?
             ADC_TEST_SAMPLE_MAX : g_adc_total_samples;
+        lv_chart_set_point_count(g_adc_chart, count == 0U ? ADC_TEST_SAMPLE_MAX : count);
         for (uint32_t i = 0; i < count; ++i) {
             if (g_adc_received[i]) {
-                lv_chart_set_next_value(g_adc_chart, g_adc_series, g_adc_samples[i]);
+                lv_chart_set_value_by_id(g_adc_chart, g_adc_series, i, g_adc_samples[i]);
+            } else {
+                lv_chart_set_value_by_id(g_adc_chart, g_adc_series, i, LV_CHART_POINT_NONE);
             }
         }
         lv_chart_refresh(g_adc_chart);
@@ -1443,7 +1463,7 @@ static void create_adc_test_page(void)
     lv_chart_set_type(g_adc_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_range(g_adc_chart, LV_CHART_AXIS_PRIMARY_Y, -5000, 5000);
     lv_chart_set_point_count(g_adc_chart, ADC_TEST_SAMPLE_MAX);
-    lv_chart_set_update_mode(g_adc_chart, LV_CHART_UPDATE_MODE_SHIFT);
+    lv_chart_set_update_mode(g_adc_chart, LV_CHART_UPDATE_MODE_CIRCULAR);
     g_adc_series = lv_chart_add_series(g_adc_chart, lv_color_hex(COLOR_GREEN), LV_CHART_AXIS_PRIMARY_Y);
     lv_chart_set_all_value(g_adc_chart, g_adc_series, LV_CHART_POINT_NONE);
 
@@ -1696,6 +1716,34 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
     render_basic_status(s);
 }
 
+void test_screen_update_adc_analysis_result(const adc_analysis_result_t *result)
+{
+    if (result == nullptr) {
+        return;
+    }
+
+    g_adc_result = *result;
+    g_adc_have_result = true;
+    if (result->seq != g_adc_seq) {
+        g_adc_seq = result->seq;
+        reset_adc_waveform_buffer();
+        g_adc_result = *result;
+        g_adc_have_result = true;
+    }
+    g_adc_sample_rate_hz = result->sample_rate_hz;
+    g_adc_dds_freq_hz = result->dds_freq_hz;
+    g_adc_total_samples = result->display_sample_count;
+    if (g_adc_total_samples > ADC_TEST_SAMPLE_MAX) {
+        g_adc_total_samples = ADC_TEST_SAMPLE_MAX;
+    }
+    g_adc_min_mv = result->raw_min;
+    g_adc_max_mv = result->raw_max;
+    g_adc_mean_mv = result->raw_mean;
+    g_adc_vpp_mv = result->raw_vpp;
+    g_adc_flags = result->flags;
+    render_adc_test_page(false);
+}
+
 void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
 {
     if (chunk == nullptr) {
@@ -1707,17 +1755,29 @@ void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
         reset_adc_waveform_buffer();
     }
 
-    g_adc_sample_rate_hz = chunk->sample_rate_hz;
-    g_adc_dds_freq_hz = chunk->dds_freq_hz;
+    if (chunk->sample_rate_hz != 0U) {
+        g_adc_sample_rate_hz = chunk->sample_rate_hz;
+    }
+    if (chunk->dds_freq_hz != 0U) {
+        g_adc_dds_freq_hz = chunk->dds_freq_hz;
+    }
     g_adc_total_samples = chunk->total_sample_count;
     if (g_adc_total_samples > ADC_TEST_SAMPLE_MAX) {
         g_adc_total_samples = ADC_TEST_SAMPLE_MAX;
     }
-    g_adc_min_mv = chunk->min_mv;
-    g_adc_max_mv = chunk->max_mv;
-    g_adc_mean_mv = chunk->mean_mv;
-    g_adc_vpp_mv = chunk->vpp_mv;
-    g_adc_flags = chunk->flags;
+    // 0x12 waveform chunk does not carry min/max/mean/vpp.
+    // Keep values from 0x13 analysis result frame.
+    if (chunk->flags != 0U) {
+        g_adc_flags = chunk->flags;
+    }
+
+    if (chunk->chunk_count != ((g_adc_total_samples + 29U) / 30U)) {
+        printf("ADC chunk count mismatch: seq=%lu got=%lu expected=%lu total=%lu\n",
+               static_cast<unsigned long>(chunk->seq),
+               static_cast<unsigned long>(chunk->chunk_count),
+               static_cast<unsigned long>((g_adc_total_samples + 29U) / 30U),
+               static_cast<unsigned long>(g_adc_total_samples));
+    }
 
     if (chunk->chunk_index != g_adc_expected_chunk_index) {
         printf("ADC chunk discontinuity: seq=%lu got=%lu expected=%lu count=%lu\n",
@@ -1743,7 +1803,10 @@ void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
         g_adc_samples[index] = chunk->samples[i];
     }
 
-    render_adc_test_page();
+    const bool capture_done = (chunk->flags & 0x2U) != 0U;
+    const bool all_samples_received = g_adc_total_samples != 0U &&
+                                      g_adc_received_count >= g_adc_total_samples;
+    render_adc_test_page(g_adc_have_result && (capture_done || all_samples_received));
 }
 
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state)
