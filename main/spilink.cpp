@@ -30,6 +30,7 @@ constexpr TickType_t SPI_RX_TIMEOUT_TICKS = pdMS_TO_TICKS(200);
 constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
 constexpr uint8_t kFrameTypeFreqRespStatus = 0x10;
+constexpr uint8_t kFrameTypeAdcWaveform = 0x12;
 constexpr uint8_t kFrameTypeCommand = 0x80;
 constexpr uint8_t kFrameTypePynqToEspText = 0xE1;
 constexpr uint8_t kFrameTypeEspToPynqText = 0xE2;
@@ -100,6 +101,14 @@ uint32_t GetU32(const uint8_t *buffer, size_t offset)
 int32_t GetI32(const uint8_t *buffer, size_t offset)
 {
     return static_cast<int32_t>(GetU32(buffer, offset));
+}
+
+int16_t GetI16(const uint8_t *buffer, size_t offset)
+{
+    return static_cast<int16_t>(
+        static_cast<uint16_t>(buffer[offset + 0]) |
+        (static_cast<uint16_t>(buffer[offset + 1]) << 8)
+    );
 }
 
 void PutU32(uint8_t *buffer, size_t offset, uint32_t value)
@@ -181,6 +190,48 @@ bool ParseFreqRespStatusFrame(const uint8_t *frame, size_t len, freqresp_ui_stat
     out->phase_deg_x10 = GetI32(frame, o);                     o += 4;
 
     out->cutoff_freq_hz = GetU32(frame, o);                    o += 4;
+
+    return true;
+}
+
+bool ParseAdcWaveformFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_t *out)
+{
+    if (frame == nullptr || out == nullptr || len < kFrameLen) {
+        return false;
+    }
+
+    if (frame[0] != kFrameMagic0 || frame[1] != kFrameMagic1) {
+        return false;
+    }
+
+    if (frame[2] != kFrameTypeAdcWaveform || frame[3] != kPayloadLen) {
+        return false;
+    }
+
+    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
+    if (rx_checksum != expected_checksum) {
+        return false;
+    }
+
+    size_t o = kFrameHeaderLen;
+    out->seq = GetU32(frame, o);                o += 4;
+    out->chunk_index = GetU32(frame, o);        o += 4;
+    out->chunk_count = GetU32(frame, o);        o += 4;
+    out->sample_rate_hz = GetU32(frame, o);     o += 4;
+    out->dds_freq_hz = GetU32(frame, o);        o += 4;
+    out->total_sample_count = GetU32(frame, o); o += 4;
+    out->start_sample_index = GetU32(frame, o); o += 4;
+    out->min_mv = GetI32(frame, o);             o += 4;
+    out->max_mv = GetI32(frame, o);             o += 4;
+    out->mean_mv = GetI32(frame, o);            o += 4;
+    out->vpp_mv = GetI32(frame, o);             o += 4;
+    out->flags = GetU32(frame, o);              o += 4;
+
+    for (size_t i = 0; i < 30U; ++i) {
+        out->samples[i] = GetI16(frame, o);
+        o += 2;
+    }
 
     return true;
 }
@@ -324,6 +375,17 @@ void UpdateUiWithLock(const freqresp_ui_status_t &status)
     }
 
     test_screen_update_measurement(&status);
+
+    esp_lv_adapter_unlock();
+}
+
+void UpdateAdcWaveformUiWithLock(const adc_waveform_chunk_t &chunk)
+{
+    if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
+        return;
+    }
+
+    test_screen_update_adc_waveform_chunk(&chunk);
 
     esp_lv_adapter_unlock();
 }
@@ -536,6 +598,25 @@ void SpiLink_Task(void)
                  static_cast<long>(status.gain_x1000));
 
         UpdateUiWithLock(status);
+        return;
+    }
+
+    adc_waveform_chunk_t adc_chunk = {};
+    if (ParseAdcWaveformFrame(rx_buffer, kFrameLen, &adc_chunk)) {
+        ++ok_count;
+
+        ESP_LOGI(TAG,
+                 "RX ADC waveform: seq=%lu chunk=%lu/%lu samples=%lu min=%ld max=%ld vpp=%ld flags=0x%08lx",
+                 static_cast<unsigned long>(adc_chunk.seq),
+                 static_cast<unsigned long>(adc_chunk.chunk_index + 1U),
+                 static_cast<unsigned long>(adc_chunk.chunk_count),
+                 static_cast<unsigned long>(adc_chunk.total_sample_count),
+                 static_cast<long>(adc_chunk.min_mv),
+                 static_cast<long>(adc_chunk.max_mv),
+                 static_cast<long>(adc_chunk.vpp_mv),
+                 static_cast<unsigned long>(adc_chunk.flags));
+
+        UpdateAdcWaveformUiWithLock(adc_chunk);
         return;
     }
 

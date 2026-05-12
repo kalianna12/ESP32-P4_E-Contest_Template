@@ -9,6 +9,7 @@ extern "C" {
 
 #define MAX_POINTS 512
 #define MODEL_POINTS_MAX 128
+#define ADC_TEST_SAMPLE_MAX 256
 
 typedef enum {
     FREQRESP_STATE_IDLE = 0,
@@ -42,6 +43,8 @@ typedef enum {
     CMD_ADV_CAPTURE = 20,
     CMD_ADV_RECONSTRUCT = 21,
     CMD_ADV_SEND_TO_DDS = 22,
+    CMD_ADC_TEST_START = 30,
+    CMD_ADC_TEST_STOP = 31,
 } freqresp_command_t;
 
 typedef struct {
@@ -105,8 +108,25 @@ typedef struct {
     uint32_t cutoff_freq_hz;
 } freqresp_ui_status_t;
 
+typedef struct {
+    uint32_t seq;
+    uint32_t chunk_index;
+    uint32_t chunk_count;
+    uint32_t sample_rate_hz;
+    uint32_t dds_freq_hz;
+    uint32_t total_sample_count;
+    uint32_t start_sample_index;
+    int32_t min_mv;
+    int32_t max_mv;
+    int32_t mean_mv;
+    int32_t vpp_mv;
+    uint32_t flags;
+    int16_t samples[30];
+} adc_waveform_chunk_t;
+
 void test_screen_create(void);
 void test_screen_update_measurement(const freqresp_ui_status_t *status);
+void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk);
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state);
 
 #ifdef __cplusplus
