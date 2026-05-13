@@ -30,8 +30,7 @@ constexpr TickType_t SPI_RX_TIMEOUT_TICKS = pdMS_TO_TICKS(200);
 constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
 constexpr uint8_t kFrameTypeFreqRespStatus = 0x10;
-constexpr uint8_t kFrameTypeAdcWaveform = 0x12;
-constexpr uint8_t kFrameTypeAdcAnalysis = 0x13;
+constexpr uint8_t kFrameTypeFreqRespPoint = 0x13;
 constexpr uint8_t kFrameTypeCommand = 0x80;
 constexpr uint8_t kFrameTypePynqToEspText = 0xE1;
 constexpr uint8_t kFrameTypeEspToPynqText = 0xE2;
@@ -104,12 +103,9 @@ int32_t GetI32(const uint8_t *buffer, size_t offset)
     return static_cast<int32_t>(GetU32(buffer, offset));
 }
 
-int16_t GetI16(const uint8_t *buffer, size_t offset)
+int32_t RawVppCodeToMv(uint32_t code)
 {
-    return static_cast<int16_t>(
-        static_cast<uint16_t>(buffer[offset + 0]) |
-        (static_cast<uint16_t>(buffer[offset + 1]) << 8)
-    );
+    return static_cast<int32_t>((static_cast<uint64_t>(code) * 10000ULL) / 4095ULL);
 }
 
 void PutU32(uint8_t *buffer, size_t offset, uint32_t value)
@@ -195,7 +191,7 @@ bool ParseFreqRespStatusFrame(const uint8_t *frame, size_t len, freqresp_ui_stat
     return true;
 }
 
-bool ParseAdcWaveformFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_t *out)
+bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_status_t *out)
 {
     if (frame == nullptr || out == nullptr || len < kFrameLen) {
         return false;
@@ -205,7 +201,7 @@ bool ParseAdcWaveformFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_
         return false;
     }
 
-    if (frame[2] != kFrameTypeAdcWaveform || frame[3] != kPayloadLen) {
+    if (frame[2] != kFrameTypeFreqRespPoint || frame[3] != kPayloadLen) {
         return false;
     }
 
@@ -215,64 +211,43 @@ bool ParseAdcWaveformFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_
         return false;
     }
 
-    size_t o = kFrameHeaderLen;
-    out->seq = GetU32(frame, o);                o += 4;
-    out->chunk_index = GetU32(frame, o);        o += 4;
-    out->chunk_count = GetU32(frame, o);        o += 4;
-    out->sample_rate_hz = 0;
-    out->dds_freq_hz = 0;
-    out->total_sample_count = GetU32(frame, o); o += 4;
-    out->start_sample_index = GetU32(frame, o); o += 4;
-    out->flags = GetU32(frame, o);              o += 4;
-    o += 4;
-    out->min_mv = 0;
-    out->max_mv = 0;
-    out->mean_mv = 0;
-    out->vpp_mv = 0;
+    // 0x13 point result, 128-byte SPI transaction:
+    // byte 0=A5, 1=5A, 2=13, 3=112
+    // byte 4 seq, 8 point_index, 12 total_points, 16 freq_req_hz, 20 freq_actual_hz
+    // byte 24 amp_a_code, 28 amp_b_code, 32 raw_a_vpp_code, 36 raw_b_vpp_code
+    // byte 40 gain_x1000, 44 phase_deg_x10, 48 flags, 116 checksum xor(frame[0..115])
+    // PYNQADC currently sends point_index as 1-based and leaves gain_x1000 as 0.
+    const uint32_t point_index = GetU32(frame, 8);
+    const uint32_t total_points = GetU32(frame, 12);
+    const uint32_t freq_actual_hz = GetU32(frame, 20);
+    const uint32_t raw_a_vpp_code = GetU32(frame, 32) & 0x0FFFU;
+    const uint32_t raw_b_vpp_code = GetU32(frame, 36) & 0x0FFFU;
+    const int32_t frame_gain_x1000 = GetI32(frame, 40);
 
-    for (size_t i = 0; i < 30U; ++i) {
-        out->samples[i] = GetI16(frame, o);
-        o += 2;
+    out->state = static_cast<uint8_t>(
+        (total_points != 0U && point_index >= total_points) ?
+        FREQRESP_STATE_DONE : FREQRESP_STATE_SCANNING
+    );
+    out->mode = MODE_SWEEP;
+    out->filter_type = FILTER_TYPE_UNKNOWN;
+    out->link_ok = 1U;
+    out->progress_permille = (total_points != 0U) ? ((point_index * 1000U) / total_points) : 0U;
+    if (out->progress_permille > 1000U) {
+        out->progress_permille = 1000U;
     }
+    out->current_freq_hz = freq_actual_hz;
+    out->point_index = point_index;
+    out->total_points = total_points;
+    out->vin_mv = RawVppCodeToMv(raw_a_vpp_code);
+    out->vout_mv = RawVppCodeToMv(raw_b_vpp_code);
+    out->gain_x1000 = (raw_a_vpp_code != 0U) ?
+        static_cast<int32_t>((static_cast<uint64_t>(raw_b_vpp_code) * 1000ULL) / raw_a_vpp_code) :
+        frame_gain_x1000;
+    out->theory_gain_x1000 = 0;
+    out->error_x10 = 0;
+    out->phase_deg_x10 = GetI32(frame, 44);
+    out->cutoff_freq_hz = 0;
 
-    return true;
-}
-
-bool ParseAdcAnalysisFrame(const uint8_t *frame, size_t len, adc_analysis_result_t *out)
-{
-    if (frame == nullptr || out == nullptr || len < kFrameLen) {
-        return false;
-    }
-    if (frame[0] != kFrameMagic0 || frame[1] != kFrameMagic1) {
-        return false;
-    }
-    if (frame[2] != kFrameTypeAdcAnalysis || frame[3] != kPayloadLen) {
-        return false;
-    }
-    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
-    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
-    if (rx_checksum != expected_checksum) {
-        return false;
-    }
-
-    size_t o = kFrameHeaderLen;
-    out->seq = GetU32(frame, o);                  o += 4;
-    out->sample_rate_hz = GetU32(frame, o);       o += 4;
-    out->dds_freq_hz = GetU32(frame, o);          o += 4;
-    out->capture_sample_count = GetU32(frame, o); o += 4;
-    out->display_sample_count = GetU32(frame, o); o += 4;
-    out->measured_freq_hz = GetU32(frame, o);     o += 4;
-    out->raw_min = GetI32(frame, o);              o += 4;
-    out->raw_max = GetI32(frame, o);              o += 4;
-    out->raw_mean = GetI32(frame, o);             o += 4;
-    out->raw_vpp = GetI32(frame, o);              o += 4;
-    out->raw_rms = GetI32(frame, o);              o += 4;
-    out->amp_peak_raw = GetI32(frame, o);         o += 4;
-    out->amp_rms_raw = GetI32(frame, o);          o += 4;
-    out->phase_deg_x10 = GetI32(frame, o);        o += 4;
-    out->flags = GetU32(frame, o);                o += 4;
-    out->display_decimation = GetU32(frame, o);   o += 4;
-    out->zero_cross_count = GetU32(frame, o);
     return true;
 }
 
@@ -415,39 +390,6 @@ void UpdateUiWithLock(const freqresp_ui_status_t &status)
     }
 
     test_screen_update_measurement(&status);
-
-    esp_lv_adapter_unlock();
-}
-
-void UpdateAdcAnalysisUiWithLock(const adc_analysis_result_t &result)
-{
-    if (esp_lv_adapter_lock(pdMS_TO_TICKS(500)) != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "DROP ADC result: seq=%lu flags=0x%08lx",
-                 static_cast<unsigned long>(result.seq),
-                 static_cast<unsigned long>(result.flags));
-        return;
-    }
-
-    test_screen_update_adc_analysis_result(&result);
-
-    esp_lv_adapter_unlock();
-}
-
-void UpdateAdcWaveformUiWithLock(const adc_waveform_chunk_t &chunk)
-{
-    if (esp_lv_adapter_lock(pdMS_TO_TICKS(500)) != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "DROP ADC chunk: seq=%lu chunk=%lu/%lu start=%lu flags=0x%08lx",
-                 static_cast<unsigned long>(chunk.seq),
-                 static_cast<unsigned long>(chunk.chunk_index),
-                 static_cast<unsigned long>(chunk.chunk_count),
-                 static_cast<unsigned long>(chunk.start_sample_index),
-                 static_cast<unsigned long>(chunk.flags));
-        return;
-    }
-
-    test_screen_update_adc_waveform_chunk(&chunk);
 
     esp_lv_adapter_unlock();
 }
@@ -643,76 +585,47 @@ void SpiLink_Task(void)
 #endif
 
     freqresp_ui_status_t status = {};
-    if (ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status)) {
+    if (ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status) ||
+        ParseFreqRespPointFrame(rx_buffer, kFrameLen, &status)) {
         ++ok_count;
 
         status.packets = ok_count;
         status.frame_errors = err_count;
         status.timeouts = timeout_count;
 
-        ESP_LOGI(TAG,
-                 "RX freq response: point=%lu/%lu freq=%luHz vin=%ldmV vout=%ldmV gain=%ld",
-                 static_cast<unsigned long>(status.point_index),
-                 static_cast<unsigned long>(status.total_points),
-                 static_cast<unsigned long>(status.current_freq_hz),
-                 static_cast<long>(status.vin_mv),
-                 static_cast<long>(status.vout_mv),
-                 static_cast<long>(status.gain_x1000));
-
-        UpdateUiWithLock(status);
-        return;
-    }
-
-    adc_analysis_result_t adc_result = {};
-    if (ParseAdcAnalysisFrame(rx_buffer, kFrameLen, &adc_result)) {
-        ++ok_count;
-        ESP_LOGI(TAG,
-                 "RX ADC result: seq=%lu fs=%lu dds=%lu measured=%lu capture=%lu display=%lu flags=0x%08lx",
-                 static_cast<unsigned long>(adc_result.seq),
-                 static_cast<unsigned long>(adc_result.sample_rate_hz),
-                 static_cast<unsigned long>(adc_result.dds_freq_hz),
-                 static_cast<unsigned long>(adc_result.measured_freq_hz),
-                 static_cast<unsigned long>(adc_result.capture_sample_count),
-                 static_cast<unsigned long>(adc_result.display_sample_count),
-                 static_cast<unsigned long>(adc_result.flags));
-        UpdateAdcAnalysisUiWithLock(adc_result);
-        return;
-    }
-
-    adc_waveform_chunk_t adc_chunk = {};
-    if (ParseAdcWaveformFrame(rx_buffer, kFrameLen, &adc_chunk)) {
-        ++ok_count;
-
-        ESP_LOGI(TAG,
-                 "RX ADC waveform: seq=%lu chunk=%lu/%lu start=%lu total=%lu flags=0x%08lx",
-                 static_cast<unsigned long>(adc_chunk.seq),
-                 static_cast<unsigned long>(adc_chunk.chunk_index),
-                 static_cast<unsigned long>(adc_chunk.chunk_count),
-                 static_cast<unsigned long>(adc_chunk.start_sample_index),
-                 static_cast<unsigned long>(adc_chunk.total_sample_count),
-                 static_cast<unsigned long>(adc_chunk.flags));
-
-        if ((adc_chunk.flags & 0x8U) != 0U) {
+        if (rx_buffer[2] == kFrameTypeFreqRespPoint) {
+            const uint32_t raw_a_vpp_code = GetU32(rx_buffer, 32) & 0x0FFFU;
+            const uint32_t raw_b_vpp_code = GetU32(rx_buffer, 36) & 0x0FFFU;
             ESP_LOGI(TAG,
-                     "ADC raw first16: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
-                     adc_chunk.samples[0], adc_chunk.samples[1],
-                     adc_chunk.samples[2], adc_chunk.samples[3],
-                     adc_chunk.samples[4], adc_chunk.samples[5],
-                     adc_chunk.samples[6], adc_chunk.samples[7],
-                     adc_chunk.samples[8], adc_chunk.samples[9],
-                     adc_chunk.samples[10], adc_chunk.samples[11],
-                     adc_chunk.samples[12], adc_chunk.samples[13],
-                     adc_chunk.samples[14], adc_chunk.samples[15]);
+                     "RX point: idx=%lu/%lu freq=%luHz rawA=%lu rawB=%lu vin_mv=%ld vout_mv=%ld gain=%ld phase=%ld",
+                     static_cast<unsigned long>(status.point_index),
+                     static_cast<unsigned long>(status.total_points),
+                     static_cast<unsigned long>(status.current_freq_hz),
+                     static_cast<unsigned long>(raw_a_vpp_code),
+                     static_cast<unsigned long>(raw_b_vpp_code),
+                     static_cast<long>(status.vin_mv),
+                     static_cast<long>(status.vout_mv),
+                     static_cast<long>(status.gain_x1000),
+                     static_cast<long>(status.phase_deg_x10));
+        } else {
+            ESP_LOGI(TAG,
+                     "RX status: point=%lu/%lu freq=%luHz vin=%ldmV vout=%ldmV gain=%ld",
+                     static_cast<unsigned long>(status.point_index),
+                     static_cast<unsigned long>(status.total_points),
+                     static_cast<unsigned long>(status.current_freq_hz),
+                     static_cast<long>(status.vin_mv),
+                     static_cast<long>(status.vout_mv),
+                     static_cast<long>(status.gain_x1000));
         }
 
-        UpdateAdcWaveformUiWithLock(adc_chunk);
+        UpdateUiWithLock(status);
         return;
     }
 
     ++err_count;
 
     ESP_LOGW(TAG,
-             "Invalid freq response frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
+             "Invalid freq response frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
              static_cast<unsigned>(rx_bits),
              rx_buffer[0],
              rx_buffer[1],
@@ -722,6 +635,14 @@ void SpiLink_Task(void)
              rx_buffer[5],
              rx_buffer[6],
              rx_buffer[7],
+             rx_buffer[8],
+             rx_buffer[9],
+             rx_buffer[10],
+             rx_buffer[11],
+             rx_buffer[12],
+             rx_buffer[13],
+             rx_buffer[14],
+             rx_buffer[15],
              static_cast<unsigned long>(err_count));
 #if ENABLE_SPI_STRING_TEST
     UpdateSpiTextUiWithLock(nullptr, 2U);
