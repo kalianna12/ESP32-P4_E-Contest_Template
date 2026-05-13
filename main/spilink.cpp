@@ -66,6 +66,8 @@ uint8_t *tx_buffer = nullptr;
 uint32_t ok_count = 0;
 uint32_t err_count = 0;
 uint32_t timeout_count = 0;
+freqresp_ui_status_t g_last_measurement_status = {};
+bool g_have_measurement_status = false;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_cmd_seq = 0;
@@ -459,6 +461,8 @@ void SpiLink_Init(void)
     ok_count = 0;
     err_count = 0;
     timeout_count = 0;
+    g_last_measurement_status = {};
+    g_have_measurement_status = false;
     spi_ready = true;
 
     ESP_LOGI(TAG,
@@ -585,15 +589,18 @@ void SpiLink_Task(void)
 #endif
 
     freqresp_ui_status_t status = {};
-    if (ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status) ||
-        ParseFreqRespPointFrame(rx_buffer, kFrameLen, &status)) {
+    const bool is_status_frame = ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status);
+    const bool is_point_frame =
+        !is_status_frame && ParseFreqRespPointFrame(rx_buffer, kFrameLen, &status);
+
+    if (is_status_frame || is_point_frame) {
         ++ok_count;
 
         status.packets = ok_count;
         status.frame_errors = err_count;
         status.timeouts = timeout_count;
 
-        if (rx_buffer[2] == kFrameTypeFreqRespPoint) {
+        if (is_point_frame) {
             const uint32_t raw_a_vpp_code = GetU32(rx_buffer, 32) & 0x0FFFU;
             const uint32_t raw_b_vpp_code = GetU32(rx_buffer, 36) & 0x0FFFU;
             ESP_LOGI(TAG,
@@ -607,18 +614,43 @@ void SpiLink_Task(void)
                      static_cast<long>(status.vout_mv),
                      static_cast<long>(status.gain_x1000),
                      static_cast<long>(status.phase_deg_x10));
+
+            g_last_measurement_status = status;
+            g_have_measurement_status = true;
+            UpdateUiWithLock(status);
         } else {
             ESP_LOGI(TAG,
-                     "RX status: point=%lu/%lu freq=%luHz vin=%ldmV vout=%ldmV gain=%ld",
+                     "RX status: point=%lu/%lu freq=%luHz state=%u progress=%lu",
                      static_cast<unsigned long>(status.point_index),
                      static_cast<unsigned long>(status.total_points),
                      static_cast<unsigned long>(status.current_freq_hz),
-                     static_cast<long>(status.vin_mv),
-                     static_cast<long>(status.vout_mv),
-                     static_cast<long>(status.gain_x1000));
-        }
+                     static_cast<unsigned>(status.state),
+                     static_cast<unsigned long>(status.progress_permille));
 
-        UpdateUiWithLock(status);
+            freqresp_ui_status_t merged = {};
+            if (g_have_measurement_status) {
+                merged = g_last_measurement_status;
+            }
+
+            merged.state = status.state;
+            merged.mode = status.mode;
+            merged.filter_type = status.filter_type;
+            merged.link_ok = status.link_ok;
+            merged.progress_permille = status.progress_permille;
+            merged.start_freq_hz = status.start_freq_hz;
+            merged.stop_freq_hz = status.stop_freq_hz;
+            merged.step_freq_hz = status.step_freq_hz;
+            merged.single_freq_hz = status.single_freq_hz;
+            merged.current_freq_hz = status.current_freq_hz;
+            merged.point_index = status.point_index;
+            merged.total_points = status.total_points;
+            merged.cutoff_freq_hz = status.cutoff_freq_hz;
+            merged.packets = ok_count;
+            merged.frame_errors = err_count;
+            merged.timeouts = timeout_count;
+
+            UpdateUiWithLock(merged);
+        }
         return;
     }
 
