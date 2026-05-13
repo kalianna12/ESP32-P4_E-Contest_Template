@@ -641,9 +641,11 @@ void SpiLink_Task(void)
             merged.stop_freq_hz = status.stop_freq_hz;
             merged.step_freq_hz = status.step_freq_hz;
             merged.single_freq_hz = status.single_freq_hz;
-            merged.current_freq_hz = status.current_freq_hz;
-            merged.point_index = status.point_index;
-            merged.total_points = status.total_points;
+            if (!g_have_measurement_status) {
+                merged.current_freq_hz = status.current_freq_hz;
+                merged.point_index = status.point_index;
+                merged.total_points = status.total_points;
+            }
             merged.cutoff_freq_hz = status.cutoff_freq_hz;
             merged.packets = ok_count;
             merged.frame_errors = err_count;
