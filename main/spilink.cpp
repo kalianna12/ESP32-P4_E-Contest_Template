@@ -68,6 +68,8 @@ uint32_t err_count = 0;
 uint32_t timeout_count = 0;
 freqresp_ui_status_t g_last_measurement_status = {};
 bool g_have_measurement_status = false;
+bool g_have_phase_history = false;
+int32_t g_prev_phase_deg_x10 = 0;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_cmd_seq = 0;
@@ -225,6 +227,30 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
     const uint32_t raw_a_vpp_code = GetU32(frame, 32) & 0x0FFFU;
     const uint32_t raw_b_vpp_code = GetU32(frame, 36) & 0x0FFFU;
     const int32_t frame_gain_x1000 = GetI32(frame, 40);
+    int32_t phase_deg_x10 = GetI32(frame, 44);
+    const bool phase_level_ok = (raw_a_vpp_code >= 80U) && (raw_b_vpp_code >= 40U);
+
+    if (g_have_phase_history) {
+        while ((phase_deg_x10 - g_prev_phase_deg_x10) > 1800) {
+            phase_deg_x10 -= 3600;
+        }
+        while ((phase_deg_x10 - g_prev_phase_deg_x10) < -1800) {
+            phase_deg_x10 += 3600;
+        }
+    }
+
+    bool phase_valid = phase_level_ok;
+    if (phase_valid && g_have_phase_history) {
+        const int32_t phase_delta = phase_deg_x10 - g_prev_phase_deg_x10;
+        if (phase_delta > 600 || phase_delta < -600) {
+            phase_valid = false;
+        }
+    }
+
+    if (phase_valid) {
+        g_prev_phase_deg_x10 = phase_deg_x10;
+        g_have_phase_history = true;
+    }
 
     out->state = static_cast<uint8_t>(
         (total_points != 0U && point_index >= total_points) ?
@@ -247,8 +273,10 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
         frame_gain_x1000;
     out->theory_gain_x1000 = 0;
     out->error_x10 = 0;
-    out->phase_deg_x10 = GetI32(frame, 44);
+    out->phase_deg_x10 = phase_deg_x10;
     out->cutoff_freq_hz = 0;
+    out->has_measurement = true;
+    out->phase_valid = phase_valid;
 
     return true;
 }
@@ -461,8 +489,7 @@ void SpiLink_Init(void)
     ok_count = 0;
     err_count = 0;
     timeout_count = 0;
-    g_last_measurement_status = {};
-    g_have_measurement_status = false;
+    SpiLink_ClearMeasurementCache();
     spi_ready = true;
 
     ESP_LOGI(TAG,
@@ -490,6 +517,14 @@ void SpiLink_SetPendingCommand(uint32_t cmd, uint32_t arg0, uint32_t arg1)
     ++g_cmd_count;
 
     portEXIT_CRITICAL(&g_cmd_lock);
+}
+
+void SpiLink_ClearMeasurementCache(void)
+{
+    g_last_measurement_status = {};
+    g_have_measurement_status = false;
+    g_have_phase_history = false;
+    g_prev_phase_deg_x10 = 0;
 }
 
 void SpiLink_SendTextToPynq(const char *text)
@@ -650,6 +685,7 @@ void SpiLink_Task(void)
             merged.packets = ok_count;
             merged.frame_errors = err_count;
             merged.timeouts = timeout_count;
+            merged.has_measurement = false;
 
             UpdateUiWithLock(merged);
         }

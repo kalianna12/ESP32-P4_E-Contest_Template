@@ -21,7 +21,7 @@
 
 #define DEFAULT_START_FREQ_HZ 100U
 #define DEFAULT_STOP_FREQ_HZ 100000U
-#define DEFAULT_STEP_FREQ_HZ 10000U
+#define DEFAULT_STEP_FREQ_HZ 1000U
 #define DEFAULT_SINGLE_FREQ_HZ 1000U
 
 #define COLOR_BG        0x0B1020
@@ -94,6 +94,8 @@ static circuit_model_t g_circuit_model = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
 static bool g_model_saved_for_current_sweep = false;
+
+static void update_adv_model_line(void);
 
 #if ENABLE_SPI_TEST_WINDOW
 static lv_obj_t *g_spi_test_link = nullptr;
@@ -182,6 +184,14 @@ static void format_cutoff_freq(char *buf, size_t len, uint8_t filter_type, uint3
 {
     if (cutoff_freq_hz == 0U || filter_type == FILTER_TYPE_UNKNOWN) {
         snprintf(buf, len, "-----");
+        return;
+    }
+    if (cutoff_freq_hz == UINT32_MAX) {
+        snprintf(buf, len, ">max");
+        return;
+    }
+    if (cutoff_freq_hz == (UINT32_MAX - 1U)) {
+        snprintf(buf, len, "<min");
         return;
     }
 
@@ -389,12 +399,19 @@ static void textarea_event_cb(lv_event_t *event)
     }
 }
 
-static void clear_table_and_curve(void)
+static void ClearAllSweepData(void)
 {
     g_table_count = 0;
     g_table_full = false;
+    g_have_last_status = false;
     g_last_point_index = UINT32_MAX;
     g_last_point_freq = 0;
+    g_last_status = {};
+    g_circuit_model = {};
+    g_adv_output_captured = false;
+    g_adv_reconstruction_ready = false;
+    g_model_saved_for_current_sweep = false;
+    SpiLink_ClearMeasurementCache();
 
     if (g_main_page_active && g_chart != nullptr && g_chart_gain != nullptr) {
         lv_chart_set_all_value(g_chart, g_chart_gain, LV_CHART_POINT_NONE);
@@ -404,6 +421,25 @@ static void clear_table_and_curve(void)
     if (g_main_page_active && g_latest != nullptr) {
         lv_label_set_text(g_latest, "Latest: --");
     }
+    if (g_main_page_active && g_freq != nullptr) {
+        lv_label_set_text(g_freq, "Freq: ----- Hz");
+        lv_label_set_text(g_vin, "Vin: --");
+        lv_label_set_text(g_vout, "Vout: --");
+        lv_label_set_text(g_gain_line, "Gain: --");
+        lv_label_set_text(g_theory, "Theory: --");
+        lv_label_set_text(g_error_line, "Error: --");
+        lv_label_set_text(g_phase, "Phase: --");
+        lv_label_set_text(g_type, "Type: Unknown");
+        lv_label_set_text(g_fc, "fc: ---- Hz");
+    }
+    if (g_full_table != nullptr) {
+        lv_table_set_row_cnt(g_full_table, 2);
+        lv_table_set_cell_value(g_full_table, 1, 0, "No data yet");
+        for (uint32_t col = 1; col < 8; ++col) {
+            lv_table_set_cell_value(g_full_table, 1, col, "");
+        }
+    }
+    update_adv_model_line();
 
     set_msg("CLEARED", COLOR_GREEN);
 }
@@ -437,6 +473,7 @@ static void append_table_point(const freqresp_ui_status_t *s)
     point->theory_gain_x1000 = s->theory_gain_x1000;
     point->error_x10 = s->error_x10;
     point->phase_deg_x10 = s->phase_deg_x10;
+    point->phase_valid = s->phase_valid;
 
     if (g_main_page_active && g_chart != nullptr && g_chart_gain != nullptr) {
         int32_t chart_gain = s->gain_x1000;
@@ -466,6 +503,143 @@ static void refresh_chart_from_table(void)
         lv_chart_set_next_value(g_chart, g_chart_gain, chart_gain);
     }
     lv_chart_refresh(g_chart);
+}
+
+static int32_t abs_i32(int32_t v)
+{
+    return (v < 0) ? -v : v;
+}
+
+static double average_gain_range(uint32_t start, uint32_t count)
+{
+    double sum = 0.0;
+    uint32_t used = 0;
+    for (uint32_t i = start; i < g_table_count && used < count; ++i) {
+        if (g_table[i].gain_x1000 > 0) {
+            sum += static_cast<double>(g_table[i].gain_x1000);
+            ++used;
+        }
+    }
+    return (used == 0U) ? 0.0 : (sum / static_cast<double>(used));
+}
+
+static double theory_gain_for_type(uint8_t type, double f_hz, double fc_hz)
+{
+    if (fc_hz <= 0.0 || f_hz <= 0.0) {
+        return 0.0;
+    }
+
+    const double x = f_hz / fc_hz;
+    if (type == FILTER_TYPE_LOW_PASS) {
+        return 1.0 / sqrt(1.0 + x * x);
+    }
+    if (type == FILTER_TYPE_HIGH_PASS) {
+        return x / sqrt(1.0 + x * x);
+    }
+    return 0.0;
+}
+
+static uint32_t interpolate_fc(uint32_t i0, uint32_t i1, double target)
+{
+    const double f0 = static_cast<double>(g_table[i0].freq_hz);
+    const double f1 = static_cast<double>(g_table[i1].freq_hz);
+    const double g0 = static_cast<double>(g_table[i0].gain_x1000);
+    const double g1 = static_cast<double>(g_table[i1].gain_x1000);
+    const double dg = g1 - g0;
+    if (fabs(dg) < 1.0) {
+        return g_table[i0].freq_hz;
+    }
+
+    double t = (target - g0) / dg;
+    if (t < 0.0) {
+        t = 0.0;
+    } else if (t > 1.0) {
+        t = 1.0;
+    }
+    return static_cast<uint32_t>(f0 + (f1 - f0) * t + 0.5);
+}
+
+static void analyze_sweep_response(freqresp_ui_status_t *s)
+{
+    if (s == nullptr || s->state != FREQRESP_STATE_DONE || s->mode != MODE_SWEEP || g_table_count < 3U) {
+        return;
+    }
+
+    const uint32_t edge_count = (g_table_count < 5U) ? g_table_count : 5U;
+    const double low_avg = average_gain_range(0, edge_count);
+    const double high_avg = average_gain_range(g_table_count - edge_count, edge_count);
+    const double mid_gain = static_cast<double>(g_table[g_table_count / 2U].gain_x1000);
+
+    uint8_t type = FILTER_TYPE_UNKNOWN;
+    if (low_avg > 0.0 && high_avg > 0.0) {
+        if (high_avg < low_avg * 0.85) {
+            type = FILTER_TYPE_LOW_PASS;
+        } else if (high_avg > low_avg * 1.15) {
+            type = FILTER_TYPE_HIGH_PASS;
+        } else if (mid_gain > low_avg * 1.15 && mid_gain > high_avg * 1.15) {
+            type = FILTER_TYPE_BAND_PASS;
+        } else if (mid_gain < low_avg * 0.85 && mid_gain < high_avg * 0.85) {
+            type = FILTER_TYPE_BAND_STOP;
+        }
+    }
+
+    double target = 0.0;
+    if (type == FILTER_TYPE_LOW_PASS) {
+        target = low_avg * 0.7071;
+    } else if (type == FILTER_TYPE_HIGH_PASS) {
+        target = high_avg * 0.7071;
+    }
+
+    uint32_t fc_hz = 0;
+    if (target > 0.0) {
+        for (uint32_t i = 1; i < g_table_count; ++i) {
+            const double prev = static_cast<double>(g_table[i - 1U].gain_x1000);
+            const double curr = static_cast<double>(g_table[i].gain_x1000);
+            const bool crossed_down = (prev >= target && curr <= target);
+            const bool crossed_up = (prev <= target && curr >= target);
+            if ((type == FILTER_TYPE_LOW_PASS && crossed_down) ||
+                (type == FILTER_TYPE_HIGH_PASS && crossed_up)) {
+                fc_hz = interpolate_fc(i - 1U, i, target);
+                break;
+            }
+        }
+        if (fc_hz == 0U) {
+            const double last_gain = static_cast<double>(g_table[g_table_count - 1U].gain_x1000);
+            if (type == FILTER_TYPE_LOW_PASS) {
+                fc_hz = (last_gain > target) ? UINT32_MAX : (UINT32_MAX - 1U);
+            } else if (type == FILTER_TYPE_HIGH_PASS) {
+                fc_hz = (last_gain < target) ? UINT32_MAX : (UINT32_MAX - 1U);
+            }
+        }
+    }
+
+    s->filter_type = type;
+    s->cutoff_freq_hz = fc_hz;
+
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        const double theory =
+            (fc_hz == UINT32_MAX || fc_hz == (UINT32_MAX - 1U)) ?
+            0.0 :
+            theory_gain_for_type(type,
+                                 static_cast<double>(g_table[i].freq_hz),
+                                 static_cast<double>(fc_hz));
+        if (theory > 0.0) {
+            const int32_t theory_x1000 = static_cast<int32_t>(theory * 1000.0 + 0.5);
+            g_table[i].theory_gain_x1000 = theory_x1000;
+            g_table[i].error_x10 =
+                (theory_x1000 > 0) ?
+                (abs_i32(g_table[i].gain_x1000 - theory_x1000) * 1000) / theory_x1000 :
+                0;
+        } else {
+            g_table[i].theory_gain_x1000 = 0;
+            g_table[i].error_x10 = 0;
+        }
+    }
+
+    if (g_table_count != 0U) {
+        s->theory_gain_x1000 = g_table[g_table_count - 1U].theory_gain_x1000;
+        s->error_x10 = g_table[g_table_count - 1U].error_x10;
+    }
 }
 
 static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
@@ -701,6 +875,13 @@ static void update_current_point(const freqresp_ui_status_t *s)
     format_error(err, sizeof(err), s->error_x10);
     format_phase(phase, sizeof(phase), s->phase_deg_x10);
     format_cutoff_freq(fc, sizeof(fc), s->filter_type, s->cutoff_freq_hz);
+    if (s->theory_gain_x1000 <= 0) {
+        snprintf(theory, sizeof(theory), "----");
+        snprintf(err, sizeof(err), "N/A");
+    }
+    if (!s->phase_valid) {
+        snprintf(phase, sizeof(phase), "--");
+    }
 
     snprintf(buf, sizeof(buf), "Freq: %s Hz", freq);
     lv_label_set_text(g_freq, buf);
@@ -721,16 +902,16 @@ static void update_current_point(const freqresp_ui_status_t *s)
              sizeof(buf),
              "Error: %s %s",
              err,
-             s->error_x10 <= 50 ? "PASS" : "FAIL");
+             (s->theory_gain_x1000 > 0) ? (s->error_x10 <= 50 ? "PASS" : "FAIL") : "N/A");
     lv_label_set_text(g_error_line, buf);
     lv_obj_set_style_text_color(g_gain_line,
-                                lv_color_hex(s->error_x10 <= 50 ? COLOR_GREEN : COLOR_RED),
+                                lv_color_hex((s->theory_gain_x1000 > 0 && s->error_x10 > 50) ? COLOR_RED : COLOR_GREEN),
                                 LV_PART_MAIN);
     lv_obj_set_style_text_color(g_theory,
                                 lv_color_hex(COLOR_TEXT),
                                 LV_PART_MAIN);
     lv_obj_set_style_text_color(g_error_line,
-                                lv_color_hex(s->error_x10 <= 50 ? COLOR_GREEN : COLOR_RED),
+                                lv_color_hex((s->theory_gain_x1000 > 0 && s->error_x10 > 50) ? COLOR_RED : COLOR_GREEN),
                                 LV_PART_MAIN);
 
     snprintf(buf, sizeof(buf), "Phase: %s", phase);
@@ -768,6 +949,9 @@ static void start_button_event_cb(lv_event_t *event)
         return;
     }
 
+    ClearAllSweepData();
+    SpiLink_SetPendingCommand(CMD_CLEAR_TABLE, 0U, 0U);
+
     if (g_mode == MODE_SWEEP) {
         SpiLink_SetPendingCommand(CMD_SET_MODE, MODE_SWEEP, 0U);
         SpiLink_SetPendingCommand(CMD_SET_START_FREQ, g_start_freq_hz, 0U);
@@ -780,10 +964,7 @@ static void start_button_event_cb(lv_event_t *event)
         SpiLink_SetPendingCommand(CMD_START, 0U, 0U);
     }
 
-    g_model_saved_for_current_sweep = false;
-
 #if ENABLE_FAKE_DATA_TEST
-    clear_table_and_curve();
     g_fake_index = 0;
     if (g_fake_timer != nullptr) {
         lv_timer_resume(g_fake_timer);
@@ -809,7 +990,7 @@ static void stop_button_event_cb(lv_event_t *event)
 static void clear_button_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
-        clear_table_and_curve();
+        ClearAllSweepData();
         SpiLink_SetPendingCommand(CMD_CLEAR_TABLE, 0U, 0U);
     }
 }
@@ -1432,6 +1613,8 @@ void test_screen_create(void)
         s.error_x10 = error_x10;
         s.phase_deg_x10 = -static_cast<int32_t>(atan(static_cast<double>(freq_hz) / fc) * 1800.0 / 3.14159265358979323846);
         s.cutoff_freq_hz = 1590U;
+        s.has_measurement = true;
+        s.phase_valid = true;
 
         test_screen_update_measurement(&s);
         ++g_fake_index;
@@ -1446,14 +1629,33 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
         return;
     }
 
-    append_table_point(s);
+    freqresp_ui_status_t view = *s;
 
-    g_last_status = *s;
+    if (!view.has_measurement) {
+        if (g_main_page_active && g_top_status != nullptr) {
+            update_top_status(&view);
+        }
+        g_last_status.state = view.state;
+        g_last_status.mode = view.mode;
+        g_last_status.link_ok = view.link_ok;
+        g_last_status.progress_permille = view.progress_permille;
+        g_last_status.packets = view.packets;
+        g_last_status.frame_errors = view.frame_errors;
+        g_last_status.timeouts = view.timeouts;
+        return;
+    }
+
+    append_table_point(&view);
+
+    if (view.state == FREQRESP_STATE_DONE)
+        analyze_sweep_response(&view);
+
+    g_last_status = view;
     g_have_last_status = true;
-    save_circuit_model_from_table(s);
+    save_circuit_model_from_table(&view);
     update_adv_model_line();
 
-    render_basic_status(s);
+    render_basic_status(&view);
 }
 
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state)
@@ -1586,6 +1788,13 @@ static void create_full_table_page(void)
         format_x1000(theory, sizeof(theory), g_table[i].theory_gain_x1000);
         format_error(error, sizeof(error), g_table[i].error_x10);
         format_phase(phase, sizeof(phase), g_table[i].phase_deg_x10);
+        if (g_table[i].theory_gain_x1000 <= 0) {
+            snprintf(theory, sizeof(theory), "----");
+            snprintf(error, sizeof(error), "N/A");
+        }
+        if (!g_table[i].phase_valid) {
+            snprintf(phase, sizeof(phase), "--");
+        }
 
         const uint32_t row = i + 1U;
         set_table_cell(g_full_table, row, 0, no);

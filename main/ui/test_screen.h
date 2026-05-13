@@ -55,6 +55,7 @@ typedef struct {
     int32_t theory_gain_x1000;
     int32_t error_x10;
     int32_t phase_deg_x10;
+    bool phase_valid;
 } freq_point_t;
 
 typedef struct {
@@ -106,6 +107,8 @@ typedef struct {
     int32_t phase_deg_x10;
 
     uint32_t cutoff_freq_hz;
+    bool has_measurement;
+    bool phase_valid;
 } freqresp_ui_status_t;
 
 typedef struct {
