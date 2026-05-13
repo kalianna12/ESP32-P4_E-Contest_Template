@@ -32,6 +32,16 @@ typedef enum {
 } freqresp_filter_type_t;
 
 typedef enum {
+    MODEL_TYPE_UNKNOWN = 0,
+    MODEL_TYPE_LP1 = 1,
+    MODEL_TYPE_HP1 = 2,
+    MODEL_TYPE_LP2 = 3,
+    MODEL_TYPE_HP2 = 4,
+    MODEL_TYPE_BP2 = 5,
+    MODEL_TYPE_BS2 = 6,
+} circuit_model_kind_t;
+
+typedef enum {
     CMD_START = 1,
     CMD_STOP = 2,
     CMD_SET_MODE = 3,
@@ -66,10 +76,29 @@ typedef struct {
 
 typedef struct {
     bool valid;
+    uint8_t model_type;
+
+    uint32_t fc_hz;
+    uint32_t f0_hz;
+    uint32_t fl_hz;
+    uint32_t fh_hz;
+
+    int32_t q_x1000;
+    int32_t k_x1000;
+
+    int32_t rms_error_x10;
+    int32_t max_error_x10;
+    int32_t confidence_x1000;
+    uint32_t valid_point_count;
+} filter_fit_result_t;
+
+typedef struct {
+    bool valid;
     uint8_t filter_type;
     uint32_t cutoff_freq_hz;
     uint32_t point_count;
     model_point_t points[MODEL_POINTS_MAX];
+    filter_fit_result_t fit;
 
     uint32_t start_freq_hz;
     uint32_t stop_freq_hz;

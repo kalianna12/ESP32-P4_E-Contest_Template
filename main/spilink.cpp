@@ -72,6 +72,7 @@ bool g_have_phase_history = false;
 int32_t g_prev_phase_deg_x10 = 0;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE g_measurement_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_cmd_seq = 0;
 pending_command_t g_cmd_queue[kCommandQueueLen] = {};
 size_t g_cmd_head = 0;
@@ -230,6 +231,7 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
     int32_t phase_deg_x10 = GetI32(frame, 44);
     const bool phase_level_ok = (raw_a_vpp_code >= 80U) && (raw_b_vpp_code >= 40U);
 
+    portENTER_CRITICAL(&g_measurement_lock);
     if (g_have_phase_history) {
         while ((phase_deg_x10 - g_prev_phase_deg_x10) > 1800) {
             phase_deg_x10 -= 3600;
@@ -251,6 +253,7 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
         g_prev_phase_deg_x10 = phase_deg_x10;
         g_have_phase_history = true;
     }
+    portEXIT_CRITICAL(&g_measurement_lock);
 
     out->state = static_cast<uint8_t>(
         (total_points != 0U && point_index >= total_points) ?
@@ -521,10 +524,12 @@ void SpiLink_SetPendingCommand(uint32_t cmd, uint32_t arg0, uint32_t arg1)
 
 void SpiLink_ClearMeasurementCache(void)
 {
+    portENTER_CRITICAL(&g_measurement_lock);
     g_last_measurement_status = {};
     g_have_measurement_status = false;
     g_have_phase_history = false;
     g_prev_phase_deg_x10 = 0;
+    portEXIT_CRITICAL(&g_measurement_lock);
 }
 
 void SpiLink_SendTextToPynq(const char *text)
@@ -650,8 +655,10 @@ void SpiLink_Task(void)
                      static_cast<long>(status.gain_x1000),
                      static_cast<long>(status.phase_deg_x10));
 
+            portENTER_CRITICAL(&g_measurement_lock);
             g_last_measurement_status = status;
             g_have_measurement_status = true;
+            portEXIT_CRITICAL(&g_measurement_lock);
             UpdateUiWithLock(status);
         } else {
             ESP_LOGI(TAG,
@@ -663,9 +670,13 @@ void SpiLink_Task(void)
                      static_cast<unsigned long>(status.progress_permille));
 
             freqresp_ui_status_t merged = {};
-            if (g_have_measurement_status) {
+            bool have_measurement_status = false;
+            portENTER_CRITICAL(&g_measurement_lock);
+            have_measurement_status = g_have_measurement_status;
+            if (have_measurement_status) {
                 merged = g_last_measurement_status;
             }
+            portEXIT_CRITICAL(&g_measurement_lock);
 
             merged.state = status.state;
             merged.mode = status.mode;
@@ -676,7 +687,7 @@ void SpiLink_Task(void)
             merged.stop_freq_hz = status.stop_freq_hz;
             merged.step_freq_hz = status.step_freq_hz;
             merged.single_freq_hz = status.single_freq_hz;
-            if (!g_have_measurement_status) {
+            if (!have_measurement_status) {
                 merged.current_freq_hz = status.current_freq_hz;
                 merged.point_index = status.point_index;
                 merged.total_points = status.total_points;

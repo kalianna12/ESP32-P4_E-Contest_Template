@@ -1,5 +1,6 @@
 #include "test_screen.h"
 
+#include "esp_log.h"
 #include "lvgl.h"
 #include "spilink.h"
 
@@ -34,6 +35,8 @@
 #define COLOR_GREEN     0x86EFAC
 #define COLOR_YELLOW    0xFBBF24
 #define COLOR_RED       0xFCA5A5
+
+static const char *TAG_FIT = "FilterFit";
 
 static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_top_status = nullptr;
@@ -91,6 +94,7 @@ static uint32_t g_last_point_index = UINT32_MAX;
 static uint32_t g_last_point_freq = 0;
 static freqresp_ui_status_t g_last_status = {};
 static circuit_model_t g_circuit_model = {};
+static filter_fit_result_t g_last_fit = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
 static bool g_model_saved_for_current_sweep = false;
@@ -288,6 +292,37 @@ static const char *filter_type_text(uint8_t type)
     }
 }
 
+static const char *model_kind_text(uint8_t type)
+{
+    switch (type) {
+    case MODEL_TYPE_LP1: return "LP1";
+    case MODEL_TYPE_HP1: return "HP1";
+    case MODEL_TYPE_LP2: return "LP2";
+    case MODEL_TYPE_HP2: return "HP2";
+    case MODEL_TYPE_BP2: return "BP2";
+    case MODEL_TYPE_BS2: return "BS2";
+    default: return "Unknown";
+    }
+}
+
+static uint8_t model_filter_type(uint8_t type)
+{
+    switch (type) {
+    case MODEL_TYPE_LP1:
+    case MODEL_TYPE_LP2:
+        return FILTER_TYPE_LOW_PASS;
+    case MODEL_TYPE_HP1:
+    case MODEL_TYPE_HP2:
+        return FILTER_TYPE_HIGH_PASS;
+    case MODEL_TYPE_BP2:
+        return FILTER_TYPE_BAND_PASS;
+    case MODEL_TYPE_BS2:
+        return FILTER_TYPE_BAND_STOP;
+    default:
+        return FILTER_TYPE_UNKNOWN;
+    }
+}
+
 static uint32_t parse_ta_u32(lv_obj_t *ta)
 {
     const char *text = lv_textarea_get_text(ta);
@@ -408,6 +443,7 @@ static void ClearAllSweepData(void)
     g_last_point_freq = 0;
     g_last_status = {};
     g_circuit_model = {};
+    g_last_fit = {};
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
     g_model_saved_for_current_sweep = false;
@@ -505,141 +541,583 @@ static void refresh_chart_from_table(void)
     lv_chart_refresh(g_chart);
 }
 
-static int32_t abs_i32(int32_t v)
-{
-    return (v < 0) ? -v : v;
-}
+typedef struct {
+    bool valid;
+    uint8_t model_type;
+    double score;
+    double rms_db;
+    double rms_rel;
+    double max_rel;
+    double phase_rms_deg;
+    uint32_t phase_points;
+    uint32_t valid_points;
+    double freq_hz;
+    double q;
+    double k;
+} fit_candidate_t;
 
-static double average_gain_range(uint32_t start, uint32_t count)
+static double clamp_double(double value, double lo, double hi)
 {
-    double sum = 0.0;
-    uint32_t used = 0;
-    for (uint32_t i = start; i < g_table_count && used < count; ++i) {
-        if (g_table[i].gain_x1000 > 0) {
-            sum += static_cast<double>(g_table[i].gain_x1000);
-            ++used;
-        }
+    if (value < lo) {
+        return lo;
     }
-    return (used == 0U) ? 0.0 : (sum / static_cast<double>(used));
+    if (value > hi) {
+        return hi;
+    }
+    return value;
 }
 
-static double theory_gain_for_type(uint8_t type, double f_hz, double fc_hz)
+static int32_t clamp_i32(int32_t value, int32_t lo, int32_t hi)
 {
-    if (fc_hz <= 0.0 || f_hz <= 0.0) {
+    if (value < lo) {
+        return lo;
+    }
+    if (value > hi) {
+        return hi;
+    }
+    return value;
+}
+
+static bool fit_point_valid(const freq_point_t *p)
+{
+    return p != nullptr &&
+           p->freq_hz > 0U &&
+           p->gain_x1000 > 0 &&
+           p->vin_mv >= 80 &&
+           p->vout_mv >= 0;
+}
+
+static double gain_from_point(const freq_point_t *p)
+{
+    return static_cast<double>(p->gain_x1000) / 1000.0;
+}
+
+static double gain_db_from_gain(double gain)
+{
+    if (gain < 0.000001) {
+        gain = 0.000001;
+    }
+    return 20.0 * log10(gain);
+}
+
+static double wrap_phase_deg(double phase)
+{
+    while (phase > 180.0) {
+        phase -= 360.0;
+    }
+    while (phase < -180.0) {
+        phase += 360.0;
+    }
+    return phase;
+}
+
+static double model_gain_no_k(uint8_t model_type, double f_hz, double f0_hz, double q)
+{
+    if (f_hz <= 0.0 || f0_hz <= 0.0) {
         return 0.0;
     }
 
-    const double x = f_hz / fc_hz;
-    if (type == FILTER_TYPE_LOW_PASS) {
-        return 1.0 / sqrt(1.0 + x * x);
+    const double r = f_hz / f0_hz;
+    switch (model_type) {
+    case MODEL_TYPE_LP1:
+        return 1.0 / sqrt(1.0 + r * r);
+    case MODEL_TYPE_HP1:
+        return r / sqrt(1.0 + r * r);
+    case MODEL_TYPE_LP2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return 1.0 / sqrt(a * a + b * b);
     }
-    if (type == FILTER_TYPE_HIGH_PASS) {
-        return x / sqrt(1.0 + x * x);
+    case MODEL_TYPE_HP2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return (r * r) / sqrt(a * a + b * b);
     }
-    return 0.0;
+    case MODEL_TYPE_BP2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return (r / q) / sqrt(a * a + b * b);
+    }
+    case MODEL_TYPE_BS2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return fabs(a) / sqrt(a * a + b * b);
+    }
+    default:
+        return 0.0;
+    }
 }
 
-static uint32_t interpolate_fc(uint32_t i0, uint32_t i1, double target)
+static double model_phase_deg(uint8_t model_type, double f_hz, double f0_hz, double q)
 {
-    const double f0 = static_cast<double>(g_table[i0].freq_hz);
-    const double f1 = static_cast<double>(g_table[i1].freq_hz);
-    const double g0 = static_cast<double>(g_table[i0].gain_x1000);
-    const double g1 = static_cast<double>(g_table[i1].gain_x1000);
-    const double dg = g1 - g0;
-    if (fabs(dg) < 1.0) {
-        return g_table[i0].freq_hz;
+    if (f_hz <= 0.0 || f0_hz <= 0.0) {
+        return 0.0;
     }
 
-    double t = (target - g0) / dg;
-    if (t < 0.0) {
-        t = 0.0;
-    } else if (t > 1.0) {
-        t = 1.0;
+    const double pi = 3.14159265358979323846;
+    const double r = f_hz / f0_hz;
+    switch (model_type) {
+    case MODEL_TYPE_LP1:
+        return -atan(r) * 180.0 / pi;
+    case MODEL_TYPE_HP1:
+        return 90.0 - atan(r) * 180.0 / pi;
+    case MODEL_TYPE_LP2:
+        return wrap_phase_deg(-atan2(r / q, 1.0 - r * r) * 180.0 / pi);
+    case MODEL_TYPE_HP2:
+        return wrap_phase_deg(180.0 - atan2(r / q, 1.0 - r * r) * 180.0 / pi);
+    case MODEL_TYPE_BP2:
+        return wrap_phase_deg(90.0 - atan2(r / q, 1.0 - r * r) * 180.0 / pi);
+    case MODEL_TYPE_BS2:
+        return wrap_phase_deg(-atan2(r / q, 1.0 - r * r) * 180.0 / pi);
+    default:
+        return 0.0;
     }
-    return static_cast<uint32_t>(f0 + (f1 - f0) * t + 0.5);
+}
+
+static fit_candidate_t invalid_candidate(uint8_t model_type)
+{
+    fit_candidate_t c = {};
+    c.valid = false;
+    c.model_type = model_type;
+    c.score = 1.0e9;
+    c.rms_db = 1.0e9;
+    c.rms_rel = 1.0e9;
+    c.max_rel = 1.0e9;
+    return c;
+}
+
+static fit_candidate_t evaluate_candidate(uint8_t model_type, double freq_hz, double q)
+{
+    fit_candidate_t c = invalid_candidate(model_type);
+    c.freq_hz = freq_hz;
+    c.q = q;
+
+    double sum_mh = 0.0;
+    double sum_hh = 0.0;
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        const double h0 = model_gain_no_k(model_type,
+                                          static_cast<double>(g_table[i].freq_hz),
+                                          freq_hz,
+                                          q);
+        if (h0 <= 0.000001) {
+            continue;
+        }
+        const double measured = gain_from_point(&g_table[i]);
+        sum_mh += measured * h0;
+        sum_hh += h0 * h0;
+        ++used;
+    }
+
+    if (used < 8U || sum_hh <= 0.000001) {
+        return c;
+    }
+
+    const double k = clamp_double(sum_mh / sum_hh, 0.05, 5.0);
+    double err_db_sum = 0.0;
+    double rel_sum = 0.0;
+    double max_rel = 0.0;
+    double phase_sum = 0.0;
+    double phase_inv_sum = 0.0;
+    double phase_offset = 0.0;
+    double phase_inv_offset = 0.0;
+    bool have_phase_offset = false;
+    uint32_t phase_points = 0;
+
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        const double h0 = model_gain_no_k(model_type,
+                                          static_cast<double>(g_table[i].freq_hz),
+                                          freq_hz,
+                                          q);
+        const double theory = k * h0;
+        if (theory <= 0.000001) {
+            continue;
+        }
+
+        const double measured = gain_from_point(&g_table[i]);
+        const double err_db = gain_db_from_gain(measured) - gain_db_from_gain(theory);
+        const double rel = fabs(measured - theory) / theory;
+        err_db_sum += err_db * err_db;
+        rel_sum += rel * rel;
+        if (rel > max_rel) {
+            max_rel = rel;
+        }
+
+        if (g_table[i].phase_valid) {
+            const double measured_phase = static_cast<double>(g_table[i].phase_deg_x10) / 10.0;
+            const double theory_phase = model_phase_deg(model_type,
+                                                        static_cast<double>(g_table[i].freq_hz),
+                                                        freq_hz,
+                                                        q);
+            if (!have_phase_offset) {
+                phase_offset = measured_phase - theory_phase;
+                phase_inv_offset = measured_phase + theory_phase;
+                have_phase_offset = true;
+            }
+            const double diff = wrap_phase_deg(measured_phase - (theory_phase + phase_offset));
+            const double diff_inv = wrap_phase_deg(measured_phase - (-theory_phase + phase_inv_offset));
+            phase_sum += diff * diff;
+            phase_inv_sum += diff_inv * diff_inv;
+            ++phase_points;
+        }
+    }
+
+    c.valid = true;
+    c.k = k;
+    c.valid_points = used;
+    c.phase_points = phase_points;
+    c.rms_db = sqrt(err_db_sum / static_cast<double>(used));
+    c.rms_rel = sqrt(rel_sum / static_cast<double>(used));
+    c.max_rel = max_rel;
+    if (phase_points >= 4U) {
+        const double phase_rms = sqrt(phase_sum / static_cast<double>(phase_points));
+        const double phase_inv_rms = sqrt(phase_inv_sum / static_cast<double>(phase_points));
+        c.phase_rms_deg = (phase_inv_rms < phase_rms) ? phase_inv_rms : phase_rms;
+        c.score = c.rms_db + 0.02 * c.phase_rms_deg;
+    } else {
+        c.phase_rms_deg = 0.0;
+        c.score = c.rms_db;
+    }
+    return c;
+}
+
+static void keep_best_candidate(fit_candidate_t *best, const fit_candidate_t *cand)
+{
+    if (best == nullptr || cand == nullptr || !cand->valid) {
+        return;
+    }
+    if (!best->valid || cand->score < best->score) {
+        *best = *cand;
+    }
+}
+
+static double slope_db_per_decade(uint32_t start, uint32_t stop)
+{
+    int32_t i0 = -1;
+    int32_t i1 = -1;
+    for (uint32_t i = start; i < g_table_count && i <= stop; ++i) {
+        if (fit_point_valid(&g_table[i])) {
+            i0 = static_cast<int32_t>(i);
+            break;
+        }
+    }
+    for (int32_t i = static_cast<int32_t>(stop); i >= 0; --i) {
+        if (static_cast<uint32_t>(i) < g_table_count && fit_point_valid(&g_table[i])) {
+            i1 = i;
+            break;
+        }
+    }
+    if (i0 < 0 || i1 < 0 || i0 == i1) {
+        return 0.0;
+    }
+
+    const double f0 = static_cast<double>(g_table[i0].freq_hz);
+    const double f1 = static_cast<double>(g_table[i1].freq_hz);
+    if (f0 <= 0.0 || f1 <= f0) {
+        return 0.0;
+    }
+
+    const double g0 = gain_db_from_gain(gain_from_point(&g_table[i0]));
+    const double g1 = gain_db_from_gain(gain_from_point(&g_table[i1]));
+    return (g1 - g0) / log10(f1 / f0);
+}
+
+static int32_t confidence_from_candidate(const fit_candidate_t *best, const fit_candidate_t *second)
+{
+    if (best == nullptr || !best->valid) {
+        return 0;
+    }
+
+    int32_t confidence = 1000;
+    confidence -= static_cast<int32_t>(best->rms_rel * 3000.0 + 0.5);
+    if (best->max_rel > 0.12) {
+        confidence -= static_cast<int32_t>((best->max_rel - 0.12) * 1000.0 + 0.5);
+    }
+    if (best->valid_points < 12U) {
+        confidence -= static_cast<int32_t>((12U - best->valid_points) * 35U);
+    }
+    if (second != nullptr && second->valid) {
+        const double gap = second->score - best->score;
+        if (gap < 0.20) {
+            confidence -= 220;
+        } else if (gap < 0.50) {
+            confidence -= 120;
+        } else if (gap < 1.00) {
+            confidence -= 60;
+        }
+    }
+    if (best->phase_points >= 4U && best->phase_rms_deg > 45.0) {
+        confidence -= 120;
+    }
+
+    return clamp_i32(confidence, 0, 1000);
+}
+
+static void clear_theory_columns(void)
+{
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        g_table[i].theory_gain_x1000 = 0;
+        g_table[i].error_x10 = 0;
+    }
+}
+
+static void fill_theory_columns(const fit_candidate_t *best)
+{
+    if (best == nullptr || !best->valid) {
+        clear_theory_columns();
+        return;
+    }
+
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        if (!fit_point_valid(&g_table[i])) {
+            g_table[i].theory_gain_x1000 = 0;
+            g_table[i].error_x10 = 0;
+            continue;
+        }
+        const double h0 = model_gain_no_k(best->model_type,
+                                          static_cast<double>(g_table[i].freq_hz),
+                                          best->freq_hz,
+                                          best->q);
+        const double theory = best->k * h0;
+        if (theory <= 0.000001) {
+            g_table[i].theory_gain_x1000 = 0;
+            g_table[i].error_x10 = 0;
+            continue;
+        }
+        const int32_t theory_x1000 = static_cast<int32_t>(theory * 1000.0 + 0.5);
+        const double measured = gain_from_point(&g_table[i]);
+        const int32_t error_x10 = static_cast<int32_t>((fabs(measured - theory) / theory) * 1000.0 + 0.5);
+        g_table[i].theory_gain_x1000 = theory_x1000;
+        g_table[i].error_x10 = error_x10;
+    }
 }
 
 static void analyze_sweep_response(freqresp_ui_status_t *s)
 {
-    if (s == nullptr || s->state != FREQRESP_STATE_DONE || s->mode != MODE_SWEEP || g_table_count < 3U) {
+    if (s == nullptr || s->state != FREQRESP_STATE_DONE || s->mode != MODE_SWEEP) {
         return;
     }
 
-    const uint32_t edge_count = (g_table_count < 5U) ? g_table_count : 5U;
-    const double low_avg = average_gain_range(0, edge_count);
-    const double high_avg = average_gain_range(g_table_count - edge_count, edge_count);
-    const double mid_gain = static_cast<double>(g_table[g_table_count / 2U].gain_x1000);
-
-    uint8_t type = FILTER_TYPE_UNKNOWN;
-    if (low_avg > 0.0 && high_avg > 0.0) {
-        if (high_avg < low_avg * 0.85) {
-            type = FILTER_TYPE_LOW_PASS;
-        } else if (high_avg > low_avg * 1.15) {
-            type = FILTER_TYPE_HIGH_PASS;
-        } else if (mid_gain > low_avg * 1.15 && mid_gain > high_avg * 1.15) {
-            type = FILTER_TYPE_BAND_PASS;
-        } else if (mid_gain < low_avg * 0.85 && mid_gain < high_avg * 0.85) {
-            type = FILTER_TYPE_BAND_STOP;
-        }
-    }
-
-    double target = 0.0;
-    if (type == FILTER_TYPE_LOW_PASS) {
-        target = low_avg * 0.7071;
-    } else if (type == FILTER_TYPE_HIGH_PASS) {
-        target = high_avg * 0.7071;
-    }
-
-    uint32_t fc_hz = 0;
-    if (target > 0.0) {
-        for (uint32_t i = 1; i < g_table_count; ++i) {
-            const double prev = static_cast<double>(g_table[i - 1U].gain_x1000);
-            const double curr = static_cast<double>(g_table[i].gain_x1000);
-            const bool crossed_down = (prev >= target && curr <= target);
-            const bool crossed_up = (prev <= target && curr >= target);
-            if ((type == FILTER_TYPE_LOW_PASS && crossed_down) ||
-                (type == FILTER_TYPE_HIGH_PASS && crossed_up)) {
-                fc_hz = interpolate_fc(i - 1U, i, target);
-                break;
-            }
-        }
-        if (fc_hz == 0U) {
-            const double last_gain = static_cast<double>(g_table[g_table_count - 1U].gain_x1000);
-            if (type == FILTER_TYPE_LOW_PASS) {
-                fc_hz = (last_gain > target) ? UINT32_MAX : (UINT32_MAX - 1U);
-            } else if (type == FILTER_TYPE_HIGH_PASS) {
-                fc_hz = (last_gain < target) ? UINT32_MAX : (UINT32_MAX - 1U);
-            }
-        }
-    }
-
-    s->filter_type = type;
-    s->cutoff_freq_hz = fc_hz;
-
+    uint32_t valid_count = 0;
+    uint32_t min_freq = 0;
+    uint32_t max_freq = 0;
     for (uint32_t i = 0; i < g_table_count; ++i) {
-        const double theory =
-            (fc_hz == UINT32_MAX || fc_hz == (UINT32_MAX - 1U)) ?
-            0.0 :
-            theory_gain_for_type(type,
-                                 static_cast<double>(g_table[i].freq_hz),
-                                 static_cast<double>(fc_hz));
-        if (theory > 0.0) {
-            const int32_t theory_x1000 = static_cast<int32_t>(theory * 1000.0 + 0.5);
-            g_table[i].theory_gain_x1000 = theory_x1000;
-            g_table[i].error_x10 =
-                (theory_x1000 > 0) ?
-                (abs_i32(g_table[i].gain_x1000 - theory_x1000) * 1000) / theory_x1000 :
-                0;
-        } else {
-            g_table[i].theory_gain_x1000 = 0;
-            g_table[i].error_x10 = 0;
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        if (valid_count == 0U) {
+            min_freq = g_table[i].freq_hz;
+        }
+        max_freq = g_table[i].freq_hz;
+        ++valid_count;
+    }
+
+    g_last_fit = {};
+    if (valid_count < 8U || min_freq == 0U || max_freq <= min_freq) {
+        clear_theory_columns();
+        s->filter_type = FILTER_TYPE_UNKNOWN;
+        s->cutoff_freq_hz = 0;
+        s->theory_gain_x1000 = 0;
+        s->error_x10 = 0;
+        ESP_LOGW(TAG_FIT, "Fit summary: valid_points=%lu, selected=Unknown (not enough data)",
+                 static_cast<unsigned long>(valid_count));
+        return;
+    }
+
+    fit_candidate_t best_by_model[MODEL_TYPE_BS2 + 1];
+    for (uint32_t i = 0; i <= MODEL_TYPE_BS2; ++i) {
+        best_by_model[i] = invalid_candidate(static_cast<uint8_t>(i));
+    }
+
+    const uint32_t grid_count = 80U;
+    const double log_min = log10(static_cast<double>(min_freq));
+    const double log_max = log10(static_cast<double>(max_freq));
+    static const double q_values[] = {0.35, 0.40, 0.50, 0.577, 0.707, 0.90, 1.00, 1.20, 1.50, 2.00, 3.00, 5.00};
+
+    for (uint32_t n = 0; n < grid_count; ++n) {
+        const double t = (grid_count <= 1U) ? 0.0 : (static_cast<double>(n) / static_cast<double>(grid_count - 1U));
+        const double freq = pow(10.0, log_min + (log_max - log_min) * t);
+
+        fit_candidate_t lp1 = evaluate_candidate(MODEL_TYPE_LP1, freq, 0.707);
+        fit_candidate_t hp1 = evaluate_candidate(MODEL_TYPE_HP1, freq, 0.707);
+        keep_best_candidate(&best_by_model[MODEL_TYPE_LP1], &lp1);
+        keep_best_candidate(&best_by_model[MODEL_TYPE_HP1], &hp1);
+
+        for (uint32_t qi = 0; qi < sizeof(q_values) / sizeof(q_values[0]); ++qi) {
+            fit_candidate_t lp2 = evaluate_candidate(MODEL_TYPE_LP2, freq, q_values[qi]);
+            fit_candidate_t hp2 = evaluate_candidate(MODEL_TYPE_HP2, freq, q_values[qi]);
+            fit_candidate_t bp2 = evaluate_candidate(MODEL_TYPE_BP2, freq, q_values[qi]);
+            fit_candidate_t bs2 = evaluate_candidate(MODEL_TYPE_BS2, freq, q_values[qi]);
+            keep_best_candidate(&best_by_model[MODEL_TYPE_LP2], &lp2);
+            keep_best_candidate(&best_by_model[MODEL_TYPE_HP2], &hp2);
+            keep_best_candidate(&best_by_model[MODEL_TYPE_BP2], &bp2);
+            keep_best_candidate(&best_by_model[MODEL_TYPE_BS2], &bs2);
         }
     }
 
+    for (uint32_t i = MODEL_TYPE_LP1; i <= MODEL_TYPE_BS2; ++i) {
+        if (best_by_model[i].valid) {
+            ESP_LOGI(TAG_FIT,
+                     "%s score=%.2fdB rms=%.2f%% max=%.2f%% f=%.0fHz Q=%.3f K=%.3f phase=%.1fdeg",
+                     model_kind_text(static_cast<uint8_t>(i)),
+                     best_by_model[i].score,
+                     best_by_model[i].rms_rel * 100.0,
+                     best_by_model[i].max_rel * 100.0,
+                     best_by_model[i].freq_hz,
+                     best_by_model[i].q,
+                     best_by_model[i].k,
+                     best_by_model[i].phase_rms_deg);
+        }
+    }
+
+    const uint32_t edge_target = (valid_count < 50U) ? 5U : (valid_count / 10U);
+    double low_edge_sum = 0.0;
+    double high_edge_sum = 0.0;
+    uint32_t low_edge_count = 0;
+    uint32_t high_edge_count = 0;
+    double peak_gain = 0.0;
+    double valley_gain = 1000000.0;
+    uint32_t peak_index = 0;
+    uint32_t valley_index = 0;
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        const double gain = gain_from_point(&g_table[i]);
+        if (low_edge_count < edge_target) {
+            low_edge_sum += gain;
+            ++low_edge_count;
+        }
+        if (gain > peak_gain) {
+            peak_gain = gain;
+            peak_index = i;
+        }
+        if (gain < valley_gain) {
+            valley_gain = gain;
+            valley_index = i;
+        }
+    }
+    for (int32_t i = static_cast<int32_t>(g_table_count) - 1; i >= 0; --i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        high_edge_sum += gain_from_point(&g_table[i]);
+        ++high_edge_count;
+        if (high_edge_count >= edge_target) {
+            break;
+        }
+    }
+    const double low_edge_avg = (low_edge_count == 0U) ? 0.0 : (low_edge_sum / static_cast<double>(low_edge_count));
+    const double high_edge_avg = (high_edge_count == 0U) ? 0.0 : (high_edge_sum / static_cast<double>(high_edge_count));
+    const bool peak_is_central = peak_index > (g_table_count / 5U) && peak_index < ((g_table_count * 4U) / 5U);
+    const bool valley_is_central = valley_index > (g_table_count / 5U) && valley_index < ((g_table_count * 4U) / 5U);
+    const bool has_bandpass_evidence =
+        peak_is_central && peak_gain > ((low_edge_avg > high_edge_avg) ? low_edge_avg : high_edge_avg) * 1.15;
+    const bool has_bandstop_evidence =
+        valley_is_central && valley_gain < ((low_edge_avg < high_edge_avg) ? low_edge_avg : high_edge_avg) * 0.85;
+    if (!has_bandpass_evidence) {
+        best_by_model[MODEL_TYPE_BP2] = invalid_candidate(MODEL_TYPE_BP2);
+    }
+    if (!has_bandstop_evidence) {
+        best_by_model[MODEL_TYPE_BS2] = invalid_candidate(MODEL_TYPE_BS2);
+    }
+
+    fit_candidate_t best = invalid_candidate(MODEL_TYPE_UNKNOWN);
+    fit_candidate_t second = invalid_candidate(MODEL_TYPE_UNKNOWN);
+    for (uint32_t i = MODEL_TYPE_LP1; i <= MODEL_TYPE_BS2; ++i) {
+        const fit_candidate_t *cand = &best_by_model[i];
+        if (!cand->valid) {
+            continue;
+        }
+        if (!best.valid || cand->score < best.score) {
+            second = best;
+            best = *cand;
+        } else if (!second.valid || cand->score < second.score) {
+            second = *cand;
+        }
+    }
+
+    const double high_slope = slope_db_per_decade((g_table_count * 2U) / 3U, g_table_count - 1U);
+    const double low_slope = slope_db_per_decade(0, g_table_count / 3U);
+    const bool lp_has_second_order_evidence = (high_slope < -30.0) || (best_by_model[MODEL_TYPE_LP2].q > 0.90);
+    const bool hp_has_second_order_evidence = (low_slope > 30.0) || (best_by_model[MODEL_TYPE_HP2].q > 0.90);
+
+    if (best.model_type == MODEL_TYPE_LP2 &&
+        best_by_model[MODEL_TYPE_LP1].valid &&
+        !lp_has_second_order_evidence &&
+        (best_by_model[MODEL_TYPE_LP1].score - best.score) < 0.40) {
+        best = best_by_model[MODEL_TYPE_LP1];
+    } else if (best.model_type == MODEL_TYPE_HP2 &&
+               best_by_model[MODEL_TYPE_HP1].valid &&
+               !hp_has_second_order_evidence &&
+               (best_by_model[MODEL_TYPE_HP1].score - best.score) < 0.40) {
+        best = best_by_model[MODEL_TYPE_HP1];
+    }
+
+    const int32_t confidence = confidence_from_candidate(&best, &second);
+    const bool fit_ok = best.valid && best.rms_rel <= 0.050 && confidence >= 600;
+
+    if (!fit_ok) {
+        clear_theory_columns();
+        s->filter_type = FILTER_TYPE_UNKNOWN;
+        s->cutoff_freq_hz = 0;
+        s->theory_gain_x1000 = 0;
+        s->error_x10 = 0;
+        g_last_fit = {};
+        ESP_LOGW(TAG_FIT,
+                 "Fit summary: valid_points=%lu best=%s second=%s score_best=%.2f score_second=%.2f confidence=%ld -> Unknown",
+                 static_cast<unsigned long>(valid_count),
+                 model_kind_text(best.model_type),
+                 model_kind_text(second.model_type),
+                 best.score,
+                 second.score,
+                 static_cast<long>(confidence));
+        return;
+    }
+
+    fill_theory_columns(&best);
+
+    filter_fit_result_t fit = {};
+    fit.valid = true;
+    fit.model_type = best.model_type;
+    fit.fc_hz = static_cast<uint32_t>(best.freq_hz + 0.5);
+    fit.f0_hz = fit.fc_hz;
+    fit.fl_hz = 0;
+    fit.fh_hz = 0;
+    fit.q_x1000 = static_cast<int32_t>(best.q * 1000.0 + 0.5);
+    fit.k_x1000 = static_cast<int32_t>(best.k * 1000.0 + 0.5);
+    fit.rms_error_x10 = static_cast<int32_t>(best.rms_rel * 1000.0 + 0.5);
+    fit.max_error_x10 = static_cast<int32_t>(best.max_rel * 1000.0 + 0.5);
+    fit.confidence_x1000 = confidence;
+    fit.valid_point_count = valid_count;
+    g_last_fit = fit;
+
+    s->filter_type = model_filter_type(best.model_type);
+    s->cutoff_freq_hz = fit.fc_hz;
     if (g_table_count != 0U) {
         s->theory_gain_x1000 = g_table[g_table_count - 1U].theory_gain_x1000;
         s->error_x10 = g_table[g_table_count - 1U].error_x10;
     }
+
+    ESP_LOGI(TAG_FIT,
+             "Fit summary: valid_points=%lu best=%s second=%s score_best=%.2f score_second=%.2f K=%.3f f0=%lu Q=%.3f confidence=%ld rms_err=%.2f%% max_err=%.2f%%",
+             static_cast<unsigned long>(valid_count),
+             model_kind_text(best.model_type),
+             model_kind_text(second.model_type),
+             best.score,
+             second.score,
+             best.k,
+             static_cast<unsigned long>(fit.f0_hz),
+             best.q,
+             static_cast<long>(confidence),
+             best.rms_rel * 100.0,
+             best.max_rel * 100.0);
 }
 
 static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
@@ -655,6 +1133,7 @@ static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
     g_circuit_model.valid = true;
     g_circuit_model.filter_type = s->filter_type;
     g_circuit_model.cutoff_freq_hz = s->cutoff_freq_hz;
+    g_circuit_model.fit = g_last_fit;
     g_circuit_model.start_freq_hz = g_start_freq_hz;
     g_circuit_model.stop_freq_hz = g_stop_freq_hz;
     g_circuit_model.step_freq_hz = g_step_freq_hz;
@@ -700,20 +1179,44 @@ static void update_adv_model_line(void)
                            g_circuit_model.cutoff_freq_hz);
         format_freq(start_freq, sizeof(start_freq), g_circuit_model.start_freq_hz);
         format_freq(stop_freq, sizeof(stop_freq), g_circuit_model.stop_freq_hz);
-        snprintf(buf,
-                 sizeof(buf),
-                 "Circuit Model: %s      fc: %s Hz      H(f): Loaded",
-                 filter_type_text(g_circuit_model.filter_type),
-                 fc);
+        if (g_circuit_model.fit.valid) {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Circuit Model: %s      f0/fc: %s Hz      Q=%ld.%03ld Conf=%ld%%",
+                     model_kind_text(g_circuit_model.fit.model_type),
+                     fc,
+                     static_cast<long>(g_circuit_model.fit.q_x1000 / 1000),
+                     static_cast<long>(g_circuit_model.fit.q_x1000 % 1000),
+                     static_cast<long>(g_circuit_model.fit.confidence_x1000 / 10));
+        } else {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Circuit Model: %s      fc: %s Hz      H(f): Loaded",
+                     filter_type_text(g_circuit_model.filter_type),
+                     fc);
+        }
         lv_obj_set_style_text_color(g_adv_model_line, lv_color_hex(COLOR_GREEN), LV_PART_MAIN);
         lv_label_set_text(g_adv_model_line, buf);
 
-        snprintf(buf,
-                 sizeof(buf),
-                 "Model Range: %s~%s Hz      Points: %lu",
-                 start_freq,
-                 stop_freq,
-                 static_cast<unsigned long>(g_circuit_model.point_count));
+        if (g_circuit_model.fit.valid) {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Model Range: %s~%s Hz      Points: %lu      RMS=%ld.%ld%% Max=%ld.%ld%%",
+                     start_freq,
+                     stop_freq,
+                     static_cast<unsigned long>(g_circuit_model.fit.valid_point_count),
+                     static_cast<long>(g_circuit_model.fit.rms_error_x10 / 10),
+                     static_cast<long>(g_circuit_model.fit.rms_error_x10 % 10),
+                     static_cast<long>(g_circuit_model.fit.max_error_x10 / 10),
+                     static_cast<long>(g_circuit_model.fit.max_error_x10 % 10));
+        } else {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Model Range: %s~%s Hz      Points: %lu",
+                     start_freq,
+                     stop_freq,
+                     static_cast<unsigned long>(g_circuit_model.point_count));
+        }
         lv_label_set_text(g_adv_model_range_line, buf);
         lv_obj_set_style_text_color(g_adv_model_range_line, lv_color_hex(COLOR_SUBTEXT), LV_PART_MAIN);
     } else {
@@ -917,10 +1420,39 @@ static void update_current_point(const freqresp_ui_status_t *s)
     snprintf(buf, sizeof(buf), "Phase: %s", phase);
     lv_label_set_text(g_phase, buf);
 
-    snprintf(buf, sizeof(buf), "Type: %s", filter_type_text(s->filter_type));
+    if (g_last_fit.valid) {
+        if (g_last_fit.model_type == MODEL_TYPE_LP2 ||
+            g_last_fit.model_type == MODEL_TYPE_HP2 ||
+            g_last_fit.model_type == MODEL_TYPE_BP2 ||
+            g_last_fit.model_type == MODEL_TYPE_BS2) {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Type: %s Q=%ld.%03ld C=%ld%%",
+                     model_kind_text(g_last_fit.model_type),
+                     static_cast<long>(g_last_fit.q_x1000 / 1000),
+                     static_cast<long>(g_last_fit.q_x1000 % 1000),
+                     static_cast<long>(g_last_fit.confidence_x1000 / 10));
+        } else {
+            snprintf(buf,
+                     sizeof(buf),
+                     "Type: %s C=%ld%%",
+                     model_kind_text(g_last_fit.model_type),
+                     static_cast<long>(g_last_fit.confidence_x1000 / 10));
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "Type: %s", filter_type_text(s->filter_type));
+    }
     lv_label_set_text(g_type, buf);
 
-    snprintf(buf, sizeof(buf), "fc: %s Hz", fc);
+    if (g_last_fit.valid &&
+        (g_last_fit.model_type == MODEL_TYPE_LP2 ||
+         g_last_fit.model_type == MODEL_TYPE_HP2 ||
+         g_last_fit.model_type == MODEL_TYPE_BP2 ||
+         g_last_fit.model_type == MODEL_TYPE_BS2)) {
+        snprintf(buf, sizeof(buf), "f0: %s Hz", fc);
+    } else {
+        snprintf(buf, sizeof(buf), "fc: %s Hz", fc);
+    }
     lv_label_set_text(g_fc, buf);
 }
 
@@ -1211,6 +1743,7 @@ static void create_spi_test_page(void)
     g_reconstruction_page_active = false;
     g_spi_test_page_active = true;
 
+    g_full_table = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
@@ -1303,6 +1836,7 @@ static void create_reconstruction_page(void)
     g_main_page_active = false;
     g_reconstruction_page_active = true;
     g_spi_test_page_active = false;
+    g_full_table = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
@@ -1416,6 +1950,7 @@ static void create_main_page(void)
     g_main_page_active = true;
     g_reconstruction_page_active = false;
     g_spi_test_page_active = false;
+    g_full_table = nullptr;
     g_adv_status = nullptr;
     g_adv_model_line = nullptr;
     g_adv_model_range_line = nullptr;
@@ -1692,6 +2227,7 @@ static void create_full_table_page(void)
     g_main_page_active = false;
     g_reconstruction_page_active = false;
     g_spi_test_page_active = false;
+    g_full_table = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
