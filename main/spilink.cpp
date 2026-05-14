@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "ui/test_screen.h"
@@ -46,6 +47,9 @@ constexpr size_t kDmaAlign = 64;
 constexpr size_t kRxBufferLen = 128;
 constexpr size_t kTxBufferLen = 128;
 constexpr size_t kCommandQueueLen = 16;
+constexpr UBaseType_t kStatusQueueLen = 1;
+constexpr UBaseType_t kPointQueueLen = 256;
+constexpr size_t kMaxUiPointsPerPump = 8;
 
 static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
 static_assert((kTxBufferLen % 64) == 0, "SPI TX buffer length must be a 64-byte multiple");
@@ -66,10 +70,18 @@ uint8_t *tx_buffer = nullptr;
 uint32_t ok_count = 0;
 uint32_t err_count = 0;
 uint32_t timeout_count = 0;
+uint32_t dropped_point_count = 0;
+uint32_t point_queue_high_water = 0;
+uint32_t last_point_index = 0;
+uint32_t last_freq_hz = 0;
+TickType_t last_log_tick = 0;
+TickType_t last_invalid_log_tick = 0;
 freqresp_ui_status_t g_last_measurement_status = {};
 bool g_have_measurement_status = false;
 bool g_have_phase_history = false;
 int32_t g_prev_phase_deg_x10 = 0;
+QueueHandle_t g_status_queue = nullptr;
+QueueHandle_t g_point_queue = nullptr;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_measurement_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -348,16 +360,6 @@ void BuildTextFrame(uint8_t *frame)
     frame[kFrameHeaderLen + kPayloadLen] = Checksum(frame, kFrameHeaderLen + kPayloadLen);
 }
 
-void UpdateSpiTextUiWithLock(const char *text, uint8_t link_state)
-{
-    if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
-        return;
-    }
-
-    test_screen_update_spi_text_test(text, link_state);
-
-    esp_lv_adapter_unlock();
-}
 #endif
 
 void PrepareTxBuffer()
@@ -416,15 +418,84 @@ void FreeBuffers()
     }
 }
 
-void UpdateUiWithLock(const freqresp_ui_status_t &status)
+void FreeQueues()
 {
-    if (esp_lv_adapter_lock(pdMS_TO_TICKS(50)) != ESP_OK) {
+    if (g_status_queue != nullptr) {
+        vQueueDelete(g_status_queue);
+        g_status_queue = nullptr;
+    }
+
+    if (g_point_queue != nullptr) {
+        vQueueDelete(g_point_queue);
+        g_point_queue = nullptr;
+    }
+}
+
+void MaybeUpdatePointQueueHighWater()
+{
+    if (g_point_queue == nullptr) {
         return;
     }
 
-    test_screen_update_measurement(&status);
+    const UBaseType_t waiting = uxQueueMessagesWaiting(g_point_queue);
+    if (static_cast<uint32_t>(waiting) > point_queue_high_water) {
+        point_queue_high_water = static_cast<uint32_t>(waiting);
+    }
+}
 
-    esp_lv_adapter_unlock();
+void MaybeLogSpiStats()
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (last_log_tick != 0 &&
+        (now - last_log_tick) < pdMS_TO_TICKS(1000)) {
+        return;
+    }
+
+    last_log_tick = now;
+    const UBaseType_t point_waiting =
+        (g_point_queue != nullptr) ? uxQueueMessagesWaiting(g_point_queue) : 0;
+
+    ESP_LOGI(TAG,
+             "SPI stats: ok=%lu err=%lu timeout=%lu dropped_points=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
+             static_cast<unsigned long>(ok_count),
+             static_cast<unsigned long>(err_count),
+             static_cast<unsigned long>(timeout_count),
+             static_cast<unsigned long>(dropped_point_count),
+             static_cast<unsigned>(point_waiting),
+             static_cast<unsigned long>(point_queue_high_water),
+             static_cast<unsigned long>(last_point_index),
+             static_cast<unsigned long>(last_freq_hz));
+}
+
+void MaybeLogInvalidFrame(size_t rx_bits)
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (last_invalid_log_tick != 0 &&
+        (now - last_invalid_log_tick) < pdMS_TO_TICKS(1000)) {
+        return;
+    }
+
+    last_invalid_log_tick = now;
+    ESP_LOGW(TAG,
+             "Invalid freq response frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
+             static_cast<unsigned>(rx_bits),
+             rx_buffer[0],
+             rx_buffer[1],
+             rx_buffer[2],
+             rx_buffer[3],
+             rx_buffer[4],
+             rx_buffer[5],
+             rx_buffer[6],
+             rx_buffer[7],
+             rx_buffer[8],
+             rx_buffer[9],
+             rx_buffer[10],
+             rx_buffer[11],
+             rx_buffer[12],
+             rx_buffer[13],
+             rx_buffer[14],
+             rx_buffer[15],
+             static_cast<unsigned long>(err_count));
 }
 
 }  // namespace
@@ -457,6 +528,15 @@ void SpiLink_Init(void)
         return;
     }
 
+    g_status_queue = xQueueCreate(kStatusQueueLen, sizeof(freqresp_ui_status_t));
+    g_point_queue = xQueueCreate(kPointQueueLen, sizeof(freqresp_ui_status_t));
+    if (g_status_queue == nullptr || g_point_queue == nullptr) {
+        ESP_LOGE(TAG, "Failed to create SPI UI queues");
+        FreeQueues();
+        FreeBuffers();
+        return;
+    }
+
     std::memset(rx_buffer, 0x00, kRxBufferLen);
     std::memset(tx_buffer, 0x00, kTxBufferLen);
 
@@ -471,7 +551,7 @@ void SpiLink_Init(void)
     spi_slave_interface_config_t slave_cfg = {};
     slave_cfg.mode = 0;
     slave_cfg.spics_io_num = SPI_RX_CS;
-    slave_cfg.queue_size = 1;
+    slave_cfg.queue_size = 3;
     slave_cfg.flags = 0;
 
     gpio_set_pull_mode(SPI_RX_CS, GPIO_PULLUP_ONLY);
@@ -485,6 +565,7 @@ void SpiLink_Init(void)
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "spi_slave_initialize failed: %s", esp_err_to_name(err));
+        FreeQueues();
         FreeBuffers();
         return;
     }
@@ -492,6 +573,12 @@ void SpiLink_Init(void)
     ok_count = 0;
     err_count = 0;
     timeout_count = 0;
+    dropped_point_count = 0;
+    point_queue_high_water = 0;
+    last_point_index = 0;
+    last_freq_hz = 0;
+    last_log_tick = 0;
+    last_invalid_log_tick = 0;
     SpiLink_ClearMeasurementCache();
     spi_ready = true;
 
@@ -530,6 +617,37 @@ void SpiLink_ClearMeasurementCache(void)
     g_have_phase_history = false;
     g_prev_phase_deg_x10 = 0;
     portEXIT_CRITICAL(&g_measurement_lock);
+
+    if (g_status_queue != nullptr) {
+        xQueueReset(g_status_queue);
+    }
+    if (g_point_queue != nullptr) {
+        xQueueReset(g_point_queue);
+    }
+    dropped_point_count = 0;
+    point_queue_high_water = 0;
+    last_point_index = 0;
+    last_freq_hz = 0;
+}
+
+void SpiLink_UiPump(void)
+{
+    if (!spi_ready || g_status_queue == nullptr || g_point_queue == nullptr) {
+        return;
+    }
+
+    freqresp_ui_status_t status = {};
+    if (xQueueReceive(g_status_queue, &status, 0) == pdTRUE) {
+        test_screen_update_measurement(&status);
+    }
+
+    for (size_t i = 0; i < kMaxUiPointsPerPump; ++i) {
+        freqresp_ui_status_t point = {};
+        if (xQueueReceive(g_point_queue, &point, 0) != pdTRUE) {
+            break;
+        }
+        test_screen_update_measurement(&point);
+    }
 }
 
 void SpiLink_SendTextToPynq(const char *text)
@@ -575,9 +693,7 @@ void SpiLink_Task(void)
 
     if (err == ESP_ERR_TIMEOUT) {
         ++timeout_count;
-#if ENABLE_SPI_STRING_TEST
-        UpdateSpiTextUiWithLock(nullptr, 0U);
-#endif
+        MaybeLogSpiStats();
         return;
     }
 
@@ -588,6 +704,7 @@ void SpiLink_Task(void)
                  esp_err_to_name(err),
                  static_cast<unsigned long>(err_count));
         vTaskDelay(pdMS_TO_TICKS(10));
+        MaybeLogSpiStats();
         return;
     }
 
@@ -599,6 +716,7 @@ void SpiLink_Task(void)
                  static_cast<unsigned>(rx_bits),
                  static_cast<unsigned>(kSpiTransferLen * 8U),
                  static_cast<unsigned long>(err_count));
+        MaybeLogSpiStats();
         return;
     }
 
@@ -620,10 +738,8 @@ void SpiLink_Task(void)
             ESP_LOGI(TAG, "RX text from PYNQ: seq=%lu text=%s",
                      static_cast<unsigned long>(text_seq),
                      text);
-            UpdateSpiTextUiWithLock(text, 1U);
-        } else {
-            UpdateSpiTextUiWithLock(nullptr, 1U);
         }
+        MaybeLogSpiStats();
         return;
     }
 #endif
@@ -641,91 +757,27 @@ void SpiLink_Task(void)
         status.timeouts = timeout_count;
 
         if (is_point_frame) {
-            const uint32_t raw_a_vpp_code = GetU32(rx_buffer, 32) & 0x0FFFU;
-            const uint32_t raw_b_vpp_code = GetU32(rx_buffer, 36) & 0x0FFFU;
-            ESP_LOGI(TAG,
-                     "RX point: idx=%lu/%lu freq=%luHz rawA=%lu rawB=%lu vin_mv=%ld vout_mv=%ld gain=%ld phase=%ld",
-                     static_cast<unsigned long>(status.point_index),
-                     static_cast<unsigned long>(status.total_points),
-                     static_cast<unsigned long>(status.current_freq_hz),
-                     static_cast<unsigned long>(raw_a_vpp_code),
-                     static_cast<unsigned long>(raw_b_vpp_code),
-                     static_cast<long>(status.vin_mv),
-                     static_cast<long>(status.vout_mv),
-                     static_cast<long>(status.gain_x1000),
-                     static_cast<long>(status.phase_deg_x10));
-
             portENTER_CRITICAL(&g_measurement_lock);
             g_last_measurement_status = status;
             g_have_measurement_status = true;
             portEXIT_CRITICAL(&g_measurement_lock);
-            UpdateUiWithLock(status);
+
+            last_point_index = status.point_index;
+            last_freq_hz = status.current_freq_hz;
+            if (xQueueSend(g_point_queue, &status, 0) != pdTRUE) {
+                ++dropped_point_count;
+            }
+            MaybeUpdatePointQueueHighWater();
         } else {
-            ESP_LOGI(TAG,
-                     "RX status: point=%lu/%lu freq=%luHz state=%u progress=%lu",
-                     static_cast<unsigned long>(status.point_index),
-                     static_cast<unsigned long>(status.total_points),
-                     static_cast<unsigned long>(status.current_freq_hz),
-                     static_cast<unsigned>(status.state),
-                     static_cast<unsigned long>(status.progress_permille));
-
-            freqresp_ui_status_t merged = {};
-            bool have_measurement_status = false;
-            portENTER_CRITICAL(&g_measurement_lock);
-            have_measurement_status = g_have_measurement_status;
-            if (have_measurement_status) {
-                merged = g_last_measurement_status;
-            }
-            portEXIT_CRITICAL(&g_measurement_lock);
-
-            merged.state = status.state;
-            merged.mode = status.mode;
-            merged.filter_type = status.filter_type;
-            merged.link_ok = status.link_ok;
-            merged.progress_permille = status.progress_permille;
-            merged.start_freq_hz = status.start_freq_hz;
-            merged.stop_freq_hz = status.stop_freq_hz;
-            merged.step_freq_hz = status.step_freq_hz;
-            merged.single_freq_hz = status.single_freq_hz;
-            if (!have_measurement_status) {
-                merged.current_freq_hz = status.current_freq_hz;
-                merged.point_index = status.point_index;
-                merged.total_points = status.total_points;
-            }
-            merged.cutoff_freq_hz = status.cutoff_freq_hz;
-            merged.packets = ok_count;
-            merged.frame_errors = err_count;
-            merged.timeouts = timeout_count;
-            merged.has_measurement = false;
-
-            UpdateUiWithLock(merged);
+            status.has_measurement = false;
+            xQueueOverwrite(g_status_queue, &status);
         }
+        MaybeLogSpiStats();
         return;
     }
 
     ++err_count;
 
-    ESP_LOGW(TAG,
-             "Invalid freq response frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
-             static_cast<unsigned>(rx_bits),
-             rx_buffer[0],
-             rx_buffer[1],
-             rx_buffer[2],
-             rx_buffer[3],
-             rx_buffer[4],
-             rx_buffer[5],
-             rx_buffer[6],
-             rx_buffer[7],
-             rx_buffer[8],
-             rx_buffer[9],
-             rx_buffer[10],
-             rx_buffer[11],
-             rx_buffer[12],
-             rx_buffer[13],
-             rx_buffer[14],
-             rx_buffer[15],
-             static_cast<unsigned long>(err_count));
-#if ENABLE_SPI_STRING_TEST
-    UpdateSpiTextUiWithLock(nullptr, 2U);
-#endif
+    MaybeLogInvalidFrame(rx_bits);
+    MaybeLogSpiStats();
 }

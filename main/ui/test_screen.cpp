@@ -98,6 +98,8 @@ static filter_fit_result_t g_last_fit = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
 static bool g_model_saved_for_current_sweep = false;
+static bool g_fit_done_for_current_sweep = false;
+static lv_timer_t *g_spi_ui_pump_timer = nullptr;
 
 static void update_adv_model_line(void);
 
@@ -447,6 +449,7 @@ static void ClearAllSweepData(void)
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
     g_model_saved_for_current_sweep = false;
+    g_fit_done_for_current_sweep = false;
     SpiLink_ClearMeasurementCache();
 
     if (g_main_page_active && g_chart != nullptr && g_chart_gain != nullptr) {
@@ -1320,7 +1323,14 @@ static void update_top_status(const freqresp_ui_status_t *s)
         link = "ERR";
     }
 
-    snprintf(buf, sizeof(buf), "Link: %s    State: %s", link, state_text(s->state));
+    snprintf(buf,
+             sizeof(buf),
+             "L:%s S:%s P:%lu%% %lu/%lu",
+             link,
+             state_text(s->state),
+             static_cast<unsigned long>(s->progress_permille / 10U),
+             static_cast<unsigned long>(s->point_index),
+             static_cast<unsigned long>(s->total_points));
     lv_label_set_text(g_top_status, buf);
 
     uint32_t color = COLOR_YELLOW;
@@ -2088,6 +2098,13 @@ void test_screen_create(void)
     create_main_page();
 #endif
 
+    if (g_spi_ui_pump_timer == nullptr) {
+        g_spi_ui_pump_timer = lv_timer_create([](lv_timer_t *timer) {
+            (void)timer;
+            SpiLink_UiPump();
+        }, 20, nullptr);
+    }
+
 #if ENABLE_FAKE_DATA_TEST
     g_fake_index = 0;
     if (g_fake_timer != nullptr) {
@@ -2172,8 +2189,16 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
         }
         g_last_status.state = view.state;
         g_last_status.mode = view.mode;
+        g_last_status.filter_type = view.filter_type;
         g_last_status.link_ok = view.link_ok;
         g_last_status.progress_permille = view.progress_permille;
+        g_last_status.start_freq_hz = view.start_freq_hz;
+        g_last_status.stop_freq_hz = view.stop_freq_hz;
+        g_last_status.step_freq_hz = view.step_freq_hz;
+        g_last_status.single_freq_hz = view.single_freq_hz;
+        g_last_status.current_freq_hz = view.current_freq_hz;
+        g_last_status.point_index = view.point_index;
+        g_last_status.total_points = view.total_points;
         g_last_status.packets = view.packets;
         g_last_status.frame_errors = view.frame_errors;
         g_last_status.timeouts = view.timeouts;
@@ -2182,8 +2207,10 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
 
     append_table_point(&view);
 
-    if (view.state == FREQRESP_STATE_DONE)
+    if (view.state == FREQRESP_STATE_DONE && !g_fit_done_for_current_sweep) {
         analyze_sweep_response(&view);
+        g_fit_done_for_current_sweep = true;
+    }
 
     g_last_status = view;
     g_have_last_status = true;
