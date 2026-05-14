@@ -49,7 +49,7 @@ constexpr size_t kTxBufferLen = 128;
 constexpr size_t kCommandQueueLen = 16;
 constexpr UBaseType_t kStatusQueueLen = 1;
 constexpr UBaseType_t kPointQueueLen = 256;
-constexpr size_t kMaxUiPointsPerPump = 8;
+constexpr size_t kMaxUiPointsPerPump = 32;
 
 static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
 static_assert((kTxBufferLen % 64) == 0, "SPI TX buffer length must be a 64-byte multiple");

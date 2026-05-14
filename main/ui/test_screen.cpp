@@ -17,6 +17,10 @@
 #define ENABLE_SPI_TEST_WINDOW 0
 #endif
 
+#ifndef ENABLE_HEAVY_FILTER_FIT
+#define ENABLE_HEAVY_FILTER_FIT 0
+#endif
+
 #define TEST_SCREEN_W 1024
 #define TEST_SCREEN_H 600
 
@@ -102,6 +106,10 @@ static bool g_fit_done_for_current_sweep = false;
 static bool g_fit_pending = false;
 static uint32_t g_fit_pending_tick = 0;
 static uint32_t g_last_render_tick = 0;
+static uint32_t g_last_chart_tick = 0;
+static bool g_chart_point_pending = false;
+static int32_t g_pending_chart_gain = 0;
+static uint32_t g_heavy_fit_sample_stride = 1;
 static freqresp_ui_status_t g_fit_pending_status = {};
 static lv_timer_t *g_spi_ui_pump_timer = nullptr;
 
@@ -110,6 +118,7 @@ static void render_basic_status(const freqresp_ui_status_t *s);
 static void process_pending_fit(void);
 
 static constexpr uint32_t kLabelRenderIntervalMs = 50U;
+static constexpr uint32_t kChartRenderIntervalMs = 50U;
 static constexpr uint32_t kFitDelayMs = 300U;
 
 #if ENABLE_SPI_TEST_WINDOW
@@ -462,6 +471,9 @@ static void ClearAllSweepData(void)
     g_fit_pending = false;
     g_fit_pending_tick = 0;
     g_last_render_tick = 0;
+    g_last_chart_tick = 0;
+    g_chart_point_pending = false;
+    g_pending_chart_gain = 0;
     g_fit_pending_status = {};
     SpiLink_ClearMeasurementCache();
 
@@ -496,6 +508,44 @@ static void ClearAllSweepData(void)
     set_msg("CLEARED", COLOR_GREEN);
 }
 
+static void flush_pending_chart_point(bool force)
+{
+    if (!g_main_page_active ||
+        g_chart == nullptr ||
+        g_chart_gain == nullptr ||
+        !g_chart_point_pending) {
+        return;
+    }
+
+    const uint32_t now = lv_tick_get();
+    if (!force &&
+        g_last_chart_tick != 0U &&
+        (now - g_last_chart_tick) < kChartRenderIntervalMs) {
+        return;
+    }
+
+    lv_chart_set_next_value(g_chart, g_chart_gain, g_pending_chart_gain);
+    g_chart_point_pending = false;
+    g_last_chart_tick = now;
+}
+
+static void queue_chart_point(int32_t gain_x1000)
+{
+    if (!g_main_page_active || g_chart == nullptr || g_chart_gain == nullptr) {
+        return;
+    }
+
+    if (gain_x1000 < 0) {
+        gain_x1000 = 0;
+    } else if (gain_x1000 > 1000) {
+        gain_x1000 = 1000;
+    }
+
+    g_pending_chart_gain = gain_x1000;
+    g_chart_point_pending = true;
+    flush_pending_chart_point(false);
+}
+
 static void append_table_point(const freqresp_ui_status_t *s)
 {
     if (s->current_freq_hz == 0U) {
@@ -512,8 +562,10 @@ static void append_table_point(const freqresp_ui_status_t *s)
     g_last_point_freq = s->current_freq_hz;
 
     if (g_table_count >= MAX_POINTS) {
-        g_table_full = true;
-        set_msg("FULL", COLOR_RED);
+        if (!g_table_full) {
+            g_table_full = true;
+            set_msg("FULL", COLOR_RED);
+        }
         return;
     }
 
@@ -527,15 +579,7 @@ static void append_table_point(const freqresp_ui_status_t *s)
     point->phase_deg_x10 = s->phase_deg_x10;
     point->phase_valid = s->phase_valid;
 
-    if (g_main_page_active && g_chart != nullptr && g_chart_gain != nullptr) {
-        int32_t chart_gain = s->gain_x1000;
-        if (chart_gain < 0) {
-            chart_gain = 0;
-        } else if (chart_gain > 1000) {
-            chart_gain = 1000;
-        }
-        lv_chart_set_next_value(g_chart, g_chart_gain, chart_gain);
-    }
+    queue_chart_point(s->gain_x1000);
 }
 
 static void refresh_chart_from_table(void)
@@ -711,8 +755,12 @@ static fit_candidate_t evaluate_candidate(uint8_t model_type, double freq_hz, do
     double sum_mh = 0.0;
     double sum_hh = 0.0;
     uint32_t used = 0;
+    uint32_t valid_seq = 0;
     for (uint32_t i = 0; i < g_table_count; ++i) {
         if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        if ((valid_seq++ % g_heavy_fit_sample_stride) != 0U) {
             continue;
         }
         const double h0 = model_gain_no_k(model_type,
@@ -743,8 +791,12 @@ static fit_candidate_t evaluate_candidate(uint8_t model_type, double freq_hz, do
     bool have_phase_offset = false;
     uint32_t phase_points = 0;
 
+    valid_seq = 0;
     for (uint32_t i = 0; i < g_table_count; ++i) {
         if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        if ((valid_seq++ % g_heavy_fit_sample_stride) != 0U) {
             continue;
         }
         const double h0 = model_gain_no_k(model_type,
@@ -883,6 +935,212 @@ static void clear_theory_columns(void)
     }
 }
 
+static uint32_t clamp_u32(uint32_t value, uint32_t lo, uint32_t hi)
+{
+    if (value < lo) {
+        return lo;
+    }
+    if (value > hi) {
+        return hi;
+    }
+    return value;
+}
+
+static uint32_t interpolate_cutoff_hz(uint32_t f0,
+                                      uint32_t f1,
+                                      int32_t g0,
+                                      int32_t g1,
+                                      int32_t target)
+{
+    if (f1 <= f0 || g0 == g1) {
+        return f0;
+    }
+
+    int32_t denom = g1 - g0;
+    int32_t numer = target - g0;
+    if (denom < 0) {
+        denom = -denom;
+        numer = -numer;
+    }
+    if (numer < 0) {
+        numer = 0;
+    } else if (numer > denom) {
+        numer = denom;
+    }
+
+    const uint64_t df = static_cast<uint64_t>(f1 - f0);
+    return f0 + static_cast<uint32_t>((df * static_cast<uint32_t>(numer)) /
+                                      static_cast<uint32_t>(denom));
+}
+
+static uint32_t find_light_cutoff_hz(uint8_t filter_type, uint32_t target_gain_x1000)
+{
+    bool have_prev = false;
+    freq_point_t prev = {};
+
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+
+        const freq_point_t *cur = &g_table[i];
+        if (have_prev) {
+            if (filter_type == FILTER_TYPE_LOW_PASS &&
+                prev.gain_x1000 >= static_cast<int32_t>(target_gain_x1000) &&
+                cur->gain_x1000 <= static_cast<int32_t>(target_gain_x1000)) {
+                return interpolate_cutoff_hz(prev.freq_hz,
+                                             cur->freq_hz,
+                                             prev.gain_x1000,
+                                             cur->gain_x1000,
+                                             static_cast<int32_t>(target_gain_x1000));
+            }
+            if (filter_type == FILTER_TYPE_HIGH_PASS &&
+                prev.gain_x1000 <= static_cast<int32_t>(target_gain_x1000) &&
+                cur->gain_x1000 >= static_cast<int32_t>(target_gain_x1000)) {
+                return interpolate_cutoff_hz(prev.freq_hz,
+                                             cur->freq_hz,
+                                             prev.gain_x1000,
+                                             cur->gain_x1000,
+                                             static_cast<int32_t>(target_gain_x1000));
+            }
+        }
+
+        prev = *cur;
+        have_prev = true;
+    }
+
+    return 0U;
+}
+
+static void analyze_sweep_response_light(freqresp_ui_status_t *s)
+{
+    if (s == nullptr || s->state != FREQRESP_STATE_DONE || s->mode != MODE_SWEEP) {
+        return;
+    }
+
+    uint32_t valid_count = 0;
+    for (uint32_t i = 0; i < g_table_count; ++i) {
+        if (fit_point_valid(&g_table[i])) {
+            ++valid_count;
+        }
+    }
+
+    clear_theory_columns();
+    g_last_fit = {};
+    s->filter_type = FILTER_TYPE_UNKNOWN;
+    s->cutoff_freq_hz = 0;
+    s->theory_gain_x1000 = 0;
+    s->error_x10 = 0;
+
+    if (valid_count < 8U) {
+        ESP_LOGW(TAG_FIT,
+                 "Light fit: valid_points=%lu -> Unknown",
+                 static_cast<unsigned long>(valid_count));
+        return;
+    }
+
+    const uint32_t edge_count = clamp_u32(valid_count / 10U, 3U, 16U);
+    uint64_t low_sum = 0;
+    uint64_t high_sum = 0;
+    uint32_t low_count = 0;
+    uint32_t high_count = 0;
+
+    for (uint32_t i = 0; i < g_table_count && low_count < edge_count; ++i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        low_sum += static_cast<uint32_t>(g_table[i].gain_x1000);
+        ++low_count;
+    }
+
+    for (int32_t i = static_cast<int32_t>(g_table_count) - 1;
+         i >= 0 && high_count < edge_count;
+         --i) {
+        if (!fit_point_valid(&g_table[i])) {
+            continue;
+        }
+        high_sum += static_cast<uint32_t>(g_table[i].gain_x1000);
+        ++high_count;
+    }
+
+    if (low_count == 0U || high_count == 0U) {
+        ESP_LOGW(TAG_FIT,
+                 "Light fit: valid_points=%lu -> Unknown (empty edge)",
+                 static_cast<unsigned long>(valid_count));
+        return;
+    }
+
+    const uint32_t low_avg = static_cast<uint32_t>(low_sum / low_count);
+    const uint32_t high_avg = static_cast<uint32_t>(high_sum / high_count);
+    uint8_t filter_type = FILTER_TYPE_UNKNOWN;
+    uint8_t model_type = MODEL_TYPE_UNKNOWN;
+    uint32_t cutoff_hz = 0;
+
+    if (static_cast<uint64_t>(low_avg) * 100U >
+        static_cast<uint64_t>(high_avg) * 125U) {
+        filter_type = FILTER_TYPE_LOW_PASS;
+        model_type = MODEL_TYPE_LP1;
+        cutoff_hz = find_light_cutoff_hz(
+            filter_type,
+            static_cast<uint32_t>((static_cast<uint64_t>(low_avg) * 707ULL) / 1000ULL)
+        );
+    } else if (static_cast<uint64_t>(high_avg) * 100U >
+               static_cast<uint64_t>(low_avg) * 125U) {
+        filter_type = FILTER_TYPE_HIGH_PASS;
+        model_type = MODEL_TYPE_HP1;
+        cutoff_hz = find_light_cutoff_hz(
+            filter_type,
+            static_cast<uint32_t>((static_cast<uint64_t>(high_avg) * 707ULL) / 1000ULL)
+        );
+    }
+
+    if (filter_type == FILTER_TYPE_UNKNOWN || cutoff_hz == 0U) {
+        ESP_LOGW(TAG_FIT,
+                 "Light fit: valid_points=%lu low=%lu high=%lu -> Unknown",
+                 static_cast<unsigned long>(valid_count),
+                 static_cast<unsigned long>(low_avg),
+                 static_cast<unsigned long>(high_avg));
+        return;
+    }
+
+    const uint32_t edge_hi = (low_avg > high_avg) ? low_avg : high_avg;
+    uint32_t edge_lo = (low_avg < high_avg) ? low_avg : high_avg;
+    if (edge_lo == 0U) {
+        edge_lo = 1U;
+    }
+    const uint32_t confidence =
+        clamp_u32(static_cast<uint32_t>(((edge_hi - edge_lo) * 1000ULL) / edge_lo),
+                  0U,
+                  1000U);
+
+    filter_fit_result_t fit = {};
+    fit.valid = true;
+    fit.model_type = model_type;
+    fit.fc_hz = cutoff_hz;
+    fit.f0_hz = cutoff_hz;
+    fit.fl_hz = 0;
+    fit.fh_hz = 0;
+    fit.q_x1000 = 707;
+    fit.k_x1000 = 1000;
+    fit.rms_error_x10 = 0;
+    fit.max_error_x10 = 0;
+    fit.confidence_x1000 = static_cast<int32_t>(confidence);
+    fit.valid_point_count = valid_count;
+    g_last_fit = fit;
+
+    s->filter_type = filter_type;
+    s->cutoff_freq_hz = cutoff_hz;
+
+    ESP_LOGI(TAG_FIT,
+             "Light fit: valid_points=%lu type=%s fc=%lu low=%lu high=%lu confidence=%ld",
+             static_cast<unsigned long>(valid_count),
+             filter_type_text(filter_type),
+             static_cast<unsigned long>(cutoff_hz),
+             static_cast<unsigned long>(low_avg),
+             static_cast<unsigned long>(high_avg),
+             static_cast<long>(fit.confidence_x1000));
+}
+
 static void fill_theory_columns(const fit_candidate_t *best)
 {
     if (best == nullptr || !best->valid) {
@@ -946,17 +1204,35 @@ static void analyze_sweep_response(freqresp_ui_status_t *s)
         return;
     }
 
+    g_heavy_fit_sample_stride =
+        (valid_count > 300U) ? ((valid_count + 299U) / 300U) : 1U;
+
     fit_candidate_t best_by_model[MODEL_TYPE_BS2 + 1];
     for (uint32_t i = 0; i <= MODEL_TYPE_BS2; ++i) {
         best_by_model[i] = invalid_candidate(static_cast<uint8_t>(i));
     }
 
-    const uint32_t grid_count = 80U;
+    const uint32_t fit_start_tick = lv_tick_get();
+    const uint32_t grid_count = 40U;
     const double log_min = log10(static_cast<double>(min_freq));
     const double log_max = log10(static_cast<double>(max_freq));
     static const double q_values[] = {0.35, 0.40, 0.50, 0.577, 0.707, 0.90, 1.00, 1.20, 1.50, 2.00, 3.00, 5.00};
 
     for (uint32_t n = 0; n < grid_count; ++n) {
+        if ((lv_tick_get() - fit_start_tick) > 100U) {
+            clear_theory_columns();
+            s->filter_type = FILTER_TYPE_UNKNOWN;
+            s->cutoff_freq_hz = 0;
+            s->theory_gain_x1000 = 0;
+            s->error_x10 = 0;
+            g_last_fit = {};
+            ESP_LOGW(TAG_FIT,
+                     "Heavy fit aborted after 100ms: valid_points=%lu stride=%lu",
+                     static_cast<unsigned long>(valid_count),
+                     static_cast<unsigned long>(g_heavy_fit_sample_stride));
+            return;
+        }
+
         const double t = (grid_count <= 1U) ? 0.0 : (static_cast<double>(n) / static_cast<double>(grid_count - 1U));
         const double freq = pow(10.0, log_min + (log_max - log_min) * t);
 
@@ -974,21 +1250,6 @@ static void analyze_sweep_response(freqresp_ui_status_t *s)
             keep_best_candidate(&best_by_model[MODEL_TYPE_HP2], &hp2);
             keep_best_candidate(&best_by_model[MODEL_TYPE_BP2], &bp2);
             keep_best_candidate(&best_by_model[MODEL_TYPE_BS2], &bs2);
-        }
-    }
-
-    for (uint32_t i = MODEL_TYPE_LP1; i <= MODEL_TYPE_BS2; ++i) {
-        if (best_by_model[i].valid) {
-            ESP_LOGI(TAG_FIT,
-                     "%s score=%.2fdB rms=%.2f%% max=%.2f%% f=%.0fHz Q=%.3f K=%.3f phase=%.1fdeg",
-                     model_kind_text(static_cast<uint8_t>(i)),
-                     best_by_model[i].score,
-                     best_by_model[i].rms_rel * 100.0,
-                     best_by_model[i].max_rel * 100.0,
-                     best_by_model[i].freq_hz,
-                     best_by_model[i].q,
-                     best_by_model[i].k,
-                     best_by_model[i].phase_rms_deg);
         }
     }
 
@@ -1183,7 +1444,11 @@ static void process_pending_fit(void)
     }
 
     freqresp_ui_status_t view = g_fit_pending_status;
+#if ENABLE_HEAVY_FILTER_FIT
     analyze_sweep_response(&view);
+#else
+    analyze_sweep_response_light(&view);
+#endif
     g_fit_done_for_current_sweep = true;
     g_fit_pending = false;
 
@@ -2251,6 +2516,9 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
 
     const uint32_t now = lv_tick_get();
     const bool is_done = (view.state == FREQRESP_STATE_DONE);
+    if (is_done) {
+        flush_pending_chart_point(true);
+    }
     const bool should_render =
         is_done || ((now - g_last_render_tick) >= kLabelRenderIntervalMs);
 
