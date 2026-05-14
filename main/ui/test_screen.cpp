@@ -1889,29 +1889,31 @@ static void adv_capture_event_cb(lv_event_t *event)
         return;
     }
 
-    if (!g_circuit_model.valid) {
-        set_adv_result("Result: MODEL? Run Basic Sweep first", COLOR_RED);
-        return;
-    }
-
     SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
 
 #if ENABLE_FAKE_DATA_TEST
     generate_fake_output_waveform();
-#endif
-
     g_adv_output_captured = true;
     set_adv_result("Result: Output y(t) captured", COLOR_GREEN);
+#else
+    g_adv_output_captured = false;
+    g_adv_reconstruction_ready = false;
+    if (g_adv_output_chart != nullptr && g_adv_output_series != nullptr) {
+        lv_chart_set_all_value(g_adv_output_chart, g_adv_output_series, LV_CHART_POINT_NONE);
+        lv_chart_refresh(g_adv_output_chart);
+    }
+    if (g_adv_recon_chart != nullptr && g_adv_recon_series != nullptr) {
+        lv_chart_set_all_value(g_adv_recon_chart, g_adv_recon_series, LV_CHART_POINT_NONE);
+        lv_chart_refresh(g_adv_recon_chart);
+    }
+    set_harmonic_rows_empty();
+    set_adv_result("Result: Capturing output y(t)...", COLOR_YELLOW);
+#endif
 }
 
 static void adv_reconstruct_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
-        return;
-    }
-
-    if (!g_circuit_model.valid) {
-        set_adv_result("Result: MODEL? Run Basic Sweep first", COLOR_RED);
         return;
     }
 
@@ -1924,10 +1926,15 @@ static void adv_reconstruct_event_cb(lv_event_t *event)
     }
     generate_fake_reconstructed_waveform();
     set_harmonic_rows_fake();
-#endif
-
     g_adv_reconstruction_ready = true;
     set_adv_result("Result: Reconstructed x(t) ready   Error: 3.4% PASS", COLOR_GREEN);
+#else
+    if (!g_adv_output_captured) {
+        set_adv_result("Result: Reconstruct requested, waiting for capture data", COLOR_YELLOW);
+    } else {
+        set_adv_result("Result: Reconstructing x(t)...", COLOR_YELLOW);
+    }
+#endif
 }
 
 static void adv_send_event_cb(lv_event_t *event)
@@ -1942,7 +1949,7 @@ static void adv_send_event_cb(lv_event_t *event)
     }
 
     SpiLink_SetPendingCommand(CMD_ADV_SEND_TO_DDS, 0U, 0U);
-    set_adv_result("Result: Sent to DDS", COLOR_GREEN);
+    set_adv_result("Result: Send to DDS requested", COLOR_YELLOW);
 }
 
 static void adv_back_event_cb(lv_event_t *event)
@@ -2191,7 +2198,7 @@ static void create_reconstruction_page(void)
                                           COLOR_SUBTEXT);
 
     create_label(screen,
-                 "Source: ADC CH2 Output       Sample Rate: 200 kSPS",
+                 "Source: ADC CH2 Output       Sample Rate: 100 kSPS",
                  24,
                  122,
                  590,
@@ -2242,6 +2249,7 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_back = create_button(screen, "Back", 900, 552, 100);
     lv_obj_add_event_cb(btn_back, adv_back_event_cb, LV_EVENT_CLICKED, nullptr);
 
+#if ENABLE_FAKE_DATA_TEST
     if (g_adv_output_captured) {
         generate_fake_output_waveform();
     }
@@ -2252,6 +2260,13 @@ static void create_reconstruction_page(void)
     } else if (g_adv_output_captured) {
         set_adv_result("Result: Output y(t) captured", COLOR_GREEN);
     }
+#else
+    if (g_adv_reconstruction_ready) {
+        set_adv_result("Result: Reconstructed x(t) ready", COLOR_GREEN);
+    } else if (g_adv_output_captured) {
+        set_adv_result("Result: Output y(t) captured", COLOR_GREEN);
+    }
+#endif
 }
 
 static void create_main_page(void)
@@ -2537,6 +2552,133 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
         g_last_status = view;
         g_have_last_status = true;
         render_basic_status(&view);
+    }
+}
+
+static int32_t adv_chart_value_from_sample(int16_t sample)
+{
+    int32_t v = static_cast<int32_t>(sample) / 32;
+    if (v > 1000) {
+        v = 1000;
+    } else if (v < -1000) {
+        v = -1000;
+    }
+    return v;
+}
+
+void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
+{
+    if (chunk == nullptr) {
+        return;
+    }
+
+    const bool is_recon = (chunk->wave_type == 1U);
+    lv_obj_t *chart = is_recon ? g_adv_recon_chart : g_adv_output_chart;
+    lv_chart_series_t *series = is_recon ? g_adv_recon_series : g_adv_output_series;
+
+    if (chunk->chunk_index == 0U) {
+        if (is_recon) {
+            g_adv_reconstruction_ready = false;
+        } else {
+            g_adv_output_captured = false;
+            g_adv_reconstruction_ready = false;
+        }
+        if (chart != nullptr && series != nullptr) {
+            lv_chart_set_all_value(chart, series, LV_CHART_POINT_NONE);
+        }
+    }
+
+    if (chart != nullptr && series != nullptr) {
+        for (uint32_t i = 0; i < 30U; ++i) {
+            const uint32_t sample_index = chunk->start_sample_index + i;
+            if (sample_index >= chunk->total_sample_count) {
+                break;
+            }
+            if ((sample_index & 7U) == 0U) {
+                lv_chart_set_next_value(chart, series, adv_chart_value_from_sample(chunk->samples[i]));
+            }
+        }
+        lv_chart_refresh(chart);
+    }
+
+    const bool is_done = (chunk->flags & 0x00000002U) != 0U ||
+                         (chunk->chunk_index + 1U >= chunk->chunk_count);
+    char buf[160];
+    if (is_done) {
+        if (is_recon) {
+            g_adv_reconstruction_ready = true;
+            snprintf(buf,
+                     sizeof(buf),
+                     "Result: H0 bypass x(t) ready   Fs=%luHz N=%lu",
+                     static_cast<unsigned long>(chunk->sample_rate_hz),
+                     static_cast<unsigned long>(chunk->total_sample_count));
+            set_adv_result(buf, COLOR_GREEN);
+            set_harmonic_rows_empty();
+        } else {
+            g_adv_output_captured = true;
+            snprintf(buf,
+                     sizeof(buf),
+                     "Result: Output y(t) captured   Fs=%luHz N=%lu",
+                     static_cast<unsigned long>(chunk->sample_rate_hz),
+                     static_cast<unsigned long>(chunk->total_sample_count));
+            set_adv_result(buf, COLOR_GREEN);
+        }
+    } else if (g_reconstruction_page_active) {
+        snprintf(buf,
+                 sizeof(buf),
+                 "Result: Receiving %s chunk %lu/%lu",
+                 is_recon ? "x(t)" : "y(t)",
+                 static_cast<unsigned long>(chunk->chunk_index + 1U),
+                 static_cast<unsigned long>(chunk->chunk_count));
+        set_adv_result(buf, COLOR_YELLOW);
+    }
+}
+
+void test_screen_update_adc_analysis_result(const adc_analysis_result_t *result)
+{
+    (void)result;
+}
+
+void test_screen_update_adv_status(const adv_status_t *status)
+{
+    if (status == nullptr) {
+        return;
+    }
+
+    if (g_adv_status != nullptr) {
+        char buf[160];
+        snprintf(buf,
+                 sizeof(buf),
+                 "Link: OK   ADV:%lu  FFT:%lu/%lu  TL:%lu/%lu",
+                 static_cast<unsigned long>(status->adv_state),
+                 static_cast<unsigned long>(status->fft_overflow_count),
+                 static_cast<unsigned long>(status->ifft_overflow_count),
+                 static_cast<unsigned long>(status->tlast_missing_count),
+                 static_cast<unsigned long>(status->tlast_unexpected_count));
+        lv_label_set_text(g_adv_status, buf);
+        lv_obj_set_style_text_color(g_adv_status,
+                                    lv_color_hex(status->error_code == 0U ? COLOR_GREEN : COLOR_RED),
+                                    LV_PART_MAIN);
+    }
+
+    if (status->error_code != 0U) {
+        const char *msg = "ADV ERROR";
+        if (status->error_code == 1U) {
+            msg = "ADV BUSY";
+        } else if (status->error_code == 2U) {
+            msg = "CAPTURE FIRST";
+        } else if (status->error_code == 3U) {
+            msg = "DDS SEND NOT IMPLEMENTED";
+        }
+
+        char buf[160];
+        snprintf(buf,
+                 sizeof(buf),
+                 "Result: %s   Fs=%luHz N=%lu",
+                 msg,
+                 static_cast<unsigned long>(status->sample_rate_hz),
+                 static_cast<unsigned long>(status->total_sample_count));
+        set_adv_result(buf, status->error_code == 3U ? COLOR_YELLOW : COLOR_RED);
     }
 }
 

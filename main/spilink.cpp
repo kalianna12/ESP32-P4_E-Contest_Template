@@ -32,6 +32,9 @@ constexpr uint8_t kFrameMagic0 = 0xA5;
 constexpr uint8_t kFrameMagic1 = 0x5A;
 constexpr uint8_t kFrameTypeFreqRespStatus = 0x10;
 constexpr uint8_t kFrameTypeFreqRespPoint = 0x13;
+constexpr uint8_t kFrameTypeAdvStatus = 0x14;
+constexpr uint8_t kFrameTypeAdvWaveChunk = 0x15;
+constexpr uint8_t kFrameTypeAdvHarmonic = 0x16;
 constexpr uint8_t kFrameTypeCommand = 0x80;
 constexpr uint8_t kFrameTypePynqToEspText = 0xE1;
 constexpr uint8_t kFrameTypeEspToPynqText = 0xE2;
@@ -49,7 +52,10 @@ constexpr size_t kTxBufferLen = 128;
 constexpr size_t kCommandQueueLen = 16;
 constexpr UBaseType_t kStatusQueueLen = 1;
 constexpr UBaseType_t kPointQueueLen = 256;
+constexpr UBaseType_t kAdvStatusQueueLen = 4;
+constexpr UBaseType_t kAdvWaveQueueLen = 64;
 constexpr size_t kMaxUiPointsPerPump = 32;
+constexpr size_t kMaxAdvWavesPerPump = 8;
 
 static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
 static_assert((kTxBufferLen % 64) == 0, "SPI TX buffer length must be a 64-byte multiple");
@@ -82,6 +88,8 @@ bool g_have_phase_history = false;
 int32_t g_prev_phase_deg_x10 = 0;
 QueueHandle_t g_status_queue = nullptr;
 QueueHandle_t g_point_queue = nullptr;
+QueueHandle_t g_adv_status_queue = nullptr;
+QueueHandle_t g_adv_wave_queue = nullptr;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_measurement_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -118,6 +126,14 @@ uint32_t GetU32(const uint8_t *buffer, size_t offset)
 int32_t GetI32(const uint8_t *buffer, size_t offset)
 {
     return static_cast<int32_t>(GetU32(buffer, offset));
+}
+
+int16_t GetI16(const uint8_t *buffer, size_t offset)
+{
+    return static_cast<int16_t>(
+        static_cast<uint16_t>(buffer[offset + 0]) |
+        (static_cast<uint16_t>(buffer[offset + 1]) << 8)
+    );
 }
 
 int32_t RawVppCodeToMv(uint32_t code)
@@ -296,6 +312,80 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
     return true;
 }
 
+bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
+{
+    if (frame == nullptr || out == nullptr || len < kFrameLen) {
+        return false;
+    }
+
+    if (frame[0] != kFrameMagic0 || frame[1] != kFrameMagic1) {
+        return false;
+    }
+
+    if (frame[2] != kFrameTypeAdvStatus || frame[3] != kPayloadLen) {
+        return false;
+    }
+
+    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
+    if (rx_checksum != expected_checksum) {
+        return false;
+    }
+
+    out->seq = GetU32(frame, 4);
+    out->adv_state = GetU32(frame, 8);
+    out->error_code = GetU32(frame, 12);
+    out->flags = GetU32(frame, 16);
+    out->sample_rate_hz = GetU32(frame, 20);
+    out->total_sample_count = GetU32(frame, 24);
+    out->capture_done_count = GetU32(frame, 28);
+    out->recon_done_count = GetU32(frame, 32);
+    out->fft_overflow_count = GetU32(frame, 36);
+    out->ifft_overflow_count = GetU32(frame, 40);
+    out->tlast_missing_count = GetU32(frame, 44);
+    out->tlast_unexpected_count = GetU32(frame, 48);
+    return true;
+}
+
+bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_t *out)
+{
+    if (frame == nullptr || out == nullptr || len < kFrameLen) {
+        return false;
+    }
+
+    if (frame[0] != kFrameMagic0 || frame[1] != kFrameMagic1) {
+        return false;
+    }
+
+    if (frame[2] != kFrameTypeAdvWaveChunk || frame[3] != kPayloadLen) {
+        return false;
+    }
+
+    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
+    if (rx_checksum != expected_checksum) {
+        return false;
+    }
+
+    out->seq = GetU32(frame, 4);
+    out->wave_type = GetU32(frame, 8);
+    out->chunk_index = GetU32(frame, 12);
+    out->chunk_count = GetU32(frame, 16);
+    out->sample_rate_hz = GetU32(frame, 20);
+    out->dds_freq_hz = 0;
+    out->total_sample_count = GetU32(frame, 24);
+    out->start_sample_index = GetU32(frame, 28);
+    out->min_mv = GetI32(frame, 32);
+    out->max_mv = GetI32(frame, 36);
+    out->mean_mv = GetI32(frame, 40);
+    out->vpp_mv = GetI32(frame, 44);
+    out->flags = GetU32(frame, 48);
+    for (size_t i = 0; i < 30U; ++i) {
+        out->samples[i] = GetI16(frame, 52 + i * 2U);
+    }
+    return true;
+}
+
 #if ENABLE_SPI_STRING_TEST
 bool ParseTextFrame(const uint8_t *frame, size_t len, uint8_t expected_type, uint32_t *seq, char *text, size_t text_len)
 {
@@ -429,6 +519,16 @@ void FreeQueues()
         vQueueDelete(g_point_queue);
         g_point_queue = nullptr;
     }
+
+    if (g_adv_status_queue != nullptr) {
+        vQueueDelete(g_adv_status_queue);
+        g_adv_status_queue = nullptr;
+    }
+
+    if (g_adv_wave_queue != nullptr) {
+        vQueueDelete(g_adv_wave_queue);
+        g_adv_wave_queue = nullptr;
+    }
 }
 
 void MaybeUpdatePointQueueHighWater()
@@ -530,7 +630,12 @@ void SpiLink_Init(void)
 
     g_status_queue = xQueueCreate(kStatusQueueLen, sizeof(freqresp_ui_status_t));
     g_point_queue = xQueueCreate(kPointQueueLen, sizeof(freqresp_ui_status_t));
-    if (g_status_queue == nullptr || g_point_queue == nullptr) {
+    g_adv_status_queue = xQueueCreate(kAdvStatusQueueLen, sizeof(adv_status_t));
+    g_adv_wave_queue = xQueueCreate(kAdvWaveQueueLen, sizeof(adc_waveform_chunk_t));
+    if (g_status_queue == nullptr ||
+        g_point_queue == nullptr ||
+        g_adv_status_queue == nullptr ||
+        g_adv_wave_queue == nullptr) {
         ESP_LOGE(TAG, "Failed to create SPI UI queues");
         FreeQueues();
         FreeBuffers();
@@ -624,6 +729,12 @@ void SpiLink_ClearMeasurementCache(void)
     if (g_point_queue != nullptr) {
         xQueueReset(g_point_queue);
     }
+    if (g_adv_status_queue != nullptr) {
+        xQueueReset(g_adv_status_queue);
+    }
+    if (g_adv_wave_queue != nullptr) {
+        xQueueReset(g_adv_wave_queue);
+    }
     dropped_point_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
@@ -647,6 +758,24 @@ void SpiLink_UiPump(void)
             break;
         }
         test_screen_update_measurement(&point);
+    }
+
+    for (size_t i = 0; i < 2U; ++i) {
+        adv_status_t adv = {};
+        if (g_adv_status_queue == nullptr ||
+            xQueueReceive(g_adv_status_queue, &adv, 0) != pdTRUE) {
+            break;
+        }
+        test_screen_update_adv_status(&adv);
+    }
+
+    for (size_t i = 0; i < kMaxAdvWavesPerPump; ++i) {
+        adc_waveform_chunk_t chunk = {};
+        if (g_adv_wave_queue == nullptr ||
+            xQueueReceive(g_adv_wave_queue, &chunk, 0) != pdTRUE) {
+            break;
+        }
+        test_screen_update_adc_waveform_chunk(&chunk);
     }
 }
 
@@ -752,6 +881,26 @@ void SpiLink_Task(void)
         return;
     }
 #endif
+
+    adv_status_t adv_status = {};
+    if (ParseAdvStatusFrame(rx_buffer, kFrameLen, &adv_status)) {
+        ++ok_count;
+        if (g_adv_status_queue != nullptr) {
+            xQueueSend(g_adv_status_queue, &adv_status, 0);
+        }
+        MaybeLogSpiStats();
+        return;
+    }
+
+    adc_waveform_chunk_t adv_chunk = {};
+    if (ParseAdvWaveChunkFrame(rx_buffer, kFrameLen, &adv_chunk)) {
+        ++ok_count;
+        if (g_adv_wave_queue != nullptr) {
+            xQueueSend(g_adv_wave_queue, &adv_chunk, 0);
+        }
+        MaybeLogSpiStats();
+        return;
+    }
 
     freqresp_ui_status_t status = {};
     const bool is_status_frame = ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status);

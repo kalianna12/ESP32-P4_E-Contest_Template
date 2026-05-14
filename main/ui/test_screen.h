@@ -142,6 +142,7 @@ typedef struct {
 
 typedef struct {
     uint32_t seq;
+    uint32_t wave_type;
     uint32_t chunk_index;
     uint32_t chunk_count;
     uint32_t sample_rate_hz;
@@ -176,10 +177,26 @@ typedef struct {
     uint32_t zero_cross_count;
 } adc_analysis_result_t;
 
+typedef struct {
+    uint32_t seq;
+    uint32_t adv_state;
+    uint32_t error_code;
+    uint32_t flags;
+    uint32_t sample_rate_hz;
+    uint32_t total_sample_count;
+    uint32_t capture_done_count;
+    uint32_t recon_done_count;
+    uint32_t fft_overflow_count;
+    uint32_t ifft_overflow_count;
+    uint32_t tlast_missing_count;
+    uint32_t tlast_unexpected_count;
+} adv_status_t;
+
 void test_screen_create(void);
 void test_screen_update_measurement(const freqresp_ui_status_t *status);
 void test_screen_update_adc_analysis_result(const adc_analysis_result_t *result);
 void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk);
+void test_screen_update_adv_status(const adv_status_t *status);
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state);
 
 #ifdef __cplusplus
