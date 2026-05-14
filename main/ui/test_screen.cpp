@@ -99,9 +99,18 @@ static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
 static bool g_model_saved_for_current_sweep = false;
 static bool g_fit_done_for_current_sweep = false;
+static bool g_fit_pending = false;
+static uint32_t g_fit_pending_tick = 0;
+static uint32_t g_last_render_tick = 0;
+static freqresp_ui_status_t g_fit_pending_status = {};
 static lv_timer_t *g_spi_ui_pump_timer = nullptr;
 
 static void update_adv_model_line(void);
+static void render_basic_status(const freqresp_ui_status_t *s);
+static void process_pending_fit(void);
+
+static constexpr uint32_t kLabelRenderIntervalMs = 50U;
+static constexpr uint32_t kFitDelayMs = 300U;
 
 #if ENABLE_SPI_TEST_WINDOW
 static lv_obj_t *g_spi_test_link = nullptr;
@@ -450,6 +459,10 @@ static void ClearAllSweepData(void)
     g_adv_reconstruction_ready = false;
     g_model_saved_for_current_sweep = false;
     g_fit_done_for_current_sweep = false;
+    g_fit_pending = false;
+    g_fit_pending_tick = 0;
+    g_last_render_tick = 0;
+    g_fit_pending_status = {};
     SpiLink_ClearMeasurementCache();
 
     if (g_main_page_active && g_chart != nullptr && g_chart_gain != nullptr) {
@@ -1152,6 +1165,34 @@ static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
     g_model_saved_for_current_sweep = true;
+}
+
+static void process_pending_fit(void)
+{
+    if (!g_fit_pending || g_fit_done_for_current_sweep) {
+        return;
+    }
+
+    if (SpiLink_PointQueueWaiting() != 0U) {
+        return;
+    }
+
+    const uint32_t now = lv_tick_get();
+    if ((now - g_fit_pending_tick) < kFitDelayMs) {
+        return;
+    }
+
+    freqresp_ui_status_t view = g_fit_pending_status;
+    analyze_sweep_response(&view);
+    g_fit_done_for_current_sweep = true;
+    g_fit_pending = false;
+
+    g_last_status = view;
+    g_have_last_status = true;
+    save_circuit_model_from_table(&view);
+    update_adv_model_line();
+    render_basic_status(&view);
+    set_msg("FIT DONE", COLOR_GREEN);
 }
 
 static void set_adv_result(const char *text, uint32_t color)
@@ -2102,6 +2143,7 @@ void test_screen_create(void)
         g_spi_ui_pump_timer = lv_timer_create([](lv_timer_t *timer) {
             (void)timer;
             SpiLink_UiPump();
+            process_pending_fit();
         }, 20, nullptr);
     }
 
@@ -2207,17 +2249,27 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
 
     append_table_point(&view);
 
-    if (view.state == FREQRESP_STATE_DONE && !g_fit_done_for_current_sweep) {
-        analyze_sweep_response(&view);
-        g_fit_done_for_current_sweep = true;
+    const uint32_t now = lv_tick_get();
+    const bool is_done = (view.state == FREQRESP_STATE_DONE);
+    const bool should_render =
+        is_done || ((now - g_last_render_tick) >= kLabelRenderIntervalMs);
+
+    if (is_done &&
+        view.mode == MODE_SWEEP &&
+        !g_fit_done_for_current_sweep &&
+        !g_fit_pending) {
+        g_fit_pending = true;
+        g_fit_pending_tick = now;
+        g_fit_pending_status = view;
+        set_msg("FITTING...", COLOR_YELLOW);
     }
 
-    g_last_status = view;
-    g_have_last_status = true;
-    save_circuit_model_from_table(&view);
-    update_adv_model_line();
-
-    render_basic_status(&view);
+    if (should_render) {
+        g_last_render_tick = now;
+        g_last_status = view;
+        g_have_last_status = true;
+        render_basic_status(&view);
+    }
 }
 
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state)

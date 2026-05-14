@@ -650,6 +650,15 @@ void SpiLink_UiPump(void)
     }
 }
 
+uint32_t SpiLink_PointQueueWaiting(void)
+{
+    if (g_point_queue == nullptr) {
+        return 0U;
+    }
+
+    return static_cast<uint32_t>(uxQueueMessagesWaiting(g_point_queue));
+}
+
 void SpiLink_SendTextToPynq(const char *text)
 {
 #if ENABLE_SPI_STRING_TEST
