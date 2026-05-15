@@ -93,6 +93,12 @@ static bool g_adv_harmonic_valid[ADV_HARMONIC_MAX] = {};
 static uint32_t g_adv_harmonic_count = 0;
 static uint32_t g_last_adv_capture_done_count = 0;
 static uint32_t g_last_adv_recon_done_count = 0;
+static bool g_adv_capture_pending = false;
+static bool g_adv_recon_pending = false;
+static uint32_t g_latest_adv_capture_count = 0;
+static uint32_t g_latest_adv_recon_count = 0;
+static uint32_t g_adv_capture_req_base = 0;
+static uint32_t g_adv_recon_req_base = 0;
 
 static uint32_t g_start_freq_hz = DEFAULT_START_FREQ_HZ;
 static uint32_t g_stop_freq_hz = DEFAULT_STOP_FREQ_HZ;
@@ -389,10 +395,10 @@ static const char *model_kind_text(uint8_t type)
     switch (type) {
     case MODEL_TYPE_LP1: return "LP1";
     case MODEL_TYPE_HP1: return "HP1";
-    case MODEL_TYPE_LP2: return "LP2";
-    case MODEL_TYPE_HP2: return "HP2";
-    case MODEL_TYPE_BP2: return "BP2";
-    case MODEL_TYPE_BS2: return "BS2";
+    case MODEL_TYPE_LP2: return "2LP";
+    case MODEL_TYPE_HP2: return "2HP";
+    case MODEL_TYPE_BP2: return "BP";
+    case MODEL_TYPE_BS2: return "BS";
     default: return "Unknown";
     }
 }
@@ -525,6 +531,10 @@ static void ClearAllSweepData(void)
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     g_last_adv_capture_done_count = 0;
     g_last_adv_recon_done_count = 0;
+    g_adv_capture_pending = false;
+    g_adv_recon_pending = false;
+    g_adv_capture_req_base = g_latest_adv_capture_count;
+    g_adv_recon_req_base = g_latest_adv_recon_count;
     g_model_saved_for_current_sweep = false;
     g_fit_done_for_current_sweep = false;
     g_fit_pending = false;
@@ -1024,7 +1034,7 @@ static void process_pending_fit_request(void)
                  "Heavy fit started: points=%lu queue_waiting=%lu",
                  static_cast<unsigned long>(g_fit_input_work.point_count),
                  static_cast<unsigned long>(SpiLink_PointQueueWaiting()));
-        set_msg("FITTING", COLOR_YELLOW);
+        set_msg("FITTING...", COLOR_YELLOW);
     }
 }
 
@@ -1129,25 +1139,13 @@ static void update_adv_model_line(void)
         if (g_fit_result_quality == FIT_RESULT_HEAVY_LOW_CONF) {
             snprintf(buf,
                      sizeof(buf),
-                     "Circuit Model: Unknown/Low confidence      fc: ----- Hz      H(f): Loaded");
+                     "Circuit Model: Unknown      fc: ----- Hz      H(f): Loaded");
         } else if (g_circuit_model.fit.valid) {
-            const char *prefix = "";
-            const char *suffix = "";
-            if (g_fit_result_quality == FIT_RESULT_HEAVY_TIMEOUT) {
-                suffix = "? timeout";
-            } else if (g_fit_result_quality == FIT_RESULT_LIGHT) {
-                prefix = "Light ";
-            }
             snprintf(buf,
                      sizeof(buf),
-                     "Circuit Model: %s%s%s      f0/fc: %s Hz      Q=%ld.%03ld Conf=%ld%%",
-                     prefix,
+                     "Circuit Model: %s      f0/fc: %s Hz      H(f): Loaded",
                      model_kind_text(g_circuit_model.fit.model_type),
-                     suffix,
-                     fc,
-                     static_cast<long>(g_circuit_model.fit.q_x1000 / 1000),
-                     static_cast<long>(g_circuit_model.fit.q_x1000 % 1000),
-                     static_cast<long>(g_circuit_model.fit.confidence_x1000 / 10));
+                     fc);
         } else {
             snprintf(buf,
                      sizeof(buf),
@@ -1161,14 +1159,10 @@ static void update_adv_model_line(void)
         if (g_circuit_model.fit.valid) {
             snprintf(buf,
                      sizeof(buf),
-                     "Model Range: %s~%s Hz      Points: %lu      RMS=%ld.%ld%% Max=%ld.%ld%%",
+                     "Model Range: %s~%s Hz      Points: %lu",
                      start_freq,
                      stop_freq,
-                     static_cast<unsigned long>(g_circuit_model.fit.valid_point_count),
-                     static_cast<long>(g_circuit_model.fit.rms_error_x10 / 10),
-                     static_cast<long>(g_circuit_model.fit.rms_error_x10 % 10),
-                     static_cast<long>(g_circuit_model.fit.max_error_x10 / 10),
-                     static_cast<long>(g_circuit_model.fit.max_error_x10 % 10));
+                     static_cast<unsigned long>(g_circuit_model.fit.valid_point_count));
         } else {
             snprintf(buf,
                      sizeof(buf),
@@ -1383,46 +1377,15 @@ static void update_current_point(const freqresp_ui_status_t *s)
     lv_label_set_text(g_phase, buf);
 
     if (g_fit_result_quality == FIT_RESULT_HEAVY_LOW_CONF) {
-        snprintf(buf, sizeof(buf), "Type: Unknown/Low confidence");
+        snprintf(buf, sizeof(buf), "Type: Unknown");
     } else if (g_last_fit.valid) {
-        if (g_fit_result_quality == FIT_RESULT_HEAVY_TIMEOUT) {
-            snprintf(buf,
-                     sizeof(buf),
-                     "Type: %s? timeout C=%ld%%",
-                     model_kind_text(g_last_fit.model_type),
-                     static_cast<long>(g_last_fit.confidence_x1000 / 10));
-        } else if (g_fit_result_quality == FIT_RESULT_LIGHT) {
-            snprintf(buf,
-                     sizeof(buf),
-                     "Type: Light %s C=%ld%%",
-                     model_kind_text(g_last_fit.model_type),
-                     static_cast<long>(g_last_fit.confidence_x1000 / 10));
-        } else if (g_fit_result_quality == FIT_RESULT_HEAVY_OK &&
-                   (g_last_fit.model_type == MODEL_TYPE_LP2 ||
-                    g_last_fit.model_type == MODEL_TYPE_HP2 ||
-                    g_last_fit.model_type == MODEL_TYPE_BP2 ||
-                    g_last_fit.model_type == MODEL_TYPE_BS2)) {
-            snprintf(buf,
-                     sizeof(buf),
-                     "Type: %s Q=%ld.%03ld C=%ld%%",
-                     model_kind_text(g_last_fit.model_type),
-                     static_cast<long>(g_last_fit.q_x1000 / 1000),
-                     static_cast<long>(g_last_fit.q_x1000 % 1000),
-                     static_cast<long>(g_last_fit.confidence_x1000 / 10));
-        } else {
-            snprintf(buf,
-                     sizeof(buf),
-                     "Type: %s C=%ld%%",
-                     model_kind_text(g_last_fit.model_type),
-                     static_cast<long>(g_last_fit.confidence_x1000 / 10));
-        }
+        snprintf(buf, sizeof(buf), "Type: %s", model_kind_text(g_last_fit.model_type));
     } else {
-        snprintf(buf, sizeof(buf), "Type: %s", filter_type_text(s->filter_type));
+        snprintf(buf, sizeof(buf), "Type: Unknown");
     }
     lv_label_set_text(g_type, buf);
 
-    if (g_fit_result_quality == FIT_RESULT_HEAVY_OK &&
-        g_last_fit.valid &&
+    if (g_last_fit.valid &&
         (g_last_fit.model_type == MODEL_TYPE_LP2 ||
          g_last_fit.model_type == MODEL_TYPE_HP2 ||
          g_last_fit.model_type == MODEL_TYPE_BP2 ||
@@ -1557,6 +1520,11 @@ static void back_button_event_cb(lv_event_t *event)
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         create_main_page();
         if (g_have_last_status) {
+            if (g_last_fit.valid && g_table_count != 0U) {
+                const uint32_t last = (g_table_count - 1U < MAX_POINTS) ? (g_table_count - 1U) : (MAX_POINTS - 1U);
+                g_last_status.theory_gain_x1000 = g_table[last].theory_gain_x1000;
+                g_last_status.error_x10 = g_table[last].error_x10;
+            }
             render_basic_status(&g_last_status);
         }
     }
@@ -1569,16 +1537,19 @@ static void adv_capture_event_cb(lv_event_t *event)
     }
 
     if (!g_circuit_model.valid) {
-        set_adv_result("Result: MODEL? Run Basic Sweep first", COLOR_RED);
+        set_adv_result("MODEL FIRST", COLOR_RED);
         return;
     }
 
-    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+    g_adv_capture_pending = true;
+    g_adv_recon_pending = false;
+    g_adv_capture_req_base = g_latest_adv_capture_count;
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     refresh_harmonic_rows();
+    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
     set_adv_result("CAP REQ / WAIT", COLOR_YELLOW);
 }
 
@@ -1589,15 +1560,22 @@ static void adv_reconstruct_event_cb(lv_event_t *event)
     }
 
     if (!g_circuit_model.valid) {
-        set_adv_result("Result: MODEL? Run Basic Sweep first", COLOR_RED);
+        set_adv_result("MODEL FIRST", COLOR_RED);
         return;
     }
 
-    SpiLink_SetPendingCommand(CMD_ADV_RECONSTRUCT, 0U, 0U);
+    if (!g_adv_output_captured) {
+        set_adv_result("CAP FIRST", COLOR_RED);
+        return;
+    }
+
+    g_adv_recon_pending = true;
+    g_adv_recon_req_base = g_latest_adv_recon_count;
     g_adv_reconstruction_ready = false;
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     refresh_harmonic_rows();
+    SpiLink_SetPendingCommand(CMD_ADV_RECONSTRUCT, 0U, 0U);
     set_adv_result("RECON REQ / WAIT", COLOR_YELLOW);
 }
 
@@ -2312,6 +2290,11 @@ void test_screen_update_adv_status(const adv_status_t *status)
         return;
     }
 
+    g_latest_adv_capture_count = status->capture_done_count;
+    g_latest_adv_recon_count = status->recon_done_count;
+    g_last_adv_capture_done_count = status->capture_done_count;
+    g_last_adv_recon_done_count = status->recon_done_count;
+
     if (g_adv_status != nullptr) {
         char buf[160];
         snprintf(buf,
@@ -2329,40 +2312,37 @@ void test_screen_update_adv_status(const adv_status_t *status)
                                     LV_PART_MAIN);
     }
 
-    if (status->capture_done_count != 0U &&
-        status->capture_done_count != g_last_adv_capture_done_count) {
-        g_last_adv_capture_done_count = status->capture_done_count;
+    if (status->error_code != 0U) {
+        g_adv_capture_pending = false;
+        g_adv_recon_pending = false;
+
+        const char *msg = "ADV ERR";
+        if (status->error_code == 1U) {
+            msg = "BUSY";
+        } else if (status->error_code == 2U) {
+            msg = "CAP?";
+        } else if (status->error_code == 3U) {
+            msg = "DDS N/I";
+        }
+
+        set_adv_result(msg, status->error_code == 3U ? COLOR_YELLOW : COLOR_RED);
+        return;
+    }
+
+    if (g_adv_capture_pending &&
+        status->capture_done_count > g_adv_capture_req_base) {
+        g_adv_capture_pending = false;
         g_adv_output_captured = true;
         if (!g_adv_reconstruction_ready) {
             set_adv_result("CAP DONE", COLOR_GREEN);
         }
     }
 
-    if (status->recon_done_count != 0U &&
-        status->recon_done_count != g_last_adv_recon_done_count) {
-        g_last_adv_recon_done_count = status->recon_done_count;
+    if (g_adv_recon_pending &&
+        status->recon_done_count > g_adv_recon_req_base) {
+        g_adv_recon_pending = false;
         g_adv_reconstruction_ready = true;
         set_adv_result("RECON DONE", COLOR_GREEN);
-    }
-
-    if (status->error_code != 0U) {
-        const char *msg = "ADV ERROR";
-        if (status->error_code == 1U) {
-            msg = "BUSY";
-        } else if (status->error_code == 2U) {
-            msg = "CAP?";
-        } else if (status->error_code == 3U) {
-            msg = "DDS ERR";
-        }
-
-        char buf[160];
-        snprintf(buf,
-                 sizeof(buf),
-                 "%s FS=%lu N=%lu",
-                 msg,
-                 static_cast<unsigned long>(status->sample_rate_hz),
-                 static_cast<unsigned long>(status->total_sample_count));
-        set_adv_result(buf, status->error_code == 3U ? COLOR_YELLOW : COLOR_RED);
     }
 }
 

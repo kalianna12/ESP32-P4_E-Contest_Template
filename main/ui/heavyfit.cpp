@@ -12,7 +12,7 @@
 namespace {
 
 constexpr char TAG[] = "HeavyFit";
-constexpr uint32_t kHeavyFitTimeBudgetMs = 300U;
+constexpr uint32_t kHeavyFitTimeBudgetMs = 10000U;
 constexpr uint32_t kHeavyFitMaxSamples = 300U;
 constexpr uint32_t kHeavyFitGridCount = 24U;
 
