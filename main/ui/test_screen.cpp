@@ -2,9 +2,12 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "dds_direct_link.h"
 #include "heavyfit.h"
 #include "lvgl.h"
 #include "spilink.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -118,6 +121,11 @@ static circuit_model_t g_circuit_model = {};
 static filter_fit_result_t g_last_fit = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
+static int16_t g_cap_samples[1024] = {};
+static bool g_cap_valid[1024] = {};
+static uint32_t g_cap_received_count = 0;
+static bool g_cap_complete = false;
+static bool g_cap_send_square_after_complete = false;
 static bool g_model_saved_for_current_sweep = false;
 static bool g_fit_done_for_current_sweep = false;
 static bool g_fit_pending = false;
@@ -161,6 +169,7 @@ static void process_pending_fit_request(void);
 static void process_heavyfit_result(void);
 static bool chart_point_visible(uint32_t index);
 static void create_full_table_page(void);
+static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
 
 static constexpr uint32_t kLabelRenderIntervalMs = 50U;
 static constexpr uint32_t kChartRenderIntervalMs = 50U;
@@ -598,6 +607,11 @@ static void ClearAllSweepData(void)
     g_fit_result_quality = FIT_RESULT_NONE;
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
+    memset(g_cap_samples, 0, sizeof(g_cap_samples));
+    memset(g_cap_valid, 0, sizeof(g_cap_valid));
+    g_cap_received_count = 0;
+    g_cap_complete = false;
+    g_cap_send_square_after_complete = false;
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     g_last_adv_capture_done_count = 0;
@@ -1647,6 +1661,7 @@ static void adv_capture_event_cb(lv_event_t *event)
 
     g_adv_capture_pending = true;
     g_adv_recon_pending = false;
+    g_cap_send_square_after_complete = false;
     g_adv_capture_req_base = g_latest_adv_capture_count;
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
@@ -1655,6 +1670,25 @@ static void adv_capture_event_cb(lv_event_t *event)
     refresh_harmonic_rows();
     SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
     set_adv_result("CAP REQ / WAIT", COLOR_YELLOW);
+}
+
+static void adv_capture_direct_square_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    g_adv_capture_pending = true;
+    g_adv_recon_pending = false;
+    g_cap_send_square_after_complete = true;
+    g_adv_capture_req_base = g_latest_adv_capture_count;
+    g_adv_output_captured = false;
+    g_adv_reconstruction_ready = false;
+    g_adv_harmonic_count = 0;
+    memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
+    refresh_harmonic_rows();
+    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+    set_adv_result("CAP REQ / DDS DIRECT SQ", COLOR_YELLOW);
 }
 
 static void adv_reconstruct_event_cb(lv_event_t *event)
@@ -1698,6 +1732,30 @@ static void adv_send_event_cb(lv_event_t *event)
     SpiLink_SetPendingCommand(CMD_ADV_SEND_TO_DDS, 0U, 0U);
     g_adv_dds_pending = true;
     set_adv_result("DDS REQ / WAIT", COLOR_YELLOW);
+}
+
+static void adv_direct_square_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    set_adv_result("DDS DIRECT TX", COLOR_YELLOW);
+    const bool ok = DdsDirect_SendSquareTest();
+    set_adv_result(ok ? "DDS DIRECT SQ DONE" : "DDS DIRECT SQ FAIL",
+                   ok ? COLOR_GREEN : COLOR_RED);
+}
+
+static void adv_direct_triangle_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    set_adv_result("DDS DIRECT TX", COLOR_YELLOW);
+    const bool ok = DdsDirect_SendTriangleTest();
+    set_adv_result(ok ? "DDS DIRECT TRI DONE" : "DDS DIRECT TRI FAIL",
+                   ok ? COLOR_GREEN : COLOR_RED);
 }
 
 static void adv_back_event_cb(lv_event_t *event)
@@ -1975,11 +2033,17 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_capture = create_button(screen, "CAP", 24, 178, 120);
     lv_obj_t *btn_reconstruct = create_button(screen, "RECON+DDS", 164, 178, 150);
     lv_obj_t *btn_send = create_button(screen, "DDS RETRY", 334, 178, 110);
+    lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 464, 178, 95);
+    lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 579, 178, 95);
+    lv_obj_t *btn_cap_direct_square = create_button(screen, "CAP+SQ", 874, 178, 115);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_direct_triangle, adv_direct_triangle_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_cap_direct_square, adv_capture_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t *btn_harmonic = create_button(screen, "Harmonics", 464, 178, 160);
+    lv_obj_t *btn_harmonic = create_button(screen, "Harmonics", 694, 178, 160);
     lv_obj_add_event_cb(btn_harmonic, open_harmonic_table_event_cb, LV_EVENT_CLICKED, nullptr);
 
     create_hline(screen, 230);
@@ -2314,11 +2378,128 @@ static int32_t adv_chart_value_from_sample(int16_t sample)
     return v;
 }
 
+static void capture_buffer_print_summary(uint32_t total_count)
+{
+    int16_t cap_min = 32767;
+    int16_t cap_max = -32768;
+    int64_t sum = 0;
+    uint32_t zero_count = 0;
+    const uint32_t n = (total_count > 1024U) ? 1024U : total_count;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!g_cap_valid[i]) {
+            continue;
+        }
+        const int16_t s = g_cap_samples[i];
+        if (s < cap_min) {
+            cap_min = s;
+        }
+        if (s > cap_max) {
+            cap_max = s;
+        }
+        if (s == 0) {
+            ++zero_count;
+        }
+        sum += s;
+    }
+
+    const int32_t vpp = static_cast<int32_t>(cap_max) - static_cast<int32_t>(cap_min);
+    const int32_t mean = (g_cap_received_count == 0U) ? 0 :
+        static_cast<int32_t>(sum / static_cast<int64_t>(g_cap_received_count));
+
+    ESP_LOGI(TAG_UI,
+             "CAP COMPLETE min=%d max=%d vpp=%ld mean=%ld zero_count=%lu received=%lu/%lu",
+             static_cast<int>(cap_min),
+             static_cast<int>(cap_max),
+             static_cast<long>(vpp),
+             static_cast<long>(mean),
+             static_cast<unsigned long>(zero_count),
+             static_cast<unsigned long>(g_cap_received_count),
+             static_cast<unsigned long>(n));
+
+    char first_line[160];
+    int used = snprintf(first_line, sizeof(first_line), "CAP first16:");
+    for (uint32_t i = 0; i < 16U && i < n; ++i) {
+        used += snprintf(first_line + used, sizeof(first_line) - used, " %d",
+                         static_cast<int>(g_cap_samples[i]));
+        if (used >= static_cast<int>(sizeof(first_line))) {
+            break;
+        }
+    }
+    ESP_LOGI(TAG_UI, "%s", first_line);
+
+    for (uint32_t i = 0; i < n; i += 64U) {
+        ESP_LOGI(TAG_UI, "CAP[%04lu]=%d",
+                 static_cast<unsigned long>(i),
+                 static_cast<int>(g_cap_samples[i]));
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
+{
+    if (chunk == nullptr || chunk->wave_type != 0U) {
+        return;
+    }
+
+    if (chunk->chunk_index == 0U) {
+        memset(g_cap_samples, 0, sizeof(g_cap_samples));
+        memset(g_cap_valid, 0, sizeof(g_cap_valid));
+        g_cap_received_count = 0;
+        g_cap_complete = false;
+    }
+
+    const uint32_t total = (chunk->total_sample_count > 1024U) ? 1024U : chunk->total_sample_count;
+    ESP_LOGI(TAG_UI,
+             "CAP chunk idx=%lu/%lu start=%lu count<=30 flags=0x%08lX total=%lu",
+             static_cast<unsigned long>(chunk->chunk_index),
+             static_cast<unsigned long>(chunk->chunk_count),
+             static_cast<unsigned long>(chunk->start_sample_index),
+             static_cast<unsigned long>(chunk->flags),
+             static_cast<unsigned long>(chunk->total_sample_count));
+
+    for (uint32_t i = 0; i < 30U; ++i) {
+        const uint32_t sample_index = chunk->start_sample_index + i;
+        if (sample_index >= total) {
+            break;
+        }
+        g_cap_samples[sample_index] = chunk->samples[i];
+        if (!g_cap_valid[sample_index]) {
+            g_cap_valid[sample_index] = true;
+            ++g_cap_received_count;
+        }
+    }
+
+    const bool is_done = (chunk->flags & 0x00000002U) != 0U ||
+                         (chunk->chunk_index + 1U >= chunk->chunk_count);
+    if (!g_cap_complete && total != 0U && (g_cap_received_count >= total || is_done)) {
+        g_cap_complete = (g_cap_received_count >= total);
+        if (g_cap_complete) {
+            capture_buffer_print_summary(total);
+            if (g_cap_send_square_after_complete) {
+                g_cap_send_square_after_complete = false;
+                set_adv_result("CAP OK / DDS DIRECT TX", COLOR_YELLOW);
+                const bool ok = DdsDirect_SendSquareTest();
+                set_adv_result(ok ? "CAP OK / DDS DIRECT DONE" : "CAP OK / DDS DIRECT FAIL",
+                               ok ? COLOR_GREEN : COLOR_RED);
+            }
+        } else {
+            g_cap_send_square_after_complete = false;
+            ESP_LOGW(TAG_UI,
+                     "CAP incomplete at done: received=%lu/%lu",
+                     static_cast<unsigned long>(g_cap_received_count),
+                     static_cast<unsigned long>(total));
+        }
+    }
+}
+
 void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
 {
     if (chunk == nullptr) {
         return;
     }
+
+    capture_buffer_store_chunk(chunk);
 
     const bool is_recon = (chunk->wave_type == 1U);
     lv_obj_t *chart = is_recon ? g_adv_recon_chart : g_adv_output_chart;

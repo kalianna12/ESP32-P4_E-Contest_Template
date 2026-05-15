@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         app_main.cpp
+        dds_direct_link.cpp
         spilink.cpp
         lvgl_adapter_init.c
         wifi/template_wifi.c
