@@ -152,10 +152,12 @@ static void render_basic_status(const freqresp_ui_status_t *s);
 static void process_pending_fit_request(void);
 static void process_heavyfit_result(void);
 static bool chart_point_visible(uint32_t index);
+static void create_full_table_page(void);
 
 static constexpr uint32_t kLabelRenderIntervalMs = 50U;
 static constexpr uint32_t kChartRenderIntervalMs = 50U;
 static constexpr uint32_t kFitDelayMs = 300U;
+static constexpr uint32_t kPhaseValidFlag = 0x00000200U;
 
 static bool ensure_ui_work_buffers(void)
 {
@@ -823,17 +825,29 @@ static fit_reject_reason_t fit_point_reject_reason_strict(uint32_t index)
 
 static bool chart_point_visible(uint32_t index)
 {
-    if (fit_point_reject_reason_strict(index) != FIT_REJECT_NONE) {
+    if (index >= g_table_count) {
         return false;
-    }
-    if (index == 0U || index >= g_table_count) {
-        return true;
     }
 
     const freq_point_t *cur = &g_table[index];
+    if ((cur->flags & FREQ_POINT_FLAG_MISSING) != 0U ||
+        cur->freq_hz == 0U ||
+        cur->gain_x1000 <= 0 ||
+        cur->gain_x1000 > 3000) {
+        return false;
+    }
+
+    if (index == 0U) {
+        return true;
+    }
+
     for (int32_t i = static_cast<int32_t>(index) - 1; i >= 0; --i) {
         const freq_point_t *prev = &g_table[i];
-        if (!fit_point_basic_valid(prev) || prev->freq_hz >= cur->freq_hz) {
+        if ((prev->flags & FREQ_POINT_FLAG_MISSING) != 0U ||
+            prev->freq_hz == 0U ||
+            prev->gain_x1000 <= 0 ||
+            prev->gain_x1000 > 3000 ||
+            prev->freq_hz >= cur->freq_hz) {
             continue;
         }
         const uint32_t freq_ratio_x1000 =
@@ -916,6 +930,10 @@ static void process_pending_fit_request(void)
     if (HeavyFit_StartAsync(&g_fit_input_work)) {
         g_fit_pending = false;
         g_fit_inflight = true;
+        ESP_LOGI(TAG_UI,
+                 "Heavy fit started: points=%lu queue_waiting=%lu",
+                 static_cast<unsigned long>(g_fit_input_work.point_count),
+                 static_cast<unsigned long>(SpiLink_PointQueueWaiting()));
         set_msg("FITTING", COLOR_YELLOW);
     }
 }
@@ -932,6 +950,7 @@ static void process_heavyfit_result(void)
 
     g_fit_inflight = false;
     if (g_fit_output_work.canceled) {
+        ESP_LOGW(TAG_UI, "Heavy fit canceled");
         set_msg("FIT CANCELED", COLOR_YELLOW);
         return;
     }
@@ -940,6 +959,7 @@ static void process_heavyfit_result(void)
         g_fit_done_for_current_sweep = true;
         g_last_fit = {};
         g_fit_result_quality = FIT_RESULT_NONE;
+        ESP_LOGW(TAG_UI, "Heavy fit failed: output invalid");
         set_msg("FIT FAIL", COLOR_RED);
         return;
     }
@@ -951,6 +971,10 @@ static void process_heavyfit_result(void)
         g_table[i].error_x10 = g_fit_output_work.error_x10[i];
     }
 
+    if (n != 0U) {
+        g_fit_output_work.status.theory_gain_x1000 = g_table[n - 1U].theory_gain_x1000;
+        g_fit_output_work.status.error_x10 = g_table[n - 1U].error_x10;
+    }
     g_last_fit = g_fit_output_work.fit;
     g_fit_result_quality = static_cast<fit_result_quality_t>(g_fit_output_work.quality);
     g_fit_done_for_current_sweep = true;
@@ -958,7 +982,17 @@ static void process_heavyfit_result(void)
     g_have_last_status = true;
     save_circuit_model_from_table(&g_fit_output_work.status);
     update_adv_model_line();
+    refresh_chart_from_table();
+    if (g_full_table != nullptr) {
+        create_full_table_page();
+    }
     render_basic_status(&g_fit_output_work.status);
+    ESP_LOGI(TAG_UI,
+             "Heavy fit done: quality=%u type=%u fc=%lu confidence=%ld",
+             static_cast<unsigned>(g_fit_result_quality),
+             static_cast<unsigned>(g_last_fit.model_type),
+             static_cast<unsigned long>(g_fit_output_work.status.cutoff_freq_hz),
+             static_cast<long>(g_last_fit.confidence_x1000));
     set_msg("FIT DONE", COLOR_GREEN);
 }
 
@@ -2067,6 +2101,7 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
         view.mode == MODE_SWEEP &&
         !g_fit_done_for_current_sweep &&
         !g_fit_pending) {
+        flush_pending_chart_point(true);
         g_fit_pending = true;
         g_fit_pending_tick = now;
         g_fit_pending_status = view;
@@ -2389,6 +2424,8 @@ static void format_point_flags(char *buf, size_t len, uint32_t flags)
         snprintf(buf, len, "MISSING");
     } else if ((flags & FREQ_POINT_FLAG_UNSTABLE) != 0U) {
         snprintf(buf, len, "UNSTABLE");
+    } else if ((flags & kPhaseValidFlag) == 0U) {
+        snprintf(buf, len, "NO_PHASE");
     } else if (flags != 0U) {
         snprintf(buf, len, "0x%08lX", static_cast<unsigned long>(flags));
     } else {

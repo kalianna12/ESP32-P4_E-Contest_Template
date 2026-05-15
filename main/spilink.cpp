@@ -98,6 +98,7 @@ uint32_t err_count = 0;
 uint32_t timeout_count = 0;
 uint32_t dropped_point_count = 0;
 uint32_t dropped_harmonic_count = 0;
+uint32_t recovered_header_count = 0;
 uint32_t point_queue_high_water = 0;
 uint32_t last_point_index = 0;
 uint32_t last_freq_hz = 0;
@@ -135,6 +136,41 @@ uint8_t Checksum(const uint8_t *frame, size_t len)
         checksum ^= frame[i];
     }
     return checksum;
+}
+
+const uint8_t *NormalizeRxFrameForParse(uint8_t *scratch, size_t len)
+{
+    if (rx_buffer == nullptr || scratch == nullptr || len < kFrameLen) {
+        return rx_buffer;
+    }
+
+    if (rx_buffer[0] == kFrameMagic0) {
+        return rx_buffer;
+    }
+
+    const bool maybe_missing_first_magic =
+        rx_buffer[0] == 0x00 &&
+        rx_buffer[1] == kFrameMagic1 &&
+        rx_buffer[3] == kPayloadLen &&
+        (rx_buffer[2] == kFrameTypeFreqRespStatus ||
+         rx_buffer[2] == kFrameTypeFreqRespPoint ||
+         rx_buffer[2] == kFrameTypeAdvStatus ||
+         rx_buffer[2] == kFrameTypeAdvWaveChunk ||
+         rx_buffer[2] == kFrameTypeAdvHarmonic ||
+         rx_buffer[2] == kFrameTypePynqToEspText);
+
+    if (!maybe_missing_first_magic) {
+        return rx_buffer;
+    }
+
+    std::memcpy(scratch, rx_buffer, len);
+    scratch[0] = kFrameMagic0;
+    if (Checksum(scratch, kFrameHeaderLen + kPayloadLen) == scratch[kFrameHeaderLen + kPayloadLen]) {
+        ++recovered_header_count;
+        return scratch;
+    }
+
+    return rx_buffer;
 }
 
 uint32_t GetU32(const uint8_t *buffer, size_t offset)
@@ -343,8 +379,7 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
         }
     }
 
-    bool phase_valid = phase_level_ok && ((flags & FREQ_POINT_FLAG_UNSTABLE) == 0U) &&
-                       ((flags & 0x00000200U) != 0U);
+    bool phase_valid = phase_level_ok && ((flags & FREQ_POINT_FLAG_UNSTABLE) == 0U);
     if (phase_valid && g_have_phase_history) {
         const int32_t phase_delta = phase_deg_x10 - g_prev_phase_deg_x10;
         if (phase_delta > 600 || phase_delta < -600) {
@@ -668,12 +703,13 @@ void MaybeLogSpiStats()
         (g_point_queue != nullptr) ? uxQueueMessagesWaiting(g_point_queue) : 0;
 
     ESP_LOGI(TAG,
-             "SPI stats: ok=%lu err=%lu timeout=%lu dropped_points=%lu dropped_harmonics=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
+             "SPI stats: ok=%lu err=%lu timeout=%lu dropped_points=%lu dropped_harmonics=%lu recovered_headers=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
              static_cast<unsigned long>(ok_count),
              static_cast<unsigned long>(err_count),
              static_cast<unsigned long>(timeout_count),
              static_cast<unsigned long>(dropped_point_count),
              static_cast<unsigned long>(dropped_harmonic_count),
+             static_cast<unsigned long>(recovered_header_count),
              static_cast<unsigned>(point_waiting),
              static_cast<unsigned long>(point_queue_high_water),
              static_cast<unsigned long>(last_point_index),
@@ -795,6 +831,7 @@ void SpiLink_Init(void)
     timeout_count = 0;
     dropped_point_count = 0;
     dropped_harmonic_count = 0;
+    recovered_header_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
@@ -856,6 +893,7 @@ void SpiLink_ClearMeasurementCache(void)
     }
     dropped_point_count = 0;
     dropped_harmonic_count = 0;
+    recovered_header_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
@@ -1006,10 +1044,13 @@ void SpiLink_Task(void)
         return;
     }
 
+    uint8_t normalized_frame[kSpiTransferLen];
+    const uint8_t *parse_frame = NormalizeRxFrameForParse(normalized_frame, kSpiTransferLen);
+
 #if ENABLE_SPI_STRING_TEST
     uint32_t text_seq = 0;
     char text[kTextMaxLen + 1] = {};
-    if (ParseTextFrame(rx_buffer, kSpiTransferLen, kFrameTypePynqToEspText, &text_seq, text, sizeof(text))) {
+    if (ParseTextFrame(parse_frame, kSpiTransferLen, kFrameTypePynqToEspText, &text_seq, text, sizeof(text))) {
         ++ok_count;
 
         bool is_new_text = false;
@@ -1031,7 +1072,7 @@ void SpiLink_Task(void)
 #endif
 
     adv_status_t adv_status = {};
-    if (ParseAdvStatusFrame(rx_buffer, kFrameLen, &adv_status)) {
+    if (ParseAdvStatusFrame(parse_frame, kFrameLen, &adv_status)) {
         ++ok_count;
         if (g_adv_status_queue != nullptr) {
             xQueueSend(g_adv_status_queue, &adv_status, 0);
@@ -1041,7 +1082,7 @@ void SpiLink_Task(void)
     }
 
     adc_waveform_chunk_t adv_chunk = {};
-    if (ParseAdvWaveChunkFrame(rx_buffer, kFrameLen, &adv_chunk)) {
+    if (ParseAdvWaveChunkFrame(parse_frame, kFrameLen, &adv_chunk)) {
         ++ok_count;
         if (kMaxAdvWavesPerPump != 0U && g_adv_wave_queue != nullptr) {
             xQueueSend(g_adv_wave_queue, &adv_chunk, 0);
@@ -1051,7 +1092,7 @@ void SpiLink_Task(void)
     }
 
     adv_harmonic_t adv_harmonic = {};
-    if (ParseAdvHarmonicFrame(rx_buffer, kFrameLen, &adv_harmonic)) {
+    if (ParseAdvHarmonicFrame(parse_frame, kFrameLen, &adv_harmonic)) {
         ++ok_count;
         if (g_adv_harmonic_queue != nullptr) {
             if (xQueueSend(g_adv_harmonic_queue, &adv_harmonic, 0) != pdTRUE) {
@@ -1065,9 +1106,9 @@ void SpiLink_Task(void)
     }
 
     freqresp_ui_status_t status = {};
-    const bool is_status_frame = ParseFreqRespStatusFrame(rx_buffer, kFrameLen, &status);
+    const bool is_status_frame = ParseFreqRespStatusFrame(parse_frame, kFrameLen, &status);
     const bool is_point_frame =
-        !is_status_frame && ParseFreqRespPointFrame(rx_buffer, kFrameLen, &status);
+        !is_status_frame && ParseFreqRespPointFrame(parse_frame, kFrameLen, &status);
 
     if (is_status_frame || is_point_frame) {
         ++ok_count;
