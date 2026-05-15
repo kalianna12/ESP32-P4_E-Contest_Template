@@ -27,7 +27,6 @@ static void spi_link_task(void *arg)
     (void)arg;
     while (true) {
         SpiLink_Task();
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
