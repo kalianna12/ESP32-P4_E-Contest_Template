@@ -1666,13 +1666,14 @@ static void adv_reconstruct_event_cb(lv_event_t *event)
     }
 
     g_adv_recon_pending = true;
+    g_adv_dds_pending = true;
     g_adv_recon_req_base = g_latest_adv_recon_count;
     g_adv_reconstruction_ready = false;
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     refresh_harmonic_rows();
     SpiLink_SetPendingCommand(CMD_ADV_RECONSTRUCT, 0U, 0U);
-    set_adv_result("RECON REQ / WAIT", COLOR_YELLOW);
+    set_adv_result("RECON+DDS / WAIT", COLOR_YELLOW);
 }
 
 static void adv_send_event_cb(lv_event_t *event)
@@ -1914,6 +1915,7 @@ static void create_reconstruction_page(void)
     g_adv_recon_chart = nullptr;
     g_adv_recon_series = nullptr;
     g_adv_harmonic_table = nullptr;
+    memset(g_adv_harmonic_rows, 0, sizeof(g_adv_harmonic_rows));
 #if ENABLE_SPI_TEST_WINDOW
     g_spi_test_link = nullptr;
     g_spi_test_rx = nullptr;
@@ -1969,22 +1971,7 @@ static void create_reconstruction_page(void)
     lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t *btn_harmonic = create_button(screen, "Open Harmonic Table", 444, 178, 180);
-    lv_obj_add_event_cb(btn_harmonic, open_harmonic_table_event_cb, LV_EVENT_CLICKED, nullptr);
-
     create_hline(screen, 230);
-
-    create_label(screen, "Harmonics", 24, 250, 220, &lv_font_montserrat_20, COLOR_BLUE);
-    for (uint32_t i = 0; i <= ADV_HARMONIC_MAIN_ROWS; ++i) {
-        g_adv_harmonic_rows[i] = create_label(screen,
-                                              "",
-                                              24,
-                                              285 + static_cast<int32_t>(i * 18U),
-                                              560,
-                                              &lv_font_montserrat_14,
-                                              i == 0U ? COLOR_SUBTEXT : COLOR_TEXT);
-    }
-    refresh_harmonic_rows();
 
     create_hline(screen, 535);
 
@@ -2344,6 +2331,7 @@ void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
     char buf[160];
     if (is_done) {
         if (is_recon) {
+            g_adv_recon_pending = false;
             g_adv_reconstruction_ready = true;
             snprintf(buf,
                      sizeof(buf),
@@ -2353,6 +2341,7 @@ void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk)
             set_adv_result(buf, COLOR_GREEN);
             set_harmonic_rows_empty();
         } else {
+            g_adv_capture_pending = false;
             g_adv_output_captured = true;
             snprintf(buf,
                      sizeof(buf),

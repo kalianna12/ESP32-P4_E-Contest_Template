@@ -53,11 +53,11 @@ constexpr size_t kCommandQueueLen = 16;
 constexpr UBaseType_t kStatusQueueLen = 1;
 constexpr UBaseType_t kPointQueueLen = 1000;
 constexpr UBaseType_t kAdvStatusQueueLen = 4;
-constexpr UBaseType_t kAdvWaveQueueLen = 64;
-constexpr UBaseType_t kAdvHarmonicQueueLen = 64;
 constexpr size_t kMaxUiPointsPerPump = 128;
 constexpr size_t kMaxAdvWavesPerPump = 0;
-constexpr size_t kMaxAdvHarmonicsPerPump = 16;
+constexpr size_t kMaxAdvHarmonicsPerPump = 0;
+constexpr UBaseType_t kAdvWaveQueueLen = (kMaxAdvWavesPerPump == 0) ? 0 : 64;
+constexpr UBaseType_t kAdvHarmonicQueueLen = (kMaxAdvHarmonicsPerPump == 0) ? 0 : 64;
 
 static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
 static_assert((kTxBufferLen % 64) == 0, "SPI TX buffer length must be a 64-byte multiple");
@@ -834,13 +834,15 @@ void SpiLink_Init(void)
     g_status_queue = xQueueCreate(kStatusQueueLen, sizeof(freqresp_ui_status_t));
     g_point_queue = xQueueCreate(kPointQueueLen, sizeof(point_queue_item_t));
     g_adv_status_queue = xQueueCreate(kAdvStatusQueueLen, sizeof(adv_status_t));
-    g_adv_wave_queue = xQueueCreate(kAdvWaveQueueLen, sizeof(adc_waveform_chunk_t));
-    g_adv_harmonic_queue = xQueueCreate(kAdvHarmonicQueueLen, sizeof(adv_harmonic_t));
+    g_adv_wave_queue = (kMaxAdvWavesPerPump == 0U) ?
+        nullptr : xQueueCreate(kAdvWaveQueueLen, sizeof(adc_waveform_chunk_t));
+    g_adv_harmonic_queue = (kMaxAdvHarmonicsPerPump == 0U) ?
+        nullptr : xQueueCreate(kAdvHarmonicQueueLen, sizeof(adv_harmonic_t));
     if (g_status_queue == nullptr ||
         g_point_queue == nullptr ||
         g_adv_status_queue == nullptr ||
-        g_adv_wave_queue == nullptr ||
-        g_adv_harmonic_queue == nullptr) {
+        (kMaxAdvWavesPerPump != 0U && g_adv_wave_queue == nullptr) ||
+        (kMaxAdvHarmonicsPerPump != 0U && g_adv_harmonic_queue == nullptr)) {
         ESP_LOGE(TAG, "Failed to create SPI UI queues");
         FreeQueues();
         FreeBuffers();
