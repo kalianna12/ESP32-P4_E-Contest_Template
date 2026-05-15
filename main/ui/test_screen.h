@@ -196,8 +196,8 @@ typedef struct {
     uint32_t recon_done_count;
     uint32_t fft_overflow_count;
     uint32_t ifft_overflow_count;
-    uint32_t tlast_missing_count;
-    uint32_t tlast_unexpected_count;
+    int32_t y_vpp;
+    int32_t x_vpp;
     uint32_t recon_count_base;
     uint32_t last_cmd_seen;
     uint32_t last_cmd_seq;
@@ -213,6 +213,10 @@ typedef struct {
     uint32_t dds_last_ack_status;
     uint32_t dds_chunk_index;
     uint32_t spi_a_frame_err_count;
+    uint32_t dds_gain_shift;
+    uint32_t dds_manual_gain_shift;
+    uint32_t dds_auto_scale;
+    uint32_t dds_auto_gain_shift;
 } adv_status_t;
 
 typedef struct {

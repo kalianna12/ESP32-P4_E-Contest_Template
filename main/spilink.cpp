@@ -471,8 +471,8 @@ bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
     out->recon_done_count = GetU32(frame, 32);
     out->fft_overflow_count = GetU32(frame, 36);
     out->ifft_overflow_count = GetU32(frame, 40);
-    out->tlast_missing_count = GetU32(frame, 44);
-    out->tlast_unexpected_count = GetU32(frame, 48);
+    out->y_vpp = GetI32(frame, 44);
+    out->x_vpp = GetI32(frame, 48);
     out->recon_count_base = GetU32(frame, 52);
     out->last_cmd_seen = GetU32(frame, 56);
     out->last_cmd_seq = GetU32(frame, 60);
@@ -488,6 +488,10 @@ bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
     out->dds_last_ack_status = GetU32(frame, 100);
     out->dds_chunk_index = GetU32(frame, 104);
     out->spi_a_frame_err_count = GetU32(frame, 108);
+    out->dds_gain_shift = frame[112] & 0x0FU;
+    out->dds_manual_gain_shift = frame[113] & 0x0FU;
+    out->dds_auto_scale = frame[114] & 0x01U;
+    out->dds_auto_gain_shift = frame[115] & 0x0FU;
     return true;
 }
 

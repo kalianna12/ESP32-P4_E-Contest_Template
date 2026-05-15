@@ -1941,7 +1941,7 @@ static void create_reconstruction_page(void)
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
     create_label(screen, "Signal Reconstruction", 24, 14, 430, &lv_font_montserrat_24, COLOR_TEXT);
-    g_adv_status = create_label(screen, "ADV WAIT", 610, 19, 390, &lv_font_montserrat_16, COLOR_GREEN);
+    g_adv_status = create_label(screen, "ADV WAIT", 610, 14, 400, &lv_font_montserrat_14, COLOR_GREEN);
     create_hline(screen, 55);
 
     g_adv_model_line = create_label(screen,
@@ -2424,7 +2424,7 @@ void test_screen_update_adv_status(const adv_status_t *status)
 
         g_adv_dds_pending = false;
         ESP_LOGW(TAG_UI,
-                 "ADV st=%lu err=%lu stage=%lu sub=%lu cmd=%lu seq=%lu acc=%lu rej=%lu cap=%lu recon=%lu flags=0x%08lX ok=%lu bad=%lu ferr=%lu dds=%lu ack=%lu ackst=%lu chunk=%lu",
+                 "ADV st=%lu err=%lu stage=%lu sub=%lu cmd=%lu seq=%lu acc=%lu rej=%lu cap=%lu recon=%lu y=%ld x=%ld g=%lu auto=%lu flags=0x%08lX ok=%lu bad=%lu ferr=%lu dds=%lu ack=%lu ackst=%lu chunk=%lu",
                  static_cast<unsigned long>(status->adv_state),
                  static_cast<unsigned long>(status->error_code),
                  static_cast<unsigned long>(status->debug_stage),
@@ -2435,6 +2435,10 @@ void test_screen_update_adv_status(const adv_status_t *status)
                  static_cast<unsigned long>(status->last_cmd_reject_reason),
                  static_cast<unsigned long>(status->capture_done_count),
                  static_cast<unsigned long>(status->recon_done_count),
+                 static_cast<long>(status->y_vpp),
+                 static_cast<long>(status->x_vpp),
+                 static_cast<unsigned long>(status->dds_gain_shift),
+                 static_cast<unsigned long>(status->dds_auto_scale),
                  static_cast<unsigned long>(status->core_dbg_flags),
                  static_cast<unsigned long>(status->spi_cmd_ok_count),
                  static_cast<unsigned long>(status->spi_cmd_bad_count),
@@ -2481,7 +2485,7 @@ void test_screen_update_adv_status(const adv_status_t *status)
     }
 
     ESP_LOGW(TAG_UI,
-             "ADV st=%lu err=%lu stage=%lu sub=%lu cmd=%lu seq=%lu acc=%lu rej=%lu cap=%lu cap_base=%lu cap_pend=%d recon=%lu recon_base=%lu recon_pend=%d flags=0x%08lX ok=%lu bad=%lu ferr=%lu dds=%lu ack=%lu ackst=%lu chunk=%lu",
+             "ADV st=%lu err=%lu stage=%lu sub=%lu cmd=%lu seq=%lu acc=%lu rej=%lu cap=%lu cap_base=%lu cap_pend=%d recon=%lu recon_base=%lu recon_pend=%d y=%ld x=%ld g=%lu auto=%lu flags=0x%08lX ok=%lu bad=%lu ferr=%lu dds=%lu ack=%lu ackst=%lu chunk=%lu",
              static_cast<unsigned long>(status->adv_state),
              static_cast<unsigned long>(status->error_code),
              static_cast<unsigned long>(status->debug_stage),
@@ -2496,6 +2500,10 @@ void test_screen_update_adv_status(const adv_status_t *status)
              static_cast<unsigned long>(status->recon_done_count),
              static_cast<unsigned long>(status->recon_count_base),
              g_adv_recon_pending ? 1 : 0,
+             static_cast<long>(status->y_vpp),
+             static_cast<long>(status->x_vpp),
+             static_cast<unsigned long>(status->dds_gain_shift),
+             static_cast<unsigned long>(status->dds_auto_scale),
              static_cast<unsigned long>(status->core_dbg_flags),
              static_cast<unsigned long>(status->spi_cmd_ok_count),
              static_cast<unsigned long>(status->spi_cmd_bad_count),
@@ -2506,23 +2514,27 @@ void test_screen_update_adv_status(const adv_status_t *status)
              static_cast<unsigned long>(status->dds_chunk_index));
 
     if (g_adv_status != nullptr) {
-        char buf[192];
+        char buf[224];
         snprintf(buf,
                  sizeof(buf),
-                 "ADV:%lu ERR:%lu FFT:%lu/%lu TL:%lu/%lu\nSTG:%lu SUB:%lu CMD:%lu %s\nCORE:%02lX DDS:%lu %lu/35",
+                 "ADV:%lu E:%lu F:%lu/%lu Y:%ld X:%ld\nG:%lu %s M:%lu A:%lu DDS:%lu %lu/35\nS:%lu/%lu CMD:%lu %s C:%02lX",
                  static_cast<unsigned long>(status->adv_state),
                  static_cast<unsigned long>(status->error_code),
                  static_cast<unsigned long>(status->fft_overflow_count),
                  static_cast<unsigned long>(status->ifft_overflow_count),
-                 static_cast<unsigned long>(status->tlast_missing_count),
-                 static_cast<unsigned long>(status->tlast_unexpected_count),
+                 static_cast<long>(status->y_vpp),
+                 static_cast<long>(status->x_vpp),
+                 static_cast<unsigned long>(status->dds_gain_shift),
+                 status->dds_auto_scale ? "AUTO" : "MAN",
+                 static_cast<unsigned long>(status->dds_manual_gain_shift),
+                 static_cast<unsigned long>(status->dds_auto_gain_shift),
+                 static_cast<unsigned long>(status->dds_state),
+                 static_cast<unsigned long>(status->dds_chunk_index),
                  static_cast<unsigned long>(status->debug_stage),
                  static_cast<unsigned long>(status->debug_substage),
                  static_cast<unsigned long>(status->last_cmd_seen),
                  status->last_cmd_accepted ? "OK" : "BAD",
-                 static_cast<unsigned long>(status->core_dbg_flags & 0xFFU),
-                 static_cast<unsigned long>(status->dds_state),
-                 static_cast<unsigned long>(status->dds_chunk_index));
+                 static_cast<unsigned long>(status->core_dbg_flags & 0xFFU));
         lv_label_set_text(g_adv_status, buf);
         lv_obj_set_style_text_color(g_adv_status,
                                     lv_color_hex(COLOR_GREEN),
