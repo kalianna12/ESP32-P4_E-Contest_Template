@@ -387,7 +387,7 @@ static const char *filter_type_text(uint8_t type)
     case FILTER_TYPE_HIGH_PASS: return "High-pass";
     case FILTER_TYPE_BAND_PASS: return "Band-pass";
     case FILTER_TYPE_BAND_STOP: return "Band-stop";
-    default: return "Unknown";
+    default: return "LP1";
     }
 }
 
@@ -400,7 +400,7 @@ static const char *model_kind_text(uint8_t type)
     case MODEL_TYPE_HP2: return "HP2";
     case MODEL_TYPE_BP2: return "BP2";
     case MODEL_TYPE_BS2: return "BS2";
-    default: return "Unknown";
+    default: return "LP1";
     }
 }
 
@@ -635,7 +635,7 @@ static void ClearAllSweepData(void)
         lv_label_set_text(g_theory, "Theory: --");
         lv_label_set_text(g_error_line, "Error: --");
         lv_label_set_text(g_phase, "Phase: --");
-        lv_label_set_text(g_type, "Type: Unknown");
+        lv_label_set_text(g_type, "Type: LP1");
         lv_label_set_text(g_fc, "fc: ---- Hz");
     }
     if (g_full_table != nullptr) {
@@ -1272,7 +1272,7 @@ static void update_adv_model_line(void)
         lv_label_set_text(g_adv_model_range_line, buf);
         lv_obj_set_style_text_color(g_adv_model_range_line, lv_color_hex(COLOR_SUBTEXT), LV_PART_MAIN);
     } else {
-        snprintf(buf, sizeof(buf), "Circuit Model: Unknown       fc: ----- Hz      H(f): Not Ready");
+        snprintf(buf, sizeof(buf), "Circuit Model: LP1      fc: ----- Hz      H(f): Pending");
         lv_obj_set_style_text_color(g_adv_model_line, lv_color_hex(COLOR_YELLOW), LV_PART_MAIN);
         lv_label_set_text(g_adv_model_line, buf);
 
@@ -1487,7 +1487,7 @@ static void update_current_point(const freqresp_ui_status_t *s)
     if (g_last_fit.valid) {
         snprintf(buf, sizeof(buf), "Type: %s", model_kind_text(g_last_fit.model_type));
     } else {
-        snprintf(buf, sizeof(buf), "Type: Unknown");
+        snprintf(buf, sizeof(buf), "Type: LP1");
     }
     lv_label_set_text(g_type, buf);
 
@@ -1945,7 +1945,7 @@ static void create_reconstruction_page(void)
     create_hline(screen, 55);
 
     g_adv_model_line = create_label(screen,
-                                    "Circuit Model: Unknown       fc: ----- Hz      H(f): Not Ready",
+                                    "Circuit Model: LP1      fc: ----- Hz      H(f): Pending",
                                     24,
                                     70,
                                     590,
@@ -2119,7 +2119,7 @@ static void create_main_page(void)
     g_theory = create_label(screen, "Theory: -.---", 220, 315, 190, &lv_font_montserrat_18, COLOR_TEXT);
     g_error_line = create_label(screen, "Error: -.-% PASS", 24, 355, 380, &lv_font_montserrat_18, COLOR_GREEN);
     g_phase = create_label(screen, "Phase: -.- deg", 24, 395, 380, &lv_font_montserrat_18, COLOR_TEXT);
-    g_type = create_label(screen, "Type: Unknown", 24, 435, 180, &lv_font_montserrat_18, COLOR_TEXT);
+    g_type = create_label(screen, "Type: LP1", 24, 435, 180, &lv_font_montserrat_18, COLOR_TEXT);
     g_fc = create_label(screen, "fc: ----- Hz", 220, 435, 190, &lv_font_montserrat_18, COLOR_TEXT);
 
     create_label(screen, "Gain Curve", 455, 205, 250, &lv_font_montserrat_20, COLOR_BLUE);
