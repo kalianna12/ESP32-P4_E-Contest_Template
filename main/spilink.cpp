@@ -55,7 +55,7 @@ constexpr UBaseType_t kPointQueueLen = 1000;
 constexpr UBaseType_t kAdvStatusQueueLen = 4;
 constexpr size_t kMaxUiPointsPerPump = 128;
 constexpr size_t kMaxAdvWavesPerPump = 0;
-constexpr size_t kMaxAdvHarmonicsPerPump = 0;
+constexpr size_t kMaxAdvHarmonicsPerPump = 16;
 constexpr UBaseType_t kAdvWaveQueueLen = (kMaxAdvWavesPerPump == 0) ? 0 : 64;
 constexpr UBaseType_t kAdvHarmonicQueueLen = (kMaxAdvHarmonicsPerPump == 0) ? 0 : 64;
 

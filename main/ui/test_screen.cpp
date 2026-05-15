@@ -1965,13 +1965,28 @@ static void create_reconstruction_page(void)
                  COLOR_SUBTEXT);
 
     lv_obj_t *btn_capture = create_button(screen, "CAP", 24, 178, 120);
-    lv_obj_t *btn_reconstruct = create_button(screen, "RECON", 164, 178, 130);
-    lv_obj_t *btn_send = create_button(screen, "DDS", 314, 178, 110);
+    lv_obj_t *btn_reconstruct = create_button(screen, "RECON+DDS", 164, 178, 150);
+    lv_obj_t *btn_send = create_button(screen, "DDS RETRY", 334, 178, 110);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
 
+    lv_obj_t *btn_harmonic = create_button(screen, "Harmonics", 464, 178, 160);
+    lv_obj_add_event_cb(btn_harmonic, open_harmonic_table_event_cb, LV_EVENT_CLICKED, nullptr);
+
     create_hline(screen, 230);
+
+    create_label(screen, "Harmonics", 24, 250, 220, &lv_font_montserrat_20, COLOR_BLUE);
+    for (uint32_t i = 0; i <= ADV_HARMONIC_MAIN_ROWS; ++i) {
+        g_adv_harmonic_rows[i] = create_label(screen,
+                                              "",
+                                              24,
+                                              285 + static_cast<int32_t>(i * 18U),
+                                              560,
+                                              &lv_font_montserrat_14,
+                                              i == 0U ? COLOR_SUBTEXT : COLOR_TEXT);
+    }
+    refresh_harmonic_rows();
 
     create_hline(screen, 535);
 
@@ -2432,13 +2447,24 @@ void test_screen_update_adv_status(const adv_status_t *status)
         status->recon_done_count > g_adv_recon_req_base) {
         g_adv_recon_pending = false;
         g_adv_reconstruction_ready = true;
-        set_adv_result("RECON DONE", COLOR_GREEN);
+        if (g_adv_dds_pending) {
+            set_adv_result("DDS TX / WAIT", COLOR_YELLOW);
+        } else {
+            set_adv_result("RECON DONE", COLOR_GREEN);
+        }
     }
 
     constexpr uint32_t kAdvStatusFlagDdsPlaying = 0x00010000U;
     if (g_adv_dds_pending && ((status->flags & kAdvStatusFlagDdsPlaying) != 0U)) {
         g_adv_dds_pending = false;
         set_adv_result("DDS PLAYING", COLOR_GREEN);
+    } else if (g_adv_dds_pending && status->dds_state != 0U) {
+        char buf[64];
+        snprintf(buf,
+                 sizeof(buf),
+                 "DDS TX %lu/35",
+                 static_cast<unsigned long>(status->dds_chunk_index + 1U));
+        set_adv_result(buf, COLOR_YELLOW);
     }
 
     ESP_LOGW(TAG_UI,
