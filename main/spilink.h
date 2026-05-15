@@ -10,6 +10,7 @@ typedef struct {
     uint32_t rx_ok;
     uint32_t frame_errors;
     uint32_t timeouts;
+    uint32_t bad_first_bytes;
     uint32_t dropped_points;
     uint32_t dropped_harmonics;
     uint32_t point_queue_waiting;

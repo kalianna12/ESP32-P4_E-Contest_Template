@@ -51,7 +51,7 @@ constexpr size_t kRxBufferLen = 128;
 constexpr size_t kTxBufferLen = 128;
 constexpr size_t kCommandQueueLen = 16;
 constexpr UBaseType_t kStatusQueueLen = 1;
-constexpr UBaseType_t kPointQueueLen = 256;
+constexpr UBaseType_t kPointQueueLen = 1000;
 constexpr UBaseType_t kAdvStatusQueueLen = 4;
 constexpr UBaseType_t kAdvWaveQueueLen = 64;
 constexpr UBaseType_t kAdvHarmonicQueueLen = 64;
@@ -96,6 +96,7 @@ uint8_t *tx_buffer = nullptr;
 uint32_t ok_count = 0;
 uint32_t err_count = 0;
 uint32_t timeout_count = 0;
+uint32_t bad_first_byte_count = 0;
 uint32_t dropped_point_count = 0;
 uint32_t dropped_harmonic_count = 0;
 uint32_t recovered_header_count = 0;
@@ -171,6 +172,21 @@ const uint8_t *NormalizeRxFrameForParse(uint8_t *scratch, size_t len)
     }
 
     return rx_buffer;
+}
+
+bool LooksLikeBadFirstByteFrame()
+{
+    if (rx_buffer == nullptr) {
+        return false;
+    }
+
+    return rx_buffer[0] != kFrameMagic0 &&
+           rx_buffer[1] == kFrameMagic1 &&
+           rx_buffer[3] == kPayloadLen &&
+           (rx_buffer[2] == kFrameTypeFreqRespStatus ||
+            rx_buffer[2] == kFrameTypeFreqRespPoint ||
+            rx_buffer[2] == kFrameTypeAdvStatus ||
+            rx_buffer[2] == kFrameTypeAdvHarmonic);
 }
 
 uint32_t GetU32(const uint8_t *buffer, size_t offset)
@@ -703,10 +719,11 @@ void MaybeLogSpiStats()
         (g_point_queue != nullptr) ? uxQueueMessagesWaiting(g_point_queue) : 0;
 
     ESP_LOGI(TAG,
-             "SPI stats: ok=%lu err=%lu timeout=%lu dropped_points=%lu dropped_harmonics=%lu recovered_headers=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
+             "SPI stats: ok=%lu err=%lu timeout=%lu bad_first=%lu dropped_points=%lu dropped_harmonics=%lu recovered_headers=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
              static_cast<unsigned long>(ok_count),
              static_cast<unsigned long>(err_count),
              static_cast<unsigned long>(timeout_count),
+             static_cast<unsigned long>(bad_first_byte_count),
              static_cast<unsigned long>(dropped_point_count),
              static_cast<unsigned long>(dropped_harmonic_count),
              static_cast<unsigned long>(recovered_header_count),
@@ -725,6 +742,28 @@ void MaybeLogInvalidFrame(size_t rx_bits)
     }
 
     last_invalid_log_tick = now;
+    if (LooksLikeBadFirstByteFrame()) {
+        const uint8_t expected_checksum = Checksum(rx_buffer, kFrameHeaderLen + kPayloadLen);
+        const uint8_t actual_checksum = rx_buffer[kFrameHeaderLen + kPayloadLen];
+        ESP_LOGW(TAG,
+                 "Invalid freq response frame: bad first byte got=%02X expected=A5 type=%02X expected_chk=%02X actual_chk=%02X head=%02X %02X %02X %02X %02X %02X %02X %02X err=%lu bad_first=%lu",
+                 rx_buffer[0],
+                 rx_buffer[2],
+                 expected_checksum,
+                 actual_checksum,
+                 rx_buffer[0],
+                 rx_buffer[1],
+                 rx_buffer[2],
+                 rx_buffer[3],
+                 rx_buffer[4],
+                 rx_buffer[5],
+                 rx_buffer[6],
+                 rx_buffer[7],
+                 static_cast<unsigned long>(err_count),
+                 static_cast<unsigned long>(bad_first_byte_count));
+        return;
+    }
+
     ESP_LOGW(TAG,
              "Invalid freq response frame: bits=%u data=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X err=%lu",
              static_cast<unsigned>(rx_bits),
@@ -966,6 +1005,7 @@ bool SpiLink_GetStats(spilink_stats_t *out)
     out->rx_ok = ok_count;
     out->frame_errors = err_count;
     out->timeouts = timeout_count;
+    out->bad_first_bytes = bad_first_byte_count;
     out->dropped_points = dropped_point_count;
     out->dropped_harmonics = dropped_harmonic_count;
     out->point_queue_waiting =
@@ -1094,6 +1134,14 @@ void SpiLink_Task(void)
     adv_harmonic_t adv_harmonic = {};
     if (ParseAdvHarmonicFrame(parse_frame, kFrameLen, &adv_harmonic)) {
         ++ok_count;
+        if (adv_harmonic.index <= 5U) {
+            ESP_LOGI(TAG,
+                     "ADV harmonic rx: index=%lu freq=%lu amp=%ld flags=0x%08lX",
+                     static_cast<unsigned long>(adv_harmonic.index),
+                     static_cast<unsigned long>(adv_harmonic.freq_hz),
+                     static_cast<long>(adv_harmonic.amp_mv),
+                     static_cast<unsigned long>(adv_harmonic.flags));
+        }
         if (g_adv_harmonic_queue != nullptr) {
             if (xQueueSend(g_adv_harmonic_queue, &adv_harmonic, 0) != pdTRUE) {
                 ++dropped_harmonic_count;
@@ -1140,6 +1188,9 @@ void SpiLink_Task(void)
     }
 
     ++err_count;
+    if (LooksLikeBadFirstByteFrame()) {
+        ++bad_first_byte_count;
+    }
 
     MaybeLogInvalidFrame(rx_bits);
     MaybeLogSpiStats();

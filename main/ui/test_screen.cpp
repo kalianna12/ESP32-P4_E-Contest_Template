@@ -403,6 +403,73 @@ static const char *model_kind_text(uint8_t type)
     }
 }
 
+static uint8_t model_filter_type_ui(uint8_t type)
+{
+    switch (type) {
+    case MODEL_TYPE_LP1:
+    case MODEL_TYPE_LP2:
+        return FILTER_TYPE_LOW_PASS;
+    case MODEL_TYPE_HP1:
+    case MODEL_TYPE_HP2:
+        return FILTER_TYPE_HIGH_PASS;
+    case MODEL_TYPE_BP2:
+        return FILTER_TYPE_BAND_PASS;
+    case MODEL_TYPE_BS2:
+        return FILTER_TYPE_BAND_STOP;
+    default:
+        return FILTER_TYPE_UNKNOWN;
+    }
+}
+
+static uint32_t fit_display_freq_hz(const filter_fit_result_t *fit)
+{
+    if (fit == nullptr || !fit->valid) {
+        return 0U;
+    }
+    return (fit->f0_hz != 0U) ? fit->f0_hz : fit->fc_hz;
+}
+
+static void apply_last_model_to_status(freqresp_ui_status_t *view)
+{
+    if (view == nullptr) {
+        return;
+    }
+
+    if (g_last_fit.valid) {
+        view->filter_type = model_filter_type_ui(g_last_fit.model_type);
+        view->cutoff_freq_hz = fit_display_freq_hz(&g_last_fit);
+    } else if (g_circuit_model.valid) {
+        view->filter_type = g_circuit_model.filter_type;
+        view->cutoff_freq_hz = g_circuit_model.cutoff_freq_hz;
+    }
+
+    if (g_table == nullptr) {
+        return;
+    }
+
+    for (uint32_t i = g_table_count; i > 0U; --i) {
+        const freq_point_t *p = &g_table[i - 1U];
+        if ((p->flags & FREQ_POINT_FLAG_MISSING) == 0U) {
+            view->theory_gain_x1000 = p->theory_gain_x1000;
+            view->error_x10 = p->error_x10;
+            break;
+        }
+    }
+}
+
+static bool render_last_basic_status(void)
+{
+    if (!g_have_last_status) {
+        return false;
+    }
+
+    freqresp_ui_status_t view = g_last_status;
+    apply_last_model_to_status(&view);
+    g_last_status = view;
+    render_basic_status(&g_last_status);
+    return true;
+}
+
 static uint32_t parse_ta_u32(lv_obj_t *ta)
 {
     const char *text = lv_textarea_get_text(ta);
@@ -1089,6 +1156,7 @@ static void process_heavyfit_result(void)
     g_last_fit = g_fit_output_work.fit;
     g_fit_result_quality = static_cast<fit_result_quality_t>(g_fit_output_work.quality);
     g_fit_done_for_current_sweep = true;
+    apply_last_model_to_status(&g_fit_output_work.status);
     g_last_status = g_fit_output_work.status;
     g_have_last_status = true;
     save_circuit_model_from_table(&g_fit_output_work.status);
@@ -1098,7 +1166,7 @@ static void process_heavyfit_result(void)
     if (g_full_table != nullptr) {
         create_full_table_page();
     }
-    render_basic_status(&g_fit_output_work.status);
+    render_basic_status(&g_last_status);
     ESP_LOGI(TAG_UI,
              "Heavy fit done: quality=%u type=%u fc=%lu confidence=%ld",
              static_cast<unsigned>(g_fit_result_quality),
@@ -1261,7 +1329,7 @@ static void update_top_status(const freqresp_ui_status_t *s)
 
     snprintf(buf,
              sizeof(buf),
-             "L:%s S:%s P:%lu%% %lu/%lu RX:%lu ERR:%lu DROP:%lu HDROP:%lu Q:%lu",
+             "L:%s S:%s P:%lu%% %lu/%lu RX:%lu ERR:%lu BFB:%lu DROP:%lu HDROP:%lu Q:%lu",
              link,
              state_text(s->state),
              static_cast<unsigned long>(s->progress_permille / 10U),
@@ -1269,6 +1337,7 @@ static void update_top_status(const freqresp_ui_status_t *s)
              static_cast<unsigned long>(s->total_points),
              static_cast<unsigned long>(stats.rx_ok),
              static_cast<unsigned long>(stats.frame_errors + stats.timeouts),
+             static_cast<unsigned long>(stats.bad_first_bytes),
              static_cast<unsigned long>(stats.dropped_points),
              static_cast<unsigned long>(stats.dropped_harmonics),
              static_cast<unsigned long>(stats.point_queue_waiting));
@@ -1333,7 +1402,16 @@ static void update_current_point(const freqresp_ui_status_t *s)
     format_x1000(theory, sizeof(theory), s->theory_gain_x1000);
     format_error(err, sizeof(err), s->error_x10);
     format_phase(phase, sizeof(phase), s->phase_deg_x10);
-    format_cutoff_freq(fc, sizeof(fc), s->filter_type, s->cutoff_freq_hz);
+    uint8_t display_filter_type = s->filter_type;
+    uint32_t display_cutoff_hz = s->cutoff_freq_hz;
+    if (g_last_fit.valid) {
+        display_filter_type = model_filter_type_ui(g_last_fit.model_type);
+        display_cutoff_hz = fit_display_freq_hz(&g_last_fit);
+    } else if (g_circuit_model.valid) {
+        display_filter_type = g_circuit_model.filter_type;
+        display_cutoff_hz = g_circuit_model.cutoff_freq_hz;
+    }
+    format_cutoff_freq(fc, sizeof(fc), display_filter_type, display_cutoff_hz);
     if (s->theory_gain_x1000 <= 0) {
         snprintf(theory, sizeof(theory), "----");
         snprintf(err, sizeof(err), "N/A");
@@ -1519,14 +1597,7 @@ static void back_button_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         create_main_page();
-        if (g_have_last_status) {
-            if (g_last_fit.valid && g_table_count != 0U) {
-                const uint32_t last = (g_table_count - 1U < MAX_POINTS) ? (g_table_count - 1U) : (MAX_POINTS - 1U);
-                g_last_status.theory_gain_x1000 = g_table[last].theory_gain_x1000;
-                g_last_status.error_x10 = g_table[last].error_x10;
-            }
-            render_basic_status(&g_last_status);
-        }
+        render_last_basic_status();
     }
 }
 
@@ -1598,9 +1669,7 @@ static void adv_back_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         create_main_page();
-        if (g_have_last_status) {
-            render_basic_status(&g_last_status);
-        }
+        render_last_basic_status();
     }
 }
 
@@ -1679,9 +1748,7 @@ static void spi_test_close_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         create_main_page();
-        if (g_have_last_status) {
-            render_basic_status(&g_last_status);
-        }
+        render_last_basic_status();
     }
 }
 
@@ -2294,6 +2361,17 @@ void test_screen_update_adv_status(const adv_status_t *status)
     g_latest_adv_recon_count = status->recon_done_count;
     g_last_adv_capture_done_count = status->capture_done_count;
     g_last_adv_recon_done_count = status->recon_done_count;
+
+    ESP_LOGW(TAG_UI,
+             "ADV st=%lu err=%lu cap=%lu cap_base=%lu cap_pend=%d recon=%lu recon_base=%lu recon_pend=%d",
+             static_cast<unsigned long>(status->adv_state),
+             static_cast<unsigned long>(status->error_code),
+             static_cast<unsigned long>(status->capture_done_count),
+             static_cast<unsigned long>(g_adv_capture_req_base),
+             g_adv_capture_pending ? 1 : 0,
+             static_cast<unsigned long>(status->recon_done_count),
+             static_cast<unsigned long>(g_adv_recon_req_base),
+             g_adv_recon_pending ? 1 : 0);
 
     if (g_adv_status != nullptr) {
         char buf[160];
