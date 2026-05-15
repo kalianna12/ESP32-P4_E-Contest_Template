@@ -1,5 +1,6 @@
 #include "test_screen.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "heavyfit.h"
 #include "lvgl.h"
@@ -40,6 +41,8 @@
 #define COLOR_GREEN     0x86EFAC
 #define COLOR_YELLOW    0xFBBF24
 #define COLOR_RED       0xFCA5A5
+
+static const char *TAG_UI = "TestScreen";
 
 static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_top_status = nullptr;
@@ -96,7 +99,7 @@ static uint32_t g_step_freq_hz = DEFAULT_STEP_FREQ_HZ;
 static uint32_t g_single_freq_hz = DEFAULT_SINGLE_FREQ_HZ;
 static uint8_t g_mode = MODE_SWEEP;
 
-static freq_point_t g_table[MAX_POINTS];
+static freq_point_t *g_table = nullptr;
 static uint32_t g_table_count = 0;
 static bool g_table_full = false;
 static bool g_have_last_status = false;
@@ -117,7 +120,12 @@ static uint32_t g_last_chart_tick = 0;
 static bool g_chart_point_pending = false;
 static int32_t g_pending_chart_gain = 0;
 static freqresp_ui_status_t g_fit_pending_status = {};
+static heavyfit_input_t *g_fit_input_work_ptr = nullptr;
+static heavyfit_output_t *g_fit_output_work_ptr = nullptr;
 static lv_timer_t *g_spi_ui_pump_timer = nullptr;
+
+#define g_fit_input_work (*g_fit_input_work_ptr)
+#define g_fit_output_work (*g_fit_output_work_ptr)
 
 typedef enum {
     FIT_REJECT_NONE = 0,
@@ -148,6 +156,39 @@ static bool chart_point_visible(uint32_t index);
 static constexpr uint32_t kLabelRenderIntervalMs = 50U;
 static constexpr uint32_t kChartRenderIntervalMs = 50U;
 static constexpr uint32_t kFitDelayMs = 300U;
+
+static bool ensure_ui_work_buffers(void)
+{
+    if (g_table == nullptr) {
+        g_table = static_cast<freq_point_t *>(
+            heap_caps_calloc(MAX_POINTS, sizeof(freq_point_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+    if (g_fit_input_work_ptr == nullptr) {
+        g_fit_input_work_ptr = static_cast<heavyfit_input_t *>(
+            heap_caps_calloc(1, sizeof(heavyfit_input_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+    if (g_fit_output_work_ptr == nullptr) {
+        g_fit_output_work_ptr = static_cast<heavyfit_output_t *>(
+            heap_caps_calloc(1, sizeof(heavyfit_output_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+
+    if (g_table == nullptr || g_fit_input_work_ptr == nullptr || g_fit_output_work_ptr == nullptr) {
+        ESP_LOGE(TAG_UI,
+                 "UI PSRAM buffer alloc failed: table=%p fit_in=%p fit_out=%p psram=%u internal=%u dma=%u",
+                 g_table,
+                 g_fit_input_work_ptr,
+                 g_fit_output_work_ptr,
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 heap_caps_get_free_size(MALLOC_CAP_DMA));
+        return false;
+    }
+
+    return true;
+}
 
 #if ENABLE_SPI_TEST_WINDOW
 static lv_obj_t *g_spi_test_link = nullptr;
@@ -565,6 +606,10 @@ static void queue_chart_point(int32_t gain_x1000)
 
 static bool append_missing_table_point(uint32_t point_index, uint32_t total_points)
 {
+    if (!ensure_ui_work_buffers()) {
+        return false;
+    }
+
     if (g_table_count >= MAX_POINTS) {
         if (!g_table_full) {
             g_table_full = true;
@@ -584,6 +629,10 @@ static bool append_missing_table_point(uint32_t point_index, uint32_t total_poin
 
 static void append_table_point(const freqresp_ui_status_t *s)
 {
+    if (!ensure_ui_work_buffers()) {
+        return;
+    }
+
     if (s->current_freq_hz == 0U) {
         return;
     }
@@ -697,8 +746,14 @@ static fit_reject_reason_t fit_point_reject_reason_strict(uint32_t index)
     }
 
     const freq_point_t *p = &g_table[index];
+    if ((p->flags & FREQ_POINT_FLAG_MISSING) != 0U) {
+        return FIT_REJECT_FREQ;
+    }
     if (p->freq_hz == 0U) {
         return FIT_REJECT_FREQ;
+    }
+    if ((p->flags & FREQ_POINT_FLAG_UNSTABLE) != 0U) {
+        return FIT_REJECT_GAIN;
     }
     if (p->vin_mv < 80) {
         return FIT_REJECT_LOW_VIN;
@@ -834,6 +889,10 @@ static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
 
 static void process_pending_fit_request(void)
 {
+    if (!ensure_ui_work_buffers()) {
+        return;
+    }
+
     if (!g_fit_pending || g_fit_done_for_current_sweep || g_fit_inflight || HeavyFit_IsBusy()) {
         return;
     }
@@ -847,14 +906,14 @@ static void process_pending_fit_request(void)
         return;
     }
 
-    static heavyfit_input_t input = {};
-    input.status = g_fit_pending_status;
-    input.point_count = (g_table_count > MAX_POINTS) ? MAX_POINTS : g_table_count;
-    for (uint32_t i = 0; i < input.point_count; ++i) {
-        input.points[i] = g_table[i];
+    memset(&g_fit_input_work, 0, sizeof(g_fit_input_work));
+    g_fit_input_work.status = g_fit_pending_status;
+    g_fit_input_work.point_count = (g_table_count > MAX_POINTS) ? MAX_POINTS : g_table_count;
+    for (uint32_t i = 0; i < g_fit_input_work.point_count; ++i) {
+        g_fit_input_work.points[i] = g_table[i];
     }
 
-    if (HeavyFit_StartAsync(&input)) {
+    if (HeavyFit_StartAsync(&g_fit_input_work)) {
         g_fit_pending = false;
         g_fit_inflight = true;
         set_msg("FITTING", COLOR_YELLOW);
@@ -867,18 +926,17 @@ static void process_heavyfit_result(void)
         return;
     }
 
-    static heavyfit_output_t out = {};
-    if (!HeavyFit_PollResult(&out)) {
+    if (!HeavyFit_PollResult(&g_fit_output_work)) {
         return;
     }
 
     g_fit_inflight = false;
-    if (out.canceled) {
+    if (g_fit_output_work.canceled) {
         set_msg("FIT CANCELED", COLOR_YELLOW);
         return;
     }
 
-    if (!out.valid) {
+    if (!g_fit_output_work.valid) {
         g_fit_done_for_current_sweep = true;
         g_last_fit = {};
         g_fit_result_quality = FIT_RESULT_NONE;
@@ -886,20 +944,21 @@ static void process_heavyfit_result(void)
         return;
     }
 
-    const uint32_t n = (out.point_count < g_table_count) ? out.point_count : g_table_count;
+    const uint32_t n = (g_fit_output_work.point_count < g_table_count) ?
+        g_fit_output_work.point_count : g_table_count;
     for (uint32_t i = 0; i < n; ++i) {
-        g_table[i].theory_gain_x1000 = out.theory_gain_x1000[i];
-        g_table[i].error_x10 = out.error_x10[i];
+        g_table[i].theory_gain_x1000 = g_fit_output_work.theory_gain_x1000[i];
+        g_table[i].error_x10 = g_fit_output_work.error_x10[i];
     }
 
-    g_last_fit = out.fit;
-    g_fit_result_quality = static_cast<fit_result_quality_t>(out.quality);
+    g_last_fit = g_fit_output_work.fit;
+    g_fit_result_quality = static_cast<fit_result_quality_t>(g_fit_output_work.quality);
     g_fit_done_for_current_sweep = true;
-    g_last_status = out.status;
+    g_last_status = g_fit_output_work.status;
     g_have_last_status = true;
-    save_circuit_model_from_table(&out.status);
+    save_circuit_model_from_table(&g_fit_output_work.status);
     update_adv_model_line();
-    render_basic_status(&out.status);
+    render_basic_status(&g_fit_output_work.status);
     set_msg("FIT DONE", COLOR_GREEN);
 }
 
@@ -1874,6 +1933,10 @@ static void create_main_page(void)
 
 void test_screen_create(void)
 {
+    if (!ensure_ui_work_buffers()) {
+        return;
+    }
+
 #if ENABLE_SPI_TEST_WINDOW
     create_spi_test_page();
 #else

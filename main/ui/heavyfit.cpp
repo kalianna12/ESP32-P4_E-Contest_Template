@@ -1,5 +1,6 @@
 #include "heavyfit.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -81,17 +82,65 @@ typedef struct {
     double k;
 } fit_candidate_t;
 
-static heavyfit_input_t g_input;
-static heavyfit_output_t g_result;
-static heavyfit_output_t g_work_result;
-static fit_work_point_t g_fit_points[kHeavyFitMaxSamples];
+static heavyfit_input_t *g_input_ptr = nullptr;
+static heavyfit_output_t *g_result_ptr = nullptr;
+static heavyfit_output_t *g_work_result_ptr = nullptr;
+static fit_work_point_t *g_fit_points_ptr = nullptr;
 static uint32_t g_fit_point_count = 0;
 static uint32_t g_heavy_fit_sample_stride = 1;
 static TaskHandle_t g_task = nullptr;
 static volatile bool g_busy = false;
 static volatile bool g_ready = false;
 static volatile bool g_cancel = false;
+static volatile bool g_result_copying = false;
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
+
+#define g_input (*g_input_ptr)
+#define g_result (*g_result_ptr)
+#define g_work_result (*g_work_result_ptr)
+#define g_fit_points (g_fit_points_ptr)
+
+static bool ensure_heavyfit_buffers(void)
+{
+    if (g_input_ptr == nullptr) {
+        g_input_ptr = static_cast<heavyfit_input_t *>(
+            heap_caps_calloc(1, sizeof(heavyfit_input_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+    if (g_result_ptr == nullptr) {
+        g_result_ptr = static_cast<heavyfit_output_t *>(
+            heap_caps_calloc(1, sizeof(heavyfit_output_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+    if (g_work_result_ptr == nullptr) {
+        g_work_result_ptr = static_cast<heavyfit_output_t *>(
+            heap_caps_calloc(1, sizeof(heavyfit_output_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+    if (g_fit_points_ptr == nullptr) {
+        g_fit_points_ptr = static_cast<fit_work_point_t *>(
+            heap_caps_calloc(kHeavyFitMaxSamples, sizeof(fit_work_point_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+    }
+
+    if (g_input_ptr == nullptr ||
+        g_result_ptr == nullptr ||
+        g_work_result_ptr == nullptr ||
+        g_fit_points_ptr == nullptr) {
+        ESP_LOGE(TAG,
+                 "PSRAM buffer alloc failed: in=%p result=%p work=%p points=%p psram=%u internal=%u dma=%u",
+                 g_input_ptr,
+                 g_result_ptr,
+                 g_work_result_ptr,
+                 g_fit_points_ptr,
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 heap_caps_get_free_size(MALLOC_CAP_DMA));
+        return false;
+    }
+
+    return true;
+}
 
 static uint32_t now_ms(void)
 {
@@ -1001,10 +1050,13 @@ bool HeavyFit_StartAsync(const heavyfit_input_t *input)
     if (input == nullptr || input->point_count == 0U || input->point_count > MAX_POINTS) {
         return false;
     }
+    if (!ensure_heavyfit_buffers()) {
+        return false;
+    }
 
     bool can_start = false;
     portENTER_CRITICAL(&g_lock);
-    if (!g_busy) {
+    if (!g_busy && !g_ready && !g_result_copying) {
         g_busy = true;
         g_ready = false;
         g_cancel = false;
@@ -1032,18 +1084,29 @@ bool HeavyFit_StartAsync(const heavyfit_input_t *input)
 
 bool HeavyFit_PollResult(heavyfit_output_t *out)
 {
-    if (out == nullptr) {
+    if (out == nullptr || g_result_ptr == nullptr) {
         return false;
     }
 
     bool have_result = false;
     portENTER_CRITICAL(&g_lock);
     if (g_ready) {
-        *out = g_result;
         g_ready = false;
+        g_result_copying = true;
         have_result = true;
     }
     portEXIT_CRITICAL(&g_lock);
+
+    if (!have_result) {
+        return false;
+    }
+
+    *out = g_result;
+
+    portENTER_CRITICAL(&g_lock);
+    g_result_copying = false;
+    portEXIT_CRITICAL(&g_lock);
+
     return have_result;
 }
 

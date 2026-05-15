@@ -4,6 +4,7 @@
 
 #include "esp_check.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
@@ -18,8 +19,6 @@
 
 #include "wifi/template_wifi.h"
 #include "storage/template_sdcard.h"
-
-#include <assert.h>
 
 static const char *TAG = "template";
 
@@ -58,8 +57,22 @@ extern "C" void app_main(void)
         },
     };
 
+    ESP_LOGI(TAG,
+             "display init start: internal=%u dma=%u psram=%u",
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             heap_caps_get_free_size(MALLOC_CAP_DMA),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     lv_display_t *disp = lvgl_adapter_init(&cfg);
-    assert(disp != NULL);
+    ESP_LOGI(TAG, "display init result=%p", disp);
+    if (disp == NULL) {
+        ESP_LOGE(TAG,
+                 "Display init failed: internal=%u dma=%u psram=%u",
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        return;
+    }
 
     ESP_ERROR_CHECK(bsp_display_backlight_on());
 

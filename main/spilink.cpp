@@ -51,7 +51,7 @@ constexpr size_t kRxBufferLen = 128;
 constexpr size_t kTxBufferLen = 128;
 constexpr size_t kCommandQueueLen = 16;
 constexpr UBaseType_t kStatusQueueLen = 1;
-constexpr UBaseType_t kPointQueueLen = 1600;
+constexpr UBaseType_t kPointQueueLen = 256;
 constexpr UBaseType_t kAdvStatusQueueLen = 4;
 constexpr UBaseType_t kAdvWaveQueueLen = 64;
 constexpr UBaseType_t kAdvHarmonicQueueLen = 64;
@@ -70,6 +70,24 @@ typedef struct {
     uint32_t arg0;
     uint32_t arg1;
 } pending_command_t;
+
+typedef struct {
+    uint32_t packets;
+    uint32_t frame_errors;
+    uint32_t timeouts;
+    uint32_t progress_permille;
+    uint32_t current_freq_hz;
+    uint32_t point_index;
+    uint32_t total_points;
+    int32_t vin_mv;
+    int32_t vout_mv;
+    int32_t gain_x1000;
+    int32_t phase_deg_x10;
+    uint32_t flags;
+    bool phase_valid;
+} point_queue_item_t;
+
+static_assert(sizeof(point_queue_item_t) <= 64, "Point queue item must stay small");
 
 bool spi_ready = false;
 uint8_t *rx_buffer = nullptr;
@@ -143,6 +161,57 @@ int16_t GetI16(const uint8_t *buffer, size_t offset)
 int32_t RawVppCodeToMv(uint32_t code)
 {
     return static_cast<int32_t>((static_cast<uint64_t>(code) * 10000ULL) / 4095ULL);
+}
+
+void FillPointQueueItem(const freqresp_ui_status_t *status, point_queue_item_t *item)
+{
+    if (status == nullptr || item == nullptr) {
+        return;
+    }
+
+    item->packets = status->packets;
+    item->frame_errors = status->frame_errors;
+    item->timeouts = status->timeouts;
+    item->progress_permille = status->progress_permille;
+    item->current_freq_hz = status->current_freq_hz;
+    item->point_index = status->point_index;
+    item->total_points = status->total_points;
+    item->vin_mv = status->vin_mv;
+    item->vout_mv = status->vout_mv;
+    item->gain_x1000 = status->gain_x1000;
+    item->phase_deg_x10 = status->phase_deg_x10;
+    item->flags = status->flags;
+    item->phase_valid = status->phase_valid;
+}
+
+void FillStatusFromPointQueueItem(const point_queue_item_t *item, freqresp_ui_status_t *status)
+{
+    if (item == nullptr || status == nullptr) {
+        return;
+    }
+
+    *status = {};
+    status->packets = item->packets;
+    status->frame_errors = item->frame_errors;
+    status->timeouts = item->timeouts;
+    status->link_ok = 1U;
+    status->state = static_cast<uint8_t>(
+        (item->total_points != 0U && item->point_index >= item->total_points) ?
+        FREQRESP_STATE_DONE : FREQRESP_STATE_SCANNING
+    );
+    status->mode = MODE_SWEEP;
+    status->filter_type = FILTER_TYPE_UNKNOWN;
+    status->progress_permille = item->progress_permille;
+    status->current_freq_hz = item->current_freq_hz;
+    status->point_index = item->point_index;
+    status->total_points = item->total_points;
+    status->vin_mv = item->vin_mv;
+    status->vout_mv = item->vout_mv;
+    status->gain_x1000 = item->gain_x1000;
+    status->phase_deg_x10 = item->phase_deg_x10;
+    status->flags = item->flags;
+    status->has_measurement = true;
+    status->phase_valid = item->phase_valid;
 }
 
 void PutU32(uint8_t *buffer, size_t offset, uint32_t value)
@@ -673,7 +742,7 @@ void SpiLink_Init(void)
     }
 
     g_status_queue = xQueueCreate(kStatusQueueLen, sizeof(freqresp_ui_status_t));
-    g_point_queue = xQueueCreate(kPointQueueLen, sizeof(freqresp_ui_status_t));
+    g_point_queue = xQueueCreate(kPointQueueLen, sizeof(point_queue_item_t));
     g_adv_status_queue = xQueueCreate(kAdvStatusQueueLen, sizeof(adv_status_t));
     g_adv_wave_queue = xQueueCreate(kAdvWaveQueueLen, sizeof(adc_waveform_chunk_t));
     g_adv_harmonic_queue = xQueueCreate(kAdvHarmonicQueueLen, sizeof(adv_harmonic_t));
@@ -804,10 +873,12 @@ void SpiLink_UiPump(void)
     }
 
     for (size_t i = 0; i < kMaxUiPointsPerPump; ++i) {
-        freqresp_ui_status_t point = {};
-        if (xQueueReceive(g_point_queue, &point, 0) != pdTRUE) {
+        point_queue_item_t point_item = {};
+        if (xQueueReceive(g_point_queue, &point_item, 0) != pdTRUE) {
             break;
         }
+        freqresp_ui_status_t point = {};
+        FillStatusFromPointQueueItem(&point_item, &point);
         test_screen_update_measurement(&point);
     }
 
@@ -1013,7 +1084,9 @@ void SpiLink_Task(void)
 
             last_point_index = status.point_index;
             last_freq_hz = status.current_freq_hz;
-            if (xQueueSend(g_point_queue, &status, 0) != pdTRUE) {
+            point_queue_item_t point_item = {};
+            FillPointQueueItem(&status, &point_item);
+            if (xQueueSend(g_point_queue, &point_item, 0) != pdTRUE) {
                 ++dropped_point_count;
             }
             MaybeUpdatePointQueueHighWater();
