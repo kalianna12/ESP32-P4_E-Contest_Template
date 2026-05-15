@@ -601,6 +601,22 @@ static int32_t confidence_from_candidate(const fit_candidate_t *best, const fit_
     return clamp_i32(confidence, 0, 1000);
 }
 
+static bool same_filter_family(uint8_t a, uint8_t b)
+{
+    if ((a == MODEL_TYPE_LP1 || a == MODEL_TYPE_LP2) &&
+        (b == MODEL_TYPE_LP1 || b == MODEL_TYPE_LP2)) {
+        return true;
+    }
+    if ((a == MODEL_TYPE_HP1 || a == MODEL_TYPE_HP2) &&
+        (b == MODEL_TYPE_HP1 || b == MODEL_TYPE_HP2)) {
+        return true;
+    }
+    if (a == b) {
+        return true;
+    }
+    return false;
+}
+
 static uint32_t interpolate_cutoff_hz(uint32_t f0, uint32_t f1, int32_t g0, int32_t g1, int32_t target)
 {
     if (f1 <= f0 || g0 == g1) {
@@ -953,8 +969,18 @@ static void analyze_sweep_response(heavyfit_output_t *out)
         best = best_by_model[MODEL_TYPE_HP1];
     }
 
-    const int32_t confidence = confidence_from_candidate(&best, &second);
-    const bool fit_ok = best.valid && best.rms_rel <= 0.120 && confidence >= 450;
+    int32_t confidence = confidence_from_candidate(&best, &second);
+    const bool same_family_ambiguous =
+        best.valid && second.valid && same_filter_family(best.model_type, second.model_type);
+    const bool family_only =
+        (best.valid && (shape.candidate_mask & ~MODEL_MASK_LP) == 0U &&
+         (best.model_type == MODEL_TYPE_LP1 || best.model_type == MODEL_TYPE_LP2)) ||
+        (best.valid && (shape.candidate_mask & ~MODEL_MASK_HP) == 0U &&
+         (best.model_type == MODEL_TYPE_HP1 || best.model_type == MODEL_TYPE_HP2));
+    if ((same_family_ambiguous || family_only) && confidence < 500 && best.rms_rel <= 0.250) {
+        confidence = 500;
+    }
+    const bool fit_ok = best.valid && best.rms_rel <= (family_only ? 0.250 : 0.180) && confidence >= 450;
     if (!fit_ok) {
         clear_theory_columns(out);
         out->fit = {};
