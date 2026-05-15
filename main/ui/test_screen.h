@@ -198,6 +198,7 @@ typedef struct {
     uint32_t ifft_overflow_count;
     uint32_t tlast_missing_count;
     uint32_t tlast_unexpected_count;
+    uint32_t recon_count_base;
 } adv_status_t;
 
 typedef struct {

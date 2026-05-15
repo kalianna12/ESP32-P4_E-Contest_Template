@@ -473,6 +473,7 @@ bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
     out->ifft_overflow_count = GetU32(frame, 40);
     out->tlast_missing_count = GetU32(frame, 44);
     out->tlast_unexpected_count = GetU32(frame, 48);
+    out->recon_count_base = GetU32(frame, 52);
     return true;
 }
 

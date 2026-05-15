@@ -540,6 +540,9 @@ static lv_obj_t *create_freq_input(lv_obj_t *parent, int32_t x, int32_t y, uint3
     lv_obj_set_style_text_color(ta, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
     lv_obj_set_style_bg_color(ta, lv_color_hex(COLOR_INPUT), LV_PART_MAIN);
     lv_obj_set_style_border_color(ta, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_style_border_color(ta, lv_color_hex(COLOR_BLUE), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(COLOR_TEXT), LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_PART_CURSOR);
     lv_obj_set_style_radius(ta, 6, LV_PART_MAIN);
     set_ta_freq(ta, value);
     return ta;
@@ -764,6 +767,19 @@ static void append_table_point(const freqresp_ui_status_t *s)
     }
 
     if (g_last_point_index != UINT32_MAX && s->point_index > (g_last_point_index + 1U)) {
+        spilink_stats_t stats = {};
+        SpiLink_GetStats(&stats);
+        ESP_LOGW(TAG_UI,
+                 "MISSING gap: missing_start=%lu missing_end=%lu last_point_index=%lu new_point_index=%lu freq=%lu dropped=%lu bad_first=%lu frame_errors=%lu high_water=%lu",
+                 static_cast<unsigned long>(g_last_point_index + 1U),
+                 static_cast<unsigned long>(s->point_index - 1U),
+                 static_cast<unsigned long>(g_last_point_index),
+                 static_cast<unsigned long>(s->point_index),
+                 static_cast<unsigned long>(s->current_freq_hz),
+                 static_cast<unsigned long>(stats.dropped_points),
+                 static_cast<unsigned long>(stats.bad_first_bytes),
+                 static_cast<unsigned long>(stats.frame_errors),
+                 static_cast<unsigned long>(stats.point_queue_high_water));
         for (uint32_t missing = g_last_point_index + 1U; missing < s->point_index; ++missing) {
             if (!append_missing_table_point(missing, s->total_points)) {
                 break;
@@ -2370,7 +2386,7 @@ void test_screen_update_adv_status(const adv_status_t *status)
              static_cast<unsigned long>(g_adv_capture_req_base),
              g_adv_capture_pending ? 1 : 0,
              static_cast<unsigned long>(status->recon_done_count),
-             static_cast<unsigned long>(g_adv_recon_req_base),
+             static_cast<unsigned long>(status->recon_count_base),
              g_adv_recon_pending ? 1 : 0);
 
     if (g_adv_status != nullptr) {
@@ -2401,6 +2417,8 @@ void test_screen_update_adv_status(const adv_status_t *status)
             msg = "CAP?";
         } else if (status->error_code == 3U) {
             msg = "DDS N/I";
+        } else if (status->error_code == 4U) {
+            msg = "RECON TIMEOUT";
         }
 
         set_adv_result(msg, status->error_code == 3U ? COLOR_YELLOW : COLOR_RED);
