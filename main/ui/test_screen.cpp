@@ -95,6 +95,7 @@ static uint32_t g_last_adv_capture_done_count = 0;
 static uint32_t g_last_adv_recon_done_count = 0;
 static bool g_adv_capture_pending = false;
 static bool g_adv_recon_pending = false;
+static bool g_adv_dds_pending = false;
 static uint32_t g_latest_adv_capture_count = 0;
 static uint32_t g_latest_adv_recon_count = 0;
 static uint32_t g_adv_capture_req_base = 0;
@@ -1678,6 +1679,7 @@ static void adv_send_event_cb(lv_event_t *event)
     }
 
     SpiLink_SetPendingCommand(CMD_ADV_SEND_TO_DDS, 0U, 0U);
+    g_adv_dds_pending = true;
     set_adv_result("DDS REQ / WAIT", COLOR_YELLOW);
 }
 
@@ -2419,8 +2421,11 @@ void test_screen_update_adv_status(const adv_status_t *status)
             msg = "DDS N/I";
         } else if (status->error_code == 4U) {
             msg = "RECON TIMEOUT";
+        } else if (status->error_code == 5U) {
+            msg = "DDS TIMEOUT";
         }
 
+        g_adv_dds_pending = false;
         set_adv_result(msg, status->error_code == 3U ? COLOR_YELLOW : COLOR_RED);
         return;
     }
@@ -2439,6 +2444,12 @@ void test_screen_update_adv_status(const adv_status_t *status)
         g_adv_recon_pending = false;
         g_adv_reconstruction_ready = true;
         set_adv_result("RECON DONE", COLOR_GREEN);
+    }
+
+    constexpr uint32_t kAdvStatusFlagDdsPlaying = 0x00010000U;
+    if (g_adv_dds_pending && ((status->flags & kAdvStatusFlagDdsPlaying) != 0U)) {
+        g_adv_dds_pending = false;
+        set_adv_result("DDS PLAYING", COLOR_GREEN);
     }
 }
 
