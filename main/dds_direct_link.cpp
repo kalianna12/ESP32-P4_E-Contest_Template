@@ -16,10 +16,10 @@ namespace {
 constexpr char TAG[] = "DdsDirect";
 
 constexpr spi_host_device_t DDS_SPI_HOST = SPI2_HOST;
-constexpr gpio_num_t DDS_SPI_SCLK = GPIO_NUM_7;
-constexpr gpio_num_t DDS_SPI_MOSI = GPIO_NUM_8;
-constexpr gpio_num_t DDS_SPI_MISO = GPIO_NUM_20;
-constexpr gpio_num_t DDS_SPI_CS = GPIO_NUM_6;
+constexpr gpio_num_t DDS_SPI_SCLK = GPIO_NUM_33;
+constexpr gpio_num_t DDS_SPI_MOSI = GPIO_NUM_54;
+constexpr gpio_num_t DDS_SPI_MISO = GPIO_NUM_48;
+constexpr gpio_num_t DDS_SPI_CS = GPIO_NUM_32;
 constexpr int DDS_SPI_CLOCK_HZ = 1 * 1000 * 1000;
 
 constexpr uint8_t kMagic0 = 0xA5;
@@ -99,6 +99,15 @@ void LogAck(const char *tag)
 {
     if (g_rx[0] != kMagic0 || g_rx[1] != kMagic1 || g_rx[2] != 0xD2 ||
         g_rx[3] != kPayloadLen || g_rx[kChecksumOffset] != Checksum(g_rx)) {
+        ESP_LOGW(TAG,
+                 "%s ack invalid: head=%02X %02X %02X %02X chk=%02X expect=%02X",
+                 tag,
+                 g_rx[0],
+                 g_rx[1],
+                 g_rx[2],
+                 g_rx[3],
+                 g_rx[kChecksumOffset],
+                 Checksum(g_rx));
         return;
     }
 

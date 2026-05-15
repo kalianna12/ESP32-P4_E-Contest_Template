@@ -100,6 +100,7 @@ uint32_t bad_first_byte_count = 0;
 uint32_t dropped_point_count = 0;
 uint32_t dropped_harmonic_count = 0;
 uint32_t recovered_header_count = 0;
+uint32_t adv_wave_checksum_warn_count = 0;
 uint32_t point_queue_high_water = 0;
 uint32_t last_point_index = 0;
 uint32_t last_freq_hz = 0;
@@ -521,7 +522,16 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
     const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
     if (rx_checksum != expected_checksum) {
-        return false;
+        if (adv_wave_checksum_warn_count < 8U) {
+            ++adv_wave_checksum_warn_count;
+            ESP_LOGW(TAG,
+                     "ADV 0x15 checksum mismatch accepted for CAP: seq=%lu chunk=%lu expected=%02X got=%02X warn=%lu",
+                     static_cast<unsigned long>(GetU32(frame, 4)),
+                     static_cast<unsigned long>(GetU32(frame, 12)),
+                     expected_checksum,
+                     rx_checksum,
+                     static_cast<unsigned long>(adv_wave_checksum_warn_count));
+        }
     }
 
     out->seq = GetU32(frame, 4);
@@ -901,6 +911,7 @@ void SpiLink_Init(void)
     dropped_point_count = 0;
     dropped_harmonic_count = 0;
     recovered_header_count = 0;
+    adv_wave_checksum_warn_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
