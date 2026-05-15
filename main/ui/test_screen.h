@@ -206,6 +206,13 @@ typedef struct {
     uint32_t debug_stage;
     uint32_t debug_substage;
     uint32_t core_dbg_flags;
+    int32_t d4_src_min;
+    int32_t d4_src_max;
+    uint32_t d4_src_vpp;
+    uint32_t d4_src_zero_count;
+    int32_t d4_src_first;
+    int32_t d4_src_second;
+    uint32_t d4_src_mode;
     uint32_t spi_cmd_ok_count;
     uint32_t spi_cmd_bad_count;
     uint32_t dds_state;
