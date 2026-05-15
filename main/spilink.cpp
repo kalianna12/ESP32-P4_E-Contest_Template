@@ -491,6 +491,8 @@ bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
     out->dds_gain_shift = frame[112] & 0x0FU;
     out->dds_manual_gain_shift = frame[113] & 0x0FU;
     out->dds_auto_scale = frame[114] & 0x01U;
+    out->ifft_unscaled = (frame[114] >> 1) & 0x01U;
+    out->recon_debug_mode = (frame[114] >> 2) & 0x03U;
     out->dds_auto_gain_shift = frame[115] & 0x0FU;
     return true;
 }

@@ -217,6 +217,8 @@ typedef struct {
     uint32_t dds_manual_gain_shift;
     uint32_t dds_auto_scale;
     uint32_t dds_auto_gain_shift;
+    uint32_t ifft_unscaled;
+    uint32_t recon_debug_mode;
 } adv_status_t;
 
 typedef struct {
