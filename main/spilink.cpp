@@ -51,11 +51,13 @@ constexpr size_t kRxBufferLen = 128;
 constexpr size_t kTxBufferLen = 128;
 constexpr size_t kCommandQueueLen = 16;
 constexpr UBaseType_t kStatusQueueLen = 1;
-constexpr UBaseType_t kPointQueueLen = 256;
+constexpr UBaseType_t kPointQueueLen = 1600;
 constexpr UBaseType_t kAdvStatusQueueLen = 4;
 constexpr UBaseType_t kAdvWaveQueueLen = 64;
-constexpr size_t kMaxUiPointsPerPump = 32;
-constexpr size_t kMaxAdvWavesPerPump = 8;
+constexpr UBaseType_t kAdvHarmonicQueueLen = 64;
+constexpr size_t kMaxUiPointsPerPump = 128;
+constexpr size_t kMaxAdvWavesPerPump = 0;
+constexpr size_t kMaxAdvHarmonicsPerPump = 16;
 
 static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
 static_assert((kTxBufferLen % 64) == 0, "SPI TX buffer length must be a 64-byte multiple");
@@ -77,6 +79,7 @@ uint32_t ok_count = 0;
 uint32_t err_count = 0;
 uint32_t timeout_count = 0;
 uint32_t dropped_point_count = 0;
+uint32_t dropped_harmonic_count = 0;
 uint32_t point_queue_high_water = 0;
 uint32_t last_point_index = 0;
 uint32_t last_freq_hz = 0;
@@ -90,6 +93,7 @@ QueueHandle_t g_status_queue = nullptr;
 QueueHandle_t g_point_queue = nullptr;
 QueueHandle_t g_adv_status_queue = nullptr;
 QueueHandle_t g_adv_wave_queue = nullptr;
+QueueHandle_t g_adv_harmonic_queue = nullptr;
 
 portMUX_TYPE g_cmd_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_measurement_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -257,6 +261,7 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
     const uint32_t raw_b_vpp_code = GetU32(frame, 36) & 0x0FFFU;
     const int32_t frame_gain_x1000 = GetI32(frame, 40);
     int32_t phase_deg_x10 = GetI32(frame, 44);
+    const uint32_t flags = GetU32(frame, 48);
     const bool phase_level_ok = (raw_a_vpp_code >= 80U) && (raw_b_vpp_code >= 40U);
 
     portENTER_CRITICAL(&g_measurement_lock);
@@ -269,7 +274,8 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
         }
     }
 
-    bool phase_valid = phase_level_ok;
+    bool phase_valid = phase_level_ok && ((flags & FREQ_POINT_FLAG_UNSTABLE) == 0U) &&
+                       ((flags & 0x00000200U) != 0U);
     if (phase_valid && g_have_phase_history) {
         const int32_t phase_delta = phase_deg_x10 - g_prev_phase_deg_x10;
         if (phase_delta > 600 || phase_delta < -600) {
@@ -299,12 +305,15 @@ bool ParseFreqRespPointFrame(const uint8_t *frame, size_t len, freqresp_ui_statu
     out->total_points = total_points;
     out->vin_mv = RawVppCodeToMv(raw_a_vpp_code);
     out->vout_mv = RawVppCodeToMv(raw_b_vpp_code);
-    out->gain_x1000 = (raw_a_vpp_code != 0U) ?
+    out->gain_x1000 = (frame_gain_x1000 > 0) ?
+        frame_gain_x1000 :
+        ((raw_a_vpp_code != 0U) ?
         static_cast<int32_t>((static_cast<uint64_t>(raw_b_vpp_code) * 1000ULL) / raw_a_vpp_code) :
-        frame_gain_x1000;
+        0);
     out->theory_gain_x1000 = 0;
     out->error_x10 = 0;
     out->phase_deg_x10 = phase_deg_x10;
+    out->flags = flags;
     out->cutoff_freq_hz = 0;
     out->has_measurement = true;
     out->phase_valid = phase_valid;
@@ -383,6 +392,35 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     for (size_t i = 0; i < 30U; ++i) {
         out->samples[i] = GetI16(frame, 52 + i * 2U);
     }
+    return true;
+}
+
+bool ParseAdvHarmonicFrame(const uint8_t *frame, size_t len, adv_harmonic_t *out)
+{
+    if (frame == nullptr || out == nullptr || len < kFrameLen) {
+        return false;
+    }
+
+    if (frame[0] != kFrameMagic0 || frame[1] != kFrameMagic1) {
+        return false;
+    }
+
+    if (frame[2] != kFrameTypeAdvHarmonic || frame[3] != kPayloadLen) {
+        return false;
+    }
+
+    const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
+    const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
+    if (rx_checksum != expected_checksum) {
+        return false;
+    }
+
+    out->seq = GetU32(frame, 4);
+    out->index = GetU32(frame, 8);
+    out->freq_hz = GetU32(frame, 12);
+    out->amp_mv = GetI32(frame, 16);
+    out->phase_deg_x10 = GetI32(frame, 20);
+    out->flags = GetU32(frame, 24);
     return true;
 }
 
@@ -529,6 +567,11 @@ void FreeQueues()
         vQueueDelete(g_adv_wave_queue);
         g_adv_wave_queue = nullptr;
     }
+
+    if (g_adv_harmonic_queue != nullptr) {
+        vQueueDelete(g_adv_harmonic_queue);
+        g_adv_harmonic_queue = nullptr;
+    }
 }
 
 void MaybeUpdatePointQueueHighWater()
@@ -556,11 +599,12 @@ void MaybeLogSpiStats()
         (g_point_queue != nullptr) ? uxQueueMessagesWaiting(g_point_queue) : 0;
 
     ESP_LOGI(TAG,
-             "SPI stats: ok=%lu err=%lu timeout=%lu dropped_points=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
+             "SPI stats: ok=%lu err=%lu timeout=%lu dropped_points=%lu dropped_harmonics=%lu point_queue_waiting=%u point_queue_high_water=%lu last_point_index=%lu last_freq_hz=%lu",
              static_cast<unsigned long>(ok_count),
              static_cast<unsigned long>(err_count),
              static_cast<unsigned long>(timeout_count),
              static_cast<unsigned long>(dropped_point_count),
+             static_cast<unsigned long>(dropped_harmonic_count),
              static_cast<unsigned>(point_waiting),
              static_cast<unsigned long>(point_queue_high_water),
              static_cast<unsigned long>(last_point_index),
@@ -632,10 +676,12 @@ void SpiLink_Init(void)
     g_point_queue = xQueueCreate(kPointQueueLen, sizeof(freqresp_ui_status_t));
     g_adv_status_queue = xQueueCreate(kAdvStatusQueueLen, sizeof(adv_status_t));
     g_adv_wave_queue = xQueueCreate(kAdvWaveQueueLen, sizeof(adc_waveform_chunk_t));
+    g_adv_harmonic_queue = xQueueCreate(kAdvHarmonicQueueLen, sizeof(adv_harmonic_t));
     if (g_status_queue == nullptr ||
         g_point_queue == nullptr ||
         g_adv_status_queue == nullptr ||
-        g_adv_wave_queue == nullptr) {
+        g_adv_wave_queue == nullptr ||
+        g_adv_harmonic_queue == nullptr) {
         ESP_LOGE(TAG, "Failed to create SPI UI queues");
         FreeQueues();
         FreeBuffers();
@@ -679,6 +725,7 @@ void SpiLink_Init(void)
     err_count = 0;
     timeout_count = 0;
     dropped_point_count = 0;
+    dropped_harmonic_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
@@ -735,7 +782,11 @@ void SpiLink_ClearMeasurementCache(void)
     if (g_adv_wave_queue != nullptr) {
         xQueueReset(g_adv_wave_queue);
     }
+    if (g_adv_harmonic_queue != nullptr) {
+        xQueueReset(g_adv_harmonic_queue);
+    }
     dropped_point_count = 0;
+    dropped_harmonic_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
@@ -777,6 +828,15 @@ void SpiLink_UiPump(void)
         }
         test_screen_update_adc_waveform_chunk(&chunk);
     }
+
+    for (size_t i = 0; i < kMaxAdvHarmonicsPerPump; ++i) {
+        adv_harmonic_t harmonic = {};
+        if (g_adv_harmonic_queue == nullptr ||
+            xQueueReceive(g_adv_harmonic_queue, &harmonic, 0) != pdTRUE) {
+            break;
+        }
+        test_screen_update_adv_harmonic(&harmonic);
+    }
 }
 
 uint32_t SpiLink_PointQueueWaiting(void)
@@ -786,6 +846,23 @@ uint32_t SpiLink_PointQueueWaiting(void)
     }
 
     return static_cast<uint32_t>(uxQueueMessagesWaiting(g_point_queue));
+}
+
+bool SpiLink_GetStats(spilink_stats_t *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+
+    out->rx_ok = ok_count;
+    out->frame_errors = err_count;
+    out->timeouts = timeout_count;
+    out->dropped_points = dropped_point_count;
+    out->dropped_harmonics = dropped_harmonic_count;
+    out->point_queue_waiting =
+        (g_point_queue != nullptr) ? static_cast<uint32_t>(uxQueueMessagesWaiting(g_point_queue)) : 0U;
+    out->point_queue_high_water = point_queue_high_water;
+    return true;
 }
 
 void SpiLink_SendTextToPynq(const char *text)
@@ -895,8 +972,22 @@ void SpiLink_Task(void)
     adc_waveform_chunk_t adv_chunk = {};
     if (ParseAdvWaveChunkFrame(rx_buffer, kFrameLen, &adv_chunk)) {
         ++ok_count;
-        if (g_adv_wave_queue != nullptr) {
+        if (kMaxAdvWavesPerPump != 0U && g_adv_wave_queue != nullptr) {
             xQueueSend(g_adv_wave_queue, &adv_chunk, 0);
+        }
+        MaybeLogSpiStats();
+        return;
+    }
+
+    adv_harmonic_t adv_harmonic = {};
+    if (ParseAdvHarmonicFrame(rx_buffer, kFrameLen, &adv_harmonic)) {
+        ++ok_count;
+        if (g_adv_harmonic_queue != nullptr) {
+            if (xQueueSend(g_adv_harmonic_queue, &adv_harmonic, 0) != pdTRUE) {
+                ++dropped_harmonic_count;
+            }
+        } else {
+            ++dropped_harmonic_count;
         }
         MaybeLogSpiStats();
         return;

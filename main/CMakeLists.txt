@@ -5,6 +5,7 @@ idf_component_register(
         lvgl_adapter_init.c
         wifi/template_wifi.c
         storage/template_sdcard.c
+        ui/heavyfit.cpp
         ui/test_screen.cpp
     INCLUDE_DIRS
         .

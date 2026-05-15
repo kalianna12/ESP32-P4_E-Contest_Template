@@ -7,9 +7,13 @@
 extern "C" {
 #endif
 
-#define MAX_POINTS 1500
+#define MAX_POINTS 1600
 #define MODEL_POINTS_MAX 128
 #define ADC_TEST_SAMPLE_MAX 256
+#define ADV_HARMONIC_MAX 50
+
+#define FREQ_POINT_FLAG_UNSTABLE 0x00000800U
+#define FREQ_POINT_FLAG_MISSING  0x80000000U
 
 typedef enum {
     FREQRESP_STATE_IDLE = 0,
@@ -58,6 +62,8 @@ typedef enum {
 } freqresp_command_t;
 
 typedef struct {
+    uint32_t point_index;
+    uint32_t total_points;
     uint32_t freq_hz;
     int32_t vin_mv;
     int32_t vout_mv;
@@ -65,6 +71,7 @@ typedef struct {
     int32_t theory_gain_x1000;
     int32_t error_x10;
     int32_t phase_deg_x10;
+    uint32_t flags;
     bool phase_valid;
 } freq_point_t;
 
@@ -134,6 +141,7 @@ typedef struct {
     int32_t theory_gain_x1000;
     int32_t error_x10;
     int32_t phase_deg_x10;
+    uint32_t flags;
 
     uint32_t cutoff_freq_hz;
     bool has_measurement;
@@ -192,11 +200,21 @@ typedef struct {
     uint32_t tlast_unexpected_count;
 } adv_status_t;
 
+typedef struct {
+    uint32_t seq;
+    uint32_t index;
+    uint32_t freq_hz;
+    int32_t amp_mv;
+    int32_t phase_deg_x10;
+    uint32_t flags;
+} adv_harmonic_t;
+
 void test_screen_create(void);
 void test_screen_update_measurement(const freqresp_ui_status_t *status);
 void test_screen_update_adc_analysis_result(const adc_analysis_result_t *result);
 void test_screen_update_adc_waveform_chunk(const adc_waveform_chunk_t *chunk);
 void test_screen_update_adv_status(const adv_status_t *status);
+void test_screen_update_adv_harmonic(const adv_harmonic_t *harmonic);
 void test_screen_update_spi_text_test(const char *rx_text, uint8_t link_state);
 
 #ifdef __cplusplus
