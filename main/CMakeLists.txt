@@ -4,7 +4,6 @@ idf_component_register(
         dds_direct_link.cpp
         spilink.cpp
         lvgl_adapter_init.c
-        wifi/template_wifi.c
         storage/template_sdcard.c
         ui/heavyfit.cpp
         ui/test_screen.cpp
@@ -18,8 +17,6 @@ idf_component_register(
         esp32_p4_function_ev_board_noglib
         esp_event
         esp_lvgl_adapter
-        esp_netif
-        esp_wifi
         lvgl__lvgl
         nvs_flash
 )

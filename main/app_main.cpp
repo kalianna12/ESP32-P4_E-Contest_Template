@@ -17,7 +17,6 @@
 #include "ui/test_screen.h"
 #include "spilink.h"
 
-#include "wifi/template_wifi.h"
 #include "storage/template_sdcard.h"
 
 static const char *TAG = "template";
@@ -81,8 +80,6 @@ extern "C" void app_main(void)
 
     SpiLink_Init();
     xTaskCreatePinnedToCore(spi_link_task, "spi_link_rx", 4096, nullptr, 4, nullptr, 1);
-
-    ESP_ERROR_CHECK(template_wifi_init());
 
 #if CONFIG_TEMPLATE_ENABLE_SDCARD
     ESP_ERROR_CHECK(template_sdcard_init());

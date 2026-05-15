@@ -3,12 +3,6 @@ dependencies:
   idf:
     version: ">=5.4.2"
 
-  espressif/esp_wifi_remote:
-    version: "0.14.*"
-
-  espressif/esp_hosted:
-    version: "1.4.*"
-
   espressif/esp_lvgl_adapter:
     version: "0.3.*"
     public: true
