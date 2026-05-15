@@ -72,6 +72,7 @@ static lv_obj_t *g_latest = nullptr;
 static lv_obj_t *g_open_table_btn = nullptr;
 
 static lv_obj_t *g_full_table = nullptr;
+static bool g_full_table_dirty = false;
 static bool g_main_page_active = false;
 static bool g_reconstruction_page_active = false;
 static bool g_spi_test_page_active = false;
@@ -563,6 +564,7 @@ static void ClearAllSweepData(void)
             lv_table_set_cell_value(g_full_table, 1, col, "");
         }
     }
+    g_full_table_dirty = false;
     update_adv_model_line();
 
     set_msg("CLEARED", COLOR_GREEN);
@@ -627,6 +629,43 @@ static bool append_missing_table_point(uint32_t point_index, uint32_t total_poin
     point->flags = FREQ_POINT_FLAG_MISSING;
     point->phase_valid = false;
     return true;
+}
+
+static double model_gain_no_k_ui(uint8_t model_type, double f_hz, double f0_hz, double q)
+{
+    if (f_hz <= 0.0 || f0_hz <= 0.0) {
+        return 0.0;
+    }
+
+    const double r = f_hz / f0_hz;
+    switch (model_type) {
+    case MODEL_TYPE_LP1:
+        return 1.0 / sqrt(1.0 + r * r);
+    case MODEL_TYPE_HP1:
+        return r / sqrt(1.0 + r * r);
+    case MODEL_TYPE_LP2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return 1.0 / sqrt(a * a + b * b);
+    }
+    case MODEL_TYPE_HP2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return (r * r) / sqrt(a * a + b * b);
+    }
+    case MODEL_TYPE_BP2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return (r / q) / sqrt(a * a + b * b);
+    }
+    case MODEL_TYPE_BS2: {
+        const double a = 1.0 - r * r;
+        const double b = r / q;
+        return fabs(a) / sqrt(a * a + b * b);
+    }
+    default:
+        return 0.0;
+    }
 }
 
 static void append_table_point(const freqresp_ui_status_t *s)
@@ -866,6 +905,57 @@ static bool chart_point_visible(uint32_t index)
     return true;
 }
 
+static bool recompute_theory_columns_from_fit(const filter_fit_result_t *fit, uint32_t point_count)
+{
+    if (fit == nullptr || !fit->valid || point_count == 0U) {
+        return false;
+    }
+
+    double q = static_cast<double>(fit->q_x1000) / 1000.0;
+    if (q <= 0.0) {
+        q = 0.707;
+    }
+    double k = static_cast<double>(fit->k_x1000) / 1000.0;
+    if (k <= 0.0) {
+        k = 1.0;
+    }
+    const double f0 = (fit->f0_hz != 0U) ?
+        static_cast<double>(fit->f0_hz) :
+        static_cast<double>(fit->fc_hz);
+    if (f0 <= 0.0) {
+        return false;
+    }
+
+    bool wrote_any = false;
+    const uint32_t n = (point_count < g_table_count) ? point_count : g_table_count;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (fit_point_reject_reason_strict(i) != FIT_REJECT_NONE) {
+            g_table[i].theory_gain_x1000 = 0;
+            g_table[i].error_x10 = 0;
+            continue;
+        }
+
+        const double h0 = model_gain_no_k_ui(fit->model_type,
+                                             static_cast<double>(g_table[i].freq_hz),
+                                             f0,
+                                             q);
+        const double theory = k * h0;
+        if (theory <= 0.000001) {
+            g_table[i].theory_gain_x1000 = 0;
+            g_table[i].error_x10 = 0;
+            continue;
+        }
+
+        const double measured = static_cast<double>(g_table[i].gain_x1000) / 1000.0;
+        g_table[i].theory_gain_x1000 = static_cast<int32_t>(theory * 1000.0 + 0.5);
+        g_table[i].error_x10 =
+            static_cast<int32_t>((fabs(measured - theory) / theory) * 1000.0 + 0.5);
+        wrote_any = true;
+    }
+
+    return wrote_any;
+}
+
 static void save_circuit_model_from_table(const freqresp_ui_status_t *s)
 {
     if (s == nullptr ||
@@ -966,9 +1056,20 @@ static void process_heavyfit_result(void)
 
     const uint32_t n = (g_fit_output_work.point_count < g_table_count) ?
         g_fit_output_work.point_count : g_table_count;
+    bool copied_theory = false;
     for (uint32_t i = 0; i < n; ++i) {
         g_table[i].theory_gain_x1000 = g_fit_output_work.theory_gain_x1000[i];
         g_table[i].error_x10 = g_fit_output_work.error_x10[i];
+        if (g_fit_output_work.theory_gain_x1000[i] > 0) {
+            copied_theory = true;
+        }
+    }
+
+    if (!copied_theory && g_fit_output_work.fit.valid) {
+        copied_theory = recompute_theory_columns_from_fit(&g_fit_output_work.fit, n);
+        ESP_LOGW(TAG_UI,
+                 "Heavy fit output had no theory columns; recompute %s",
+                 copied_theory ? "ok" : "failed");
     }
 
     if (n != 0U) {
@@ -982,6 +1083,7 @@ static void process_heavyfit_result(void)
     g_have_last_status = true;
     save_circuit_model_from_table(&g_fit_output_work.status);
     update_adv_model_line();
+    g_full_table_dirty = true;
     refresh_chart_from_table();
     if (g_full_table != nullptr) {
         create_full_table_page();
@@ -1435,6 +1537,10 @@ static void keyboard_event_cb(lv_event_t *event)
 static void open_table_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        if (g_full_table_dirty) {
+            ESP_LOGI(TAG_UI, "Full table dirty; rendering updated fit columns");
+        }
+        g_full_table_dirty = false;
         create_full_table_page();
     }
 }
@@ -2579,4 +2685,5 @@ static void create_full_table_page(void)
         set_table_cell(g_full_table, row, 7, phase);
         set_table_cell(g_full_table, row, 8, flags);
     }
+    g_full_table_dirty = false;
 }
