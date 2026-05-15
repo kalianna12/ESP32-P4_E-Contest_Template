@@ -2519,10 +2519,11 @@ void test_screen_update_adv_status(const adv_status_t *status)
         char buf[224];
         const char recon_mode =
             (status->recon_debug_mode == 0U) ? 'C' :
-            (status->recon_debug_mode == 2U) ? 'S' : 'F';
+            (status->recon_debug_mode == 2U) ? 'S' :
+            (status->recon_debug_mode == 3U) ? 'T' : 'F';
         snprintf(buf,
                  sizeof(buf),
-                 "ADV:%lu E:%lu F:%lu/%lu Y:%ld X:%ld R:%c I:%s\nG:%lu %s M:%lu A:%lu DDS:%lu %lu/35\nS:%lu/%lu CMD:%lu %s C:%02lX",
+                 "ADV:%lu E:%lu F:%lu/%lu Y:%ld X:%ld R:%c I:%s\nG:%lu %s M:%lu A:%lu DDS:%lu %lu/35 DF:%02lX\nS:%lu/%lu CMD:%lu %s C:%02lX",
                  static_cast<unsigned long>(status->adv_state),
                  static_cast<unsigned long>(status->error_code),
                  static_cast<unsigned long>(status->fft_overflow_count),
@@ -2537,6 +2538,7 @@ void test_screen_update_adv_status(const adv_status_t *status)
                  static_cast<unsigned long>(status->dds_auto_gain_shift),
                  static_cast<unsigned long>(status->dds_state),
                  static_cast<unsigned long>(status->dds_chunk_index),
+                 static_cast<unsigned long>(status->dds_last_ack_status & 0xFFU),
                  static_cast<unsigned long>(status->debug_stage),
                  static_cast<unsigned long>(status->debug_substage),
                  static_cast<unsigned long>(status->last_cmd_seen),
