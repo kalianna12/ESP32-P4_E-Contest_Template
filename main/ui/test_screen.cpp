@@ -1645,11 +1645,6 @@ static void adv_capture_event_cb(lv_event_t *event)
         return;
     }
 
-    if (!g_circuit_model.valid) {
-        set_adv_result("MODEL FIRST", COLOR_RED);
-        return;
-    }
-
     g_adv_capture_pending = true;
     g_adv_recon_pending = false;
     g_adv_capture_req_base = g_latest_adv_capture_count;
