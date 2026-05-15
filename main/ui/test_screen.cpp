@@ -1471,9 +1471,7 @@ static void update_current_point(const freqresp_ui_status_t *s)
     snprintf(buf, sizeof(buf), "Phase: %s", phase);
     lv_label_set_text(g_phase, buf);
 
-    if (g_fit_result_quality == FIT_RESULT_HEAVY_LOW_CONF) {
-        snprintf(buf, sizeof(buf), "Type: Unknown");
-    } else if (g_last_fit.valid) {
+    if (g_last_fit.valid) {
         snprintf(buf, sizeof(buf), "Type: %s", model_kind_text(g_last_fit.model_type));
     } else {
         snprintf(buf, sizeof(buf), "Type: Unknown");
@@ -1481,10 +1479,20 @@ static void update_current_point(const freqresp_ui_status_t *s)
     lv_label_set_text(g_type, buf);
 
     if (g_last_fit.valid &&
-        (g_last_fit.model_type == MODEL_TYPE_LP2 ||
-         g_last_fit.model_type == MODEL_TYPE_HP2 ||
-         g_last_fit.model_type == MODEL_TYPE_BP2 ||
-         g_last_fit.model_type == MODEL_TYPE_BS2)) {
+        (g_last_fit.model_type == MODEL_TYPE_BP2 ||
+         g_last_fit.model_type == MODEL_TYPE_BS2) &&
+        g_last_fit.fl_hz != 0U &&
+        g_last_fit.fh_hz != 0U) {
+        char fl[16];
+        char fh[16];
+        format_freq(fl, sizeof(fl), g_last_fit.fl_hz);
+        format_freq(fh, sizeof(fh), g_last_fit.fh_hz);
+        snprintf(buf, sizeof(buf), "%s/%s Hz", fl, fh);
+    } else if (g_last_fit.valid &&
+               (g_last_fit.model_type == MODEL_TYPE_LP2 ||
+                g_last_fit.model_type == MODEL_TYPE_HP2 ||
+                g_last_fit.model_type == MODEL_TYPE_BP2 ||
+                g_last_fit.model_type == MODEL_TYPE_BS2)) {
         snprintf(buf, sizeof(buf), "f0: %s Hz", fc);
     } else {
         snprintf(buf, sizeof(buf), "fc: %s Hz", fc);
@@ -2380,34 +2388,6 @@ void test_screen_update_adv_status(const adv_status_t *status)
     g_last_adv_capture_done_count = status->capture_done_count;
     g_last_adv_recon_done_count = status->recon_done_count;
 
-    ESP_LOGW(TAG_UI,
-             "ADV st=%lu err=%lu cap=%lu cap_base=%lu cap_pend=%d recon=%lu recon_base=%lu recon_pend=%d",
-             static_cast<unsigned long>(status->adv_state),
-             static_cast<unsigned long>(status->error_code),
-             static_cast<unsigned long>(status->capture_done_count),
-             static_cast<unsigned long>(g_adv_capture_req_base),
-             g_adv_capture_pending ? 1 : 0,
-             static_cast<unsigned long>(status->recon_done_count),
-             static_cast<unsigned long>(status->recon_count_base),
-             g_adv_recon_pending ? 1 : 0);
-
-    if (g_adv_status != nullptr) {
-        char buf[160];
-        snprintf(buf,
-                 sizeof(buf),
-                 "ADV:%lu ERR:%lu FFT:%lu/%lu TL:%lu/%lu",
-                 static_cast<unsigned long>(status->adv_state),
-                 static_cast<unsigned long>(status->error_code),
-                 static_cast<unsigned long>(status->fft_overflow_count),
-                 static_cast<unsigned long>(status->ifft_overflow_count),
-                 static_cast<unsigned long>(status->tlast_missing_count),
-                 static_cast<unsigned long>(status->tlast_unexpected_count));
-        lv_label_set_text(g_adv_status, buf);
-        lv_obj_set_style_text_color(g_adv_status,
-                                    lv_color_hex(status->error_code == 0U ? COLOR_GREEN : COLOR_RED),
-                                    LV_PART_MAIN);
-    }
-
     if (status->error_code != 0U) {
         g_adv_capture_pending = false;
         g_adv_recon_pending = false;
@@ -2426,6 +2406,26 @@ void test_screen_update_adv_status(const adv_status_t *status)
         }
 
         g_adv_dds_pending = false;
+        ESP_LOGW(TAG_UI,
+                 "ADV st=%lu err=%lu stage=%lu sub=%lu cmd=%lu seq=%lu acc=%lu rej=%lu cap=%lu recon=%lu flags=0x%08lX ok=%lu bad=%lu ferr=%lu dds=%lu ack=%lu ackst=%lu chunk=%lu",
+                 static_cast<unsigned long>(status->adv_state),
+                 static_cast<unsigned long>(status->error_code),
+                 static_cast<unsigned long>(status->debug_stage),
+                 static_cast<unsigned long>(status->debug_substage),
+                 static_cast<unsigned long>(status->last_cmd_seen),
+                 static_cast<unsigned long>(status->last_cmd_seq),
+                 static_cast<unsigned long>(status->last_cmd_accepted),
+                 static_cast<unsigned long>(status->last_cmd_reject_reason),
+                 static_cast<unsigned long>(status->capture_done_count),
+                 static_cast<unsigned long>(status->recon_done_count),
+                 static_cast<unsigned long>(status->core_dbg_flags),
+                 static_cast<unsigned long>(status->spi_cmd_ok_count),
+                 static_cast<unsigned long>(status->spi_cmd_bad_count),
+                 static_cast<unsigned long>(status->spi_a_frame_err_count),
+                 static_cast<unsigned long>(status->dds_state),
+                 static_cast<unsigned long>(status->dds_last_ack_cmd),
+                 static_cast<unsigned long>(status->dds_last_ack_status),
+                 static_cast<unsigned long>(status->dds_chunk_index));
         set_adv_result(msg, status->error_code == 3U ? COLOR_YELLOW : COLOR_RED);
         return;
     }
@@ -2450,6 +2450,55 @@ void test_screen_update_adv_status(const adv_status_t *status)
     if (g_adv_dds_pending && ((status->flags & kAdvStatusFlagDdsPlaying) != 0U)) {
         g_adv_dds_pending = false;
         set_adv_result("DDS PLAYING", COLOR_GREEN);
+    }
+
+    ESP_LOGW(TAG_UI,
+             "ADV st=%lu err=%lu stage=%lu sub=%lu cmd=%lu seq=%lu acc=%lu rej=%lu cap=%lu cap_base=%lu cap_pend=%d recon=%lu recon_base=%lu recon_pend=%d flags=0x%08lX ok=%lu bad=%lu ferr=%lu dds=%lu ack=%lu ackst=%lu chunk=%lu",
+             static_cast<unsigned long>(status->adv_state),
+             static_cast<unsigned long>(status->error_code),
+             static_cast<unsigned long>(status->debug_stage),
+             static_cast<unsigned long>(status->debug_substage),
+             static_cast<unsigned long>(status->last_cmd_seen),
+             static_cast<unsigned long>(status->last_cmd_seq),
+             static_cast<unsigned long>(status->last_cmd_accepted),
+             static_cast<unsigned long>(status->last_cmd_reject_reason),
+             static_cast<unsigned long>(status->capture_done_count),
+             static_cast<unsigned long>(g_adv_capture_req_base),
+             g_adv_capture_pending ? 1 : 0,
+             static_cast<unsigned long>(status->recon_done_count),
+             static_cast<unsigned long>(status->recon_count_base),
+             g_adv_recon_pending ? 1 : 0,
+             static_cast<unsigned long>(status->core_dbg_flags),
+             static_cast<unsigned long>(status->spi_cmd_ok_count),
+             static_cast<unsigned long>(status->spi_cmd_bad_count),
+             static_cast<unsigned long>(status->spi_a_frame_err_count),
+             static_cast<unsigned long>(status->dds_state),
+             static_cast<unsigned long>(status->dds_last_ack_cmd),
+             static_cast<unsigned long>(status->dds_last_ack_status),
+             static_cast<unsigned long>(status->dds_chunk_index));
+
+    if (g_adv_status != nullptr) {
+        char buf[192];
+        snprintf(buf,
+                 sizeof(buf),
+                 "ADV:%lu ERR:%lu FFT:%lu/%lu TL:%lu/%lu\nSTG:%lu SUB:%lu CMD:%lu %s\nCORE:%02lX DDS:%lu %lu/35",
+                 static_cast<unsigned long>(status->adv_state),
+                 static_cast<unsigned long>(status->error_code),
+                 static_cast<unsigned long>(status->fft_overflow_count),
+                 static_cast<unsigned long>(status->ifft_overflow_count),
+                 static_cast<unsigned long>(status->tlast_missing_count),
+                 static_cast<unsigned long>(status->tlast_unexpected_count),
+                 static_cast<unsigned long>(status->debug_stage),
+                 static_cast<unsigned long>(status->debug_substage),
+                 static_cast<unsigned long>(status->last_cmd_seen),
+                 status->last_cmd_accepted ? "OK" : "BAD",
+                 static_cast<unsigned long>(status->core_dbg_flags & 0xFFU),
+                 static_cast<unsigned long>(status->dds_state),
+                 static_cast<unsigned long>(status->dds_chunk_index));
+        lv_label_set_text(g_adv_status, buf);
+        lv_obj_set_style_text_color(g_adv_status,
+                                    lv_color_hex(COLOR_GREEN),
+                                    LV_PART_MAIN);
     }
 }
 

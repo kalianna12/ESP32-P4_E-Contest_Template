@@ -199,6 +199,20 @@ typedef struct {
     uint32_t tlast_missing_count;
     uint32_t tlast_unexpected_count;
     uint32_t recon_count_base;
+    uint32_t last_cmd_seen;
+    uint32_t last_cmd_seq;
+    uint32_t last_cmd_accepted;
+    uint32_t last_cmd_reject_reason;
+    uint32_t debug_stage;
+    uint32_t debug_substage;
+    uint32_t core_dbg_flags;
+    uint32_t spi_cmd_ok_count;
+    uint32_t spi_cmd_bad_count;
+    uint32_t dds_state;
+    uint32_t dds_last_ack_cmd;
+    uint32_t dds_last_ack_status;
+    uint32_t dds_chunk_index;
+    uint32_t spi_a_frame_err_count;
 } adv_status_t;
 
 typedef struct {

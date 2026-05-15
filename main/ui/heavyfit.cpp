@@ -662,6 +662,24 @@ static uint32_t find_light_cutoff_hz(uint8_t filter_type, uint32_t target_gain_x
     return 0U;
 }
 
+static void compute_band_edges(uint32_t f0_hz, double q, uint32_t *fl_hz, uint32_t *fh_hz)
+{
+    if (fl_hz == nullptr || fh_hz == nullptr) {
+        return;
+    }
+    *fl_hz = 0U;
+    *fh_hz = 0U;
+    if (f0_hz == 0U || q < 0.05) {
+        return;
+    }
+    const double inv_q = 1.0 / q;
+    const double root = sqrt(inv_q * inv_q + 4.0);
+    const double r_low = (root - inv_q) * 0.5;
+    const double r_high = (root + inv_q) * 0.5;
+    *fl_hz = static_cast<uint32_t>(static_cast<double>(f0_hz) * r_low + 0.5);
+    *fh_hz = static_cast<uint32_t>(static_cast<double>(f0_hz) * r_high + 0.5);
+}
+
 static fit_shape_t classify_shape(void)
 {
     fit_shape_t shape = {};
@@ -676,9 +694,25 @@ static fit_shape_t classify_shape(void)
     uint32_t high_count = 0;
     uint32_t peak_pos = 0;
     uint32_t valley_pos = 0;
+    uint64_t first_sum = 0;
+    uint64_t mid_sum = 0;
+    uint64_t last_sum = 0;
+    uint32_t first_count = 0;
+    uint32_t mid_count = 0;
+    uint32_t last_count = 0;
     shape.valley_gain = UINT32_MAX;
     for (uint32_t i = 0; i < g_fit_point_count; ++i) {
         const uint32_t gain = static_cast<uint32_t>(g_fit_points[i].gain_x1000);
+        if (i < shape.valid_count / 3U) {
+            first_sum += gain;
+            ++first_count;
+        } else if (i < (shape.valid_count * 2U) / 3U) {
+            mid_sum += gain;
+            ++mid_count;
+        } else {
+            last_sum += gain;
+            ++last_count;
+        }
         if (low_count < edge_count) {
             low_sum += gain;
             ++low_count;
@@ -703,6 +737,11 @@ static fit_shape_t classify_shape(void)
     if (shape.valley_gain == UINT32_MAX) {
         shape.valley_gain = 0U;
     }
+    const uint32_t first_avg = (first_count == 0U) ? 0U : static_cast<uint32_t>(first_sum / first_count);
+    const uint32_t mid_avg = (mid_count == 0U) ? 0U : static_cast<uint32_t>(mid_sum / mid_count);
+    const uint32_t last_avg = (last_count == 0U) ? 0U : static_cast<uint32_t>(last_sum / last_count);
+    const uint32_t edge_mid_hi = (first_avg > last_avg) ? first_avg : last_avg;
+    const uint32_t edge_mid_lo = (first_avg < last_avg) ? first_avg : last_avg;
     const uint32_t edge_hi = (shape.low_avg > shape.high_avg) ? shape.low_avg : shape.high_avg;
     const uint32_t edge_lo = (shape.low_avg < shape.high_avg) ? shape.low_avg : shape.high_avg;
     if (static_cast<uint64_t>(shape.low_avg) * 100ULL > static_cast<uint64_t>(shape.high_avg) * 125ULL) {
@@ -712,12 +751,20 @@ static fit_shape_t classify_shape(void)
         shape.candidate_mask |= MODEL_MASK_HP;
     }
     if (peak_pos > (shape.valid_count / 5U) && peak_pos < ((shape.valid_count * 4U) / 5U) &&
-        static_cast<uint64_t>(shape.peak_gain) * 100ULL > static_cast<uint64_t>(edge_hi) * 125ULL) {
+        static_cast<uint64_t>(shape.peak_gain) * 100ULL > static_cast<uint64_t>(edge_hi) * 112ULL) {
         shape.candidate_mask |= MODEL_MASK_BP2;
     }
     if (valley_pos > (shape.valid_count / 5U) && valley_pos < ((shape.valid_count * 4U) / 5U) &&
-        static_cast<uint64_t>(shape.valley_gain) * 125ULL < static_cast<uint64_t>(edge_lo) * 100ULL) {
+        static_cast<uint64_t>(shape.valley_gain) * 112ULL < static_cast<uint64_t>(edge_lo) * 100ULL) {
         shape.candidate_mask |= MODEL_MASK_BS2;
+    }
+    if (first_count >= 3U && mid_count >= 3U && last_count >= 3U) {
+        if (static_cast<uint64_t>(mid_avg) * 100ULL > static_cast<uint64_t>(edge_mid_hi) * 108ULL) {
+            shape.candidate_mask |= MODEL_MASK_BP2;
+        }
+        if (static_cast<uint64_t>(mid_avg) * 108ULL < static_cast<uint64_t>(edge_mid_lo) * 100ULL) {
+            shape.candidate_mask |= MODEL_MASK_BS2;
+        }
     }
     return shape;
 }
@@ -980,7 +1027,19 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     if ((same_family_ambiguous || family_only) && confidence < 500 && best.rms_rel <= 0.250) {
         confidence = 500;
     }
-    const bool fit_ok = best.valid && best.rms_rel <= (family_only ? 0.250 : 0.180) && confidence >= 450;
+    const bool band_shape =
+        best.valid &&
+        (best.model_type == MODEL_TYPE_BP2 || best.model_type == MODEL_TYPE_BS2) &&
+        ((shape.candidate_mask & (MODEL_MASK_BP2 | MODEL_MASK_BS2)) != 0U);
+    if (band_shape && confidence < 500 && best.rms_rel <= 0.400) {
+        confidence = 500;
+    }
+    if (best.valid && confidence < 450 &&
+        ((shape.candidate_mask != 0U && best.rms_rel <= 0.320) || best.rms_rel <= 0.260)) {
+        confidence = 450;
+    }
+    const double rms_limit = band_shape ? 0.400 : (family_only ? 0.300 : 0.280);
+    const bool fit_ok = best.valid && best.rms_rel <= rms_limit && confidence >= 420;
     if (!fit_ok) {
         clear_theory_columns(out);
         out->fit = {};
@@ -1007,6 +1066,9 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     fit.model_type = best.model_type;
     fit.fc_hz = static_cast<uint32_t>(best.freq_hz + 0.5);
     fit.f0_hz = fit.fc_hz;
+    if (fit.model_type == MODEL_TYPE_BP2 || fit.model_type == MODEL_TYPE_BS2) {
+        compute_band_edges(fit.f0_hz, best.q, &fit.fl_hz, &fit.fh_hz);
+    }
     fit.q_x1000 = static_cast<int32_t>(best.q * 1000.0 + 0.5);
     fit.k_x1000 = static_cast<int32_t>(best.k * 1000.0 + 0.5);
     fit.rms_error_x10 = static_cast<int32_t>(best.rms_rel * 1000.0 + 0.5);
