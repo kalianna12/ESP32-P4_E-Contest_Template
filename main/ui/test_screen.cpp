@@ -396,10 +396,10 @@ static const char *model_kind_text(uint8_t type)
     switch (type) {
     case MODEL_TYPE_LP1: return "LP1";
     case MODEL_TYPE_HP1: return "HP1";
-    case MODEL_TYPE_LP2: return "2LP";
-    case MODEL_TYPE_HP2: return "2HP";
-    case MODEL_TYPE_BP2: return "BP";
-    case MODEL_TYPE_BS2: return "BS";
+    case MODEL_TYPE_LP2: return "LP2";
+    case MODEL_TYPE_HP2: return "HP2";
+    case MODEL_TYPE_BP2: return "BP2";
+    case MODEL_TYPE_BS2: return "BS2";
     default: return "Unknown";
     }
 }
@@ -1221,16 +1221,29 @@ static void update_adv_model_line(void)
                            g_circuit_model.cutoff_freq_hz);
         format_freq(start_freq, sizeof(start_freq), g_circuit_model.start_freq_hz);
         format_freq(stop_freq, sizeof(stop_freq), g_circuit_model.stop_freq_hz);
-        if (g_fit_result_quality == FIT_RESULT_HEAVY_LOW_CONF) {
-            snprintf(buf,
-                     sizeof(buf),
-                     "Circuit Model: Unknown      fc: ----- Hz      H(f): Loaded");
-        } else if (g_circuit_model.fit.valid) {
-            snprintf(buf,
-                     sizeof(buf),
-                     "Circuit Model: %s      f0/fc: %s Hz      H(f): Loaded",
-                     model_kind_text(g_circuit_model.fit.model_type),
-                     fc);
+        if (g_circuit_model.fit.valid) {
+            if ((g_circuit_model.fit.model_type == MODEL_TYPE_BP2 ||
+                 g_circuit_model.fit.model_type == MODEL_TYPE_BS2) &&
+                g_circuit_model.fit.fl_hz != 0U &&
+                g_circuit_model.fit.fh_hz != 0U) {
+                char fl[16];
+                char fh[16];
+                format_freq(fl, sizeof(fl), g_circuit_model.fit.fl_hz);
+                format_freq(fh, sizeof(fh), g_circuit_model.fit.fh_hz);
+                snprintf(buf,
+                         sizeof(buf),
+                         "Circuit Model: %s      f0: %s Hz      fL/fH: %s/%s Hz",
+                         model_kind_text(g_circuit_model.fit.model_type),
+                         fc,
+                         fl,
+                         fh);
+            } else {
+                snprintf(buf,
+                         sizeof(buf),
+                         "Circuit Model: %s      f0/fc: %s Hz      H(f): Loaded",
+                         model_kind_text(g_circuit_model.fit.model_type),
+                         fc);
+            }
         } else {
             snprintf(buf,
                      sizeof(buf),

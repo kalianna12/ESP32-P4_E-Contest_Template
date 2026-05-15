@@ -680,6 +680,109 @@ static void compute_band_edges(uint32_t f0_hz, double q, uint32_t *fl_hz, uint32
     *fh_hz = static_cast<uint32_t>(static_cast<double>(f0_hz) * r_high + 0.5);
 }
 
+static uint32_t fallback_mid_freq_hz(uint32_t min_freq, uint32_t max_freq)
+{
+    if (min_freq != 0U && max_freq > min_freq) {
+        return static_cast<uint32_t>(sqrt(static_cast<double>(min_freq) * static_cast<double>(max_freq)) + 0.5);
+    }
+    if (max_freq != 0U) {
+        return max_freq;
+    }
+    if (min_freq != 0U) {
+        return min_freq;
+    }
+    return 1000U;
+}
+
+static uint8_t forced_model_from_shape(const fit_shape_t *shape, const filter_fit_result_t *light_fit)
+{
+    if (light_fit != nullptr && light_fit->valid && light_fit->model_type != MODEL_TYPE_UNKNOWN) {
+        return light_fit->model_type;
+    }
+    if (shape == nullptr) {
+        return MODEL_TYPE_LP1;
+    }
+    if ((shape->candidate_mask & MODEL_MASK_BP2) != 0U) {
+        return MODEL_TYPE_BP2;
+    }
+    if ((shape->candidate_mask & MODEL_MASK_BS2) != 0U) {
+        return MODEL_TYPE_BS2;
+    }
+    if (shape->low_avg > shape->high_avg) {
+        return MODEL_TYPE_LP1;
+    }
+    if (shape->high_avg > shape->low_avg) {
+        return MODEL_TYPE_HP1;
+    }
+    if ((shape->candidate_mask & MODEL_MASK_LP2) != 0U) {
+        return MODEL_TYPE_LP2;
+    }
+    if ((shape->candidate_mask & MODEL_MASK_HP2) != 0U) {
+        return MODEL_TYPE_HP2;
+    }
+    return MODEL_TYPE_LP1;
+}
+
+static uint32_t forced_freq_from_shape(uint8_t model_type,
+                                       const fit_shape_t *shape,
+                                       const filter_fit_result_t *light_fit,
+                                       uint32_t min_freq,
+                                       uint32_t max_freq)
+{
+    if (light_fit != nullptr && light_fit->valid) {
+        const uint32_t f = (light_fit->f0_hz != 0U) ? light_fit->f0_hz : light_fit->fc_hz;
+        if (f != 0U) {
+            return f;
+        }
+    }
+    if (shape != nullptr) {
+        if (model_type == MODEL_TYPE_BP2 && shape->peak_freq != 0U) {
+            return shape->peak_freq;
+        }
+        if (model_type == MODEL_TYPE_BS2 && shape->valley_freq != 0U) {
+            return shape->valley_freq;
+        }
+    }
+    return fallback_mid_freq_hz(min_freq, max_freq);
+}
+
+static void force_non_unknown_fit(heavyfit_output_t *out,
+                                  uint8_t model_type,
+                                  uint32_t freq_hz,
+                                  uint32_t valid_point_count,
+                                  int32_t confidence_x1000)
+{
+    if (out == nullptr) {
+        return;
+    }
+    if (model_type == MODEL_TYPE_UNKNOWN || model_type > MODEL_TYPE_BS2) {
+        model_type = MODEL_TYPE_LP1;
+    }
+    if (freq_hz == 0U) {
+        freq_hz = 1000U;
+    }
+
+    filter_fit_result_t fit = {};
+    fit.valid = true;
+    fit.model_type = model_type;
+    fit.fc_hz = freq_hz;
+    fit.f0_hz = freq_hz;
+    fit.q_x1000 = 707;
+    fit.k_x1000 = 1000;
+    fit.rms_error_x10 = 999;
+    fit.max_error_x10 = 999;
+    fit.confidence_x1000 = clamp_i32(confidence_x1000, 100, 500);
+    fit.valid_point_count = valid_point_count;
+    if (model_type == MODEL_TYPE_BP2 || model_type == MODEL_TYPE_BS2) {
+        compute_band_edges(fit.f0_hz, 0.707, &fit.fl_hz, &fit.fh_hz);
+    }
+
+    out->fit = fit;
+    out->quality = HEAVYFIT_RESULT_HEAVY_LOW_CONF;
+    out->status.filter_type = model_filter_type(model_type);
+    out->status.cutoff_freq_hz = fit.fc_hz;
+}
+
 static fit_shape_t classify_shape(void)
 {
     fit_shape_t shape = {};
@@ -911,6 +1014,12 @@ static void analyze_sweep_response(heavyfit_output_t *out)
                  static_cast<unsigned long>(g_fit_point_count),
                  model_kind_text(out->fit.model_type),
                  static_cast<unsigned long>(now_ms() - analyze_start));
+        const uint8_t forced_model = forced_model_from_shape(&shape, &light_fit);
+        force_non_unknown_fit(out,
+                              forced_model,
+                              forced_freq_from_shape(forced_model, &shape, &light_fit, min_freq, max_freq),
+                              stats.valid_point_count,
+                              200);
         return;
     }
 
@@ -976,6 +1085,14 @@ static void analyze_sweep_response(heavyfit_output_t *out)
         out->quality = HEAVYFIT_RESULT_HEAVY_TIMEOUT;
         out->status.filter_type = light_filter_type;
         out->status.cutoff_freq_hz = light_cutoff_hz;
+        if (!out->fit.valid || out->fit.model_type == MODEL_TYPE_UNKNOWN) {
+            const uint8_t forced_model = forced_model_from_shape(&shape, &light_fit);
+            force_non_unknown_fit(out,
+                                  forced_model,
+                                  forced_freq_from_shape(forced_model, &shape, &light_fit, min_freq, max_freq),
+                                  stats.valid_point_count,
+                                  300);
+        }
         ESP_LOGW(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu candidate_mask=0x%02lx fit_points=%lu selected=%s elapsed_ms=%lu reason=timeout",
                  static_cast<unsigned long>(stats.raw_point_count),
                  static_cast<unsigned long>(stats.valid_point_count),
@@ -1042,17 +1159,24 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     const bool fit_ok = best.valid && best.rms_rel <= rms_limit && confidence >= 420;
     if (!fit_ok) {
         clear_theory_columns(out);
-        out->fit = {};
-        out->quality = HEAVYFIT_RESULT_HEAVY_LOW_CONF;
-        out->status.filter_type = FILTER_TYPE_UNKNOWN;
-        out->status.cutoff_freq_hz = 0;
-        ESP_LOGW(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu outlier=%lu candidate_mask=0x%02lx fit_points=%lu selected=Unknown confidence=%ld elapsed_ms=%lu best=%s second=%s",
+        const uint8_t forced_model = best.valid ?
+            best.model_type : forced_model_from_shape(&shape, &light_fit);
+        const uint32_t forced_freq = best.valid ?
+            static_cast<uint32_t>(best.freq_hz + 0.5) :
+            forced_freq_from_shape(forced_model, &shape, &light_fit, min_freq, max_freq);
+        force_non_unknown_fit(out,
+                              forced_model,
+                              forced_freq,
+                              stats.valid_point_count,
+                              clamp_i32(confidence, 100, 500));
+        ESP_LOGW(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu outlier=%lu candidate_mask=0x%02lx fit_points=%lu selected=%s forced=1 confidence=%ld elapsed_ms=%lu best=%s second=%s",
                  static_cast<unsigned long>(stats.raw_point_count),
                  static_cast<unsigned long>(stats.valid_point_count),
                  static_cast<unsigned long>(stats.rejected_point_count),
                  static_cast<unsigned long>(stats.rejected_outlier_count),
                  static_cast<unsigned long>(stats.candidate_mask),
                  static_cast<unsigned long>(g_fit_point_count),
+                 model_kind_text(out->fit.model_type),
                  static_cast<long>(clamp_i32(confidence, 0, 500)),
                  static_cast<unsigned long>(now_ms() - analyze_start),
                  model_kind_text(best.model_type),
