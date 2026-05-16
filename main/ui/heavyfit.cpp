@@ -48,6 +48,26 @@ constexpr uint32_t kHeavyFitGridCount = 24U;
 #define HEAVYFIT_RESONANT_LP2_PREFER_RMS_PERCENT 125
 #endif
 
+#ifndef HEAVYFIT_LP2_SLOPE_SUPPORT_DB_DEC
+#define HEAVYFIT_LP2_SLOPE_SUPPORT_DB_DEC (-30.0)
+#endif
+
+#ifndef HEAVYFIT_LP2_SLOPE_STRONG_DB_DEC
+#define HEAVYFIT_LP2_SLOPE_STRONG_DB_DEC (-35.0)
+#endif
+
+#ifndef HEAVYFIT_HP2_SLOPE_SUPPORT_DB_DEC
+#define HEAVYFIT_HP2_SLOPE_SUPPORT_DB_DEC 30.0
+#endif
+
+#ifndef HEAVYFIT_ORDER2_SCORE_MARGIN
+#define HEAVYFIT_ORDER2_SCORE_MARGIN 0.35
+#endif
+
+#ifndef HEAVYFIT_ORDER2_SLOPE_PREFER_SCORE_MARGIN
+#define HEAVYFIT_ORDER2_SLOPE_PREFER_SCORE_MARGIN 0.25
+#endif
+
 enum {
     MODEL_MASK_LP1 = 1U << 0,
     MODEL_MASK_HP1 = 1U << 1,
@@ -600,13 +620,34 @@ static double slope_db_per_decade(uint32_t start, uint32_t stop)
     if (start >= stop) {
         return 0.0;
     }
-    const fit_work_point_t *p0 = &g_fit_points[start];
-    const fit_work_point_t *p1 = &g_fit_points[stop];
-    if (p0->freq_d <= 0.0 || p1->freq_d <= p0->freq_d) {
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_xx = 0.0;
+    double sum_xy = 0.0;
+    uint32_t n = 0;
+
+    for (uint32_t i = start; i <= stop; ++i) {
+        const fit_work_point_t *p = &g_fit_points[i];
+        if (p->freq_d <= 0.0 || p->gain <= 0.0) {
+            continue;
+        }
+        const double x = log10(p->freq_d);
+        const double y = gain_db_from_gain(p->gain);
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+        ++n;
+    }
+
+    if (n < 2U) {
         return 0.0;
     }
-    return (gain_db_from_gain(p1->gain) - gain_db_from_gain(p0->gain)) /
-           log10(p1->freq_d / p0->freq_d);
+    const double denom = static_cast<double>(n) * sum_xx - sum_x * sum_x;
+    if (fabs(denom) < 1.0e-9) {
+        return 0.0;
+    }
+    return (static_cast<double>(n) * sum_xy - sum_x * sum_y) / denom;
 }
 
 static int32_t confidence_from_candidate(const fit_candidate_t *best, const fit_candidate_t *second)
@@ -1222,18 +1263,26 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     const double high_slope = slope_db_per_decade((g_fit_point_count * 2U) / 3U, (g_fit_point_count == 0U) ? 0U : (g_fit_point_count - 1U));
     const double low_slope = slope_db_per_decade(0, g_fit_point_count / 3U);
     const bool lp2_much_better = best_by_model[MODEL_TYPE_LP1].valid && best_by_model[MODEL_TYPE_LP2].valid &&
-                                 (best_by_model[MODEL_TYPE_LP1].score - best_by_model[MODEL_TYPE_LP2].score) > 0.35;
+                                 (best_by_model[MODEL_TYPE_LP1].score - best_by_model[MODEL_TYPE_LP2].score) > HEAVYFIT_ORDER2_SCORE_MARGIN;
     const bool hp2_much_better = best_by_model[MODEL_TYPE_HP1].valid && best_by_model[MODEL_TYPE_HP2].valid &&
-                                 (best_by_model[MODEL_TYPE_HP1].score - best_by_model[MODEL_TYPE_HP2].score) > 0.35;
+                                 (best_by_model[MODEL_TYPE_HP1].score - best_by_model[MODEL_TYPE_HP2].score) > HEAVYFIT_ORDER2_SCORE_MARGIN;
     if (best.model_type == MODEL_TYPE_LP2 && best_by_model[MODEL_TYPE_LP1].valid &&
-        (!((high_slope < -30.0) ||
+        (!((high_slope < HEAVYFIT_LP2_SLOPE_SUPPORT_DB_DEC) ||
            (best_by_model[MODEL_TYPE_LP2].q > 0.90) ||
            shape.resonant_low_pass) ||
          !lp2_much_better)) {
         best = best_by_model[MODEL_TYPE_LP1];
     } else if (best.model_type == MODEL_TYPE_HP2 && best_by_model[MODEL_TYPE_HP1].valid &&
-               (!((low_slope > 30.0) || (best_by_model[MODEL_TYPE_HP2].q > 0.90)) || !hp2_much_better)) {
+               (!((low_slope > HEAVYFIT_HP2_SLOPE_SUPPORT_DB_DEC) || (best_by_model[MODEL_TYPE_HP2].q > 0.90)) || !hp2_much_better)) {
         best = best_by_model[MODEL_TYPE_HP1];
+    }
+
+    if (best.model_type == MODEL_TYPE_LP1 &&
+        best_by_model[MODEL_TYPE_LP2].valid &&
+        high_slope < HEAVYFIT_LP2_SLOPE_STRONG_DB_DEC &&
+        best_by_model[MODEL_TYPE_LP2].score <= best.score + HEAVYFIT_ORDER2_SLOPE_PREFER_SCORE_MARGIN) {
+        second = best;
+        best = best_by_model[MODEL_TYPE_LP2];
     }
 
     if (shape.resonant_low_pass && best_by_model[MODEL_TYPE_LP2].valid &&
@@ -1303,7 +1352,7 @@ static void analyze_sweep_response(heavyfit_output_t *out)
                               forced_freq,
                               stats.valid_point_count,
                               clamp_i32(confidence, 100, 500));
-        ESP_LOGW(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu outlier=%lu candidate_mask=0x%02lx fit_points=%lu selected=%s forced=1 confidence=%ld elapsed_ms=%lu best=%s second=%s",
+        ESP_LOGW(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu outlier=%lu candidate_mask=0x%02lx fit_points=%lu selected=%s forced=1 confidence=%ld elapsed_ms=%lu best=%s second=%s slope_low=%.1f slope_high=%.1f",
                  static_cast<unsigned long>(stats.raw_point_count),
                  static_cast<unsigned long>(stats.valid_point_count),
                  static_cast<unsigned long>(stats.rejected_point_count),
@@ -1314,7 +1363,9 @@ static void analyze_sweep_response(heavyfit_output_t *out)
                  static_cast<long>(clamp_i32(confidence, 0, 500)),
                  static_cast<unsigned long>(now_ms() - analyze_start),
                  model_kind_text(best.model_type),
-                 model_kind_text(second.model_type));
+                 model_kind_text(second.model_type),
+                 low_slope,
+                 high_slope);
         return;
     }
 
@@ -1342,7 +1393,7 @@ static void analyze_sweep_response(heavyfit_output_t *out)
         out->status.error_x10 = out->error_x10[out->point_count - 1U];
     }
 
-    ESP_LOGI(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu outlier=%lu low_vin=%lu nonmono=%lu candidate_mask=0x%02lx fit_points=%lu selected=%s fc_hz=%lu confidence=%ld elapsed_ms=%lu second=%s K=%.3f Q=%.3f rms=%.2f%% max=%.2f%%",
+    ESP_LOGI(TAG, "FIT summary: raw=%lu valid=%lu rejected=%lu outlier=%lu low_vin=%lu nonmono=%lu candidate_mask=0x%02lx fit_points=%lu selected=%s fc_hz=%lu confidence=%ld elapsed_ms=%lu second=%s K=%.3f Q=%.3f rms=%.2f%% max=%.2f%% slope_low=%.1f slope_high=%.1f",
              static_cast<unsigned long>(stats.raw_point_count),
              static_cast<unsigned long>(stats.valid_point_count),
              static_cast<unsigned long>(stats.rejected_point_count),
@@ -1359,7 +1410,9 @@ static void analyze_sweep_response(heavyfit_output_t *out)
              best.k,
              best.q,
              best.rms_rel * 100.0,
-             best.max_rel * 100.0);
+             best.max_rel * 100.0,
+             low_slope,
+             high_slope);
 }
 
 static void HeavyFit_Task(void *arg)
