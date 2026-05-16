@@ -29,7 +29,8 @@ constexpr uint32_t kAmdfLagMaxCeil = 2000U;
 constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
 constexpr uint32_t kMaxLockedHarmonics = 100U;
-constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
+constexpr uint32_t kReconDdsSynthesisRateHz = 100000U;
+constexpr uint32_t kReconDdsTransmitSampleRateHz = 125000U;
 constexpr uint32_t kYieldEveryBins = 16U;
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
@@ -938,8 +939,8 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
 
     uint32_t cycles = static_cast<uint32_t>(
         ((static_cast<uint64_t>(out->dominant_freq_hz) * dst_n) +
-         (kReconDdsPlaybackRateHz / 2U)) /
-        kReconDdsPlaybackRateHz);
+         (kReconDdsSynthesisRateHz / 2U)) /
+        kReconDdsSynthesisRateHz);
     if (cycles == 0U) {
         cycles = 1U;
     }
@@ -982,7 +983,7 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
     }
 
     if (playback_sample_rate_hz != nullptr) {
-        *playback_sample_rate_hz = kReconDdsPlaybackRateHz;
+        *playback_sample_rate_hz = kReconDdsTransmitSampleRateHz;
     }
     return true;
 }
@@ -1115,7 +1116,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     if (BuildPeriodicWaveFromHarmonics(out, w->synth, kOutN, &playback_sample_rate_hz)) {
         output_src = w->synth;
         output_count = kOutN;
-        out->sample_rate_hz = kReconDdsPlaybackRateHz;
+        out->sample_rate_hz = kReconDdsTransmitSampleRateHz;
     } else
 #endif
     {
@@ -1130,7 +1131,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
         }
         MakeLoopContinuous(w->tr, output_count);
         output_src = w->tr;
-        out->sample_rate_hz = kReconDdsPlaybackRateHz;
+        out->sample_rate_hz = kReconDdsTransmitSampleRateHz;
     }
 
 #if ESP_RECON_OUTPUT_SMOOTH_ENABLE
