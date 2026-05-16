@@ -29,7 +29,7 @@ constexpr uint32_t kAmdfLagMaxCeil = 2000U;
 constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
 constexpr uint32_t kMaxLockedHarmonics = 20U;
-constexpr uint32_t kOutputCycles = 16U;
+constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 constexpr uint32_t kYieldEveryBins = 16U;
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
@@ -49,6 +49,7 @@ struct Work {
     float tr[kN];
     float synth[kOutN];
     int16_t wave[kOutN];
+    int16_t clean_capture[kN];
 };
 
 static Work *AllocWork()
@@ -155,6 +156,68 @@ static int32_t MeanOfWindow(const int16_t *capture, uint32_t n)
         sum += capture[i];
     }
     return static_cast<int32_t>(sum / static_cast<int64_t>(n));
+}
+
+static int16_t Median3(int16_t a, int16_t b, int16_t c)
+{
+    if (a > b) {
+        const int16_t t = a;
+        a = b;
+        b = t;
+    }
+    if (b > c) {
+        const int16_t t = b;
+        b = c;
+        c = t;
+    }
+    if (a > b) {
+        const int16_t t = a;
+        a = b;
+        b = t;
+    }
+    return b;
+}
+
+static int32_t EstimateRms(const int16_t *capture, uint32_t n, int32_t mean)
+{
+    if (capture == nullptr || n == 0U) {
+        return 0;
+    }
+
+    uint64_t sum_sq = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const int32_t d = static_cast<int32_t>(capture[i]) - mean;
+        sum_sq += static_cast<uint64_t>(d * d);
+    }
+    return static_cast<int32_t>(sqrtf(static_cast<float>(sum_sq) / static_cast<float>(n)));
+}
+
+static void BuildCleanCapture(const int16_t *capture,
+                              uint32_t n,
+                              int32_t mean,
+                              int16_t *clean)
+{
+    if (capture == nullptr || clean == nullptr || n == 0U) {
+        return;
+    }
+
+    memcpy(clean, capture, n * sizeof(clean[0]));
+    if (n < 3U) {
+        return;
+    }
+
+    const int32_t rms = EstimateRms(capture, n, mean);
+    const int32_t spike_threshold = rms * 4;
+
+    for (uint32_t i = 1; i + 1U < n; ++i) {
+        const int16_t median = Median3(clean[i - 1U], clean[i], clean[i + 1U]);
+        const int32_t diff = static_cast<int32_t>(clean[i]) - static_cast<int32_t>(median);
+        const int32_t abs_diff = (diff < 0) ? -diff : diff;
+        if (abs_diff > spike_threshold) {
+            clean[i] = static_cast<int16_t>(
+                (static_cast<int32_t>(clean[i - 1U]) + static_cast<int32_t>(clean[i + 1U])) / 2);
+        }
+    }
 }
 
 static float AmdfScore(const int16_t *capture, uint32_t n, int32_t mean, uint32_t lag)
@@ -712,7 +775,13 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
         return false;
     }
 
-    const uint32_t cycles = kOutputCycles;
+    uint32_t cycles = static_cast<uint32_t>(
+        ((static_cast<uint64_t>(out->dominant_freq_hz) * dst_n) +
+         (kReconDdsPlaybackRateHz / 2U)) /
+        kReconDdsPlaybackRateHz);
+    if (cycles == 0U) {
+        cycles = 1U;
+    }
     if (cycles >= dst_n / 2U) {
         return false;
     }
@@ -752,9 +821,7 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
     }
 
     if (playback_sample_rate_hz != nullptr) {
-        *playback_sample_rate_hz = static_cast<uint32_t>(
-            (static_cast<uint64_t>(dst_n) * out->dominant_freq_hz + cycles / 2U) /
-            cycles);
+        *playback_sample_rate_hz = kReconDdsPlaybackRateHz;
     }
     return true;
 }
@@ -788,17 +855,19 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     uint32_t locked_use_n = 0U;
     float amdf_best = 0.0f;
 
+    BuildCleanCapture(capture, sample_count, out->cap_mean, w->clean_capture);
+
 #if ESP_RECON_STAGE == 0
     for (uint32_t i = 0; i < sample_count; ++i) {
-        w->tr[i] = static_cast<float>(capture[i] - out->cap_mean);
+        w->tr[i] = static_cast<float>(w->clean_capture[i] - out->cap_mean);
     }
     out->dominant_bin = 0;
     out->dominant_freq_hz = 0;
 #else
-    locked_period = EstimatePeriodByAmdf(capture, sample_count, sample_rate_hz,
+    locked_period = EstimatePeriodByAmdf(w->clean_capture, sample_count, sample_rate_hz,
                                          out->cap_mean, &amdf_best);
     if (locked_period != 0U) {
-        locked_harmonics = ExtractLockedHarmonics(capture, sample_count,
+        locked_harmonics = ExtractLockedHarmonics(w->clean_capture, sample_count,
                                                   sample_rate_hz, locked_period,
                                                   model, out, &locked_use_n);
     }
@@ -810,13 +879,13 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
                  static_cast<double>(amdf_best));
 #if ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
         for (uint32_t i = 0; i < sample_count; ++i) {
-            w->tr[i] = static_cast<float>(capture[i] - out->cap_mean);
+            w->tr[i] = static_cast<float>(w->clean_capture[i] - out->cap_mean);
         }
         out->dominant_bin = 0U;
         out->dominant_freq_hz = 0U;
         out->harmonic_count = 0U;
 #else
-        ForwardDft(capture, sample_count, out->cap_mean, w);
+        ForwardDft(w->clean_capture, sample_count, out->cap_mean, w);
         out->dominant_bin = DominantBin(w, sample_count);
         const float fundamental_bin = RefinePeakBin(w, sample_count, out->dominant_bin);
         out->dominant_freq_hz = static_cast<uint32_t>(
@@ -869,7 +938,6 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
     uint32_t playback_sample_rate_hz = sample_rate_hz;
-    constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 #if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE && ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
     if (BuildPeriodicWaveFromHarmonics(out, w->synth, kOutN, &playback_sample_rate_hz)) {
         output_src = w->synth;
@@ -879,9 +947,9 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
 #endif
     {
         if (locked_harmonics && locked_use_n != 0U) {
-            const int32_t locked_mean = MeanOfWindow(capture, locked_use_n);
+            const int32_t locked_mean = MeanOfWindow(w->clean_capture, locked_use_n);
             for (uint32_t i = 0; i < locked_use_n; ++i) {
-                w->tr[i] = static_cast<float>(capture[i] - locked_mean);
+                w->tr[i] = static_cast<float>(w->clean_capture[i] - locked_mean);
             }
             output_count = locked_use_n;
         } else {
