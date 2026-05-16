@@ -44,7 +44,7 @@ constexpr size_t kFrameLen = 128;
 constexpr size_t kChecksumOffset = 116;
 constexpr uint32_t kMaxSampleCount = 4096;
 constexpr uint32_t kDefaultSampleCount = 4096;
-constexpr uint32_t kDefaultSampleRateHz = 125000;
+constexpr uint32_t kDefaultSampleRateHz = 100000;
 constexpr uint32_t kSamplesPerChunk = 30;
 
 spi_device_handle_t g_dds_spi = nullptr;

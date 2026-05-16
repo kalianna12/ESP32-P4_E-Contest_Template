@@ -598,9 +598,9 @@ static const char *recon_mode_name(esp_recon_mode_t mode)
 {
     switch (mode) {
     case ESP_RECON_MODE_AUTO: return "AUTO";
-    case ESP_RECON_MODE_SQUARE: return "SQUARE";
+    case ESP_RECON_MODE_SQUARE: return "SQ/TRI";
     case ESP_RECON_MODE_ARB: return "ARB";
-    case ESP_RECON_MODE_TRI_SINE: return "TRI/SINE";
+    case ESP_RECON_MODE_TRI_SINE: return "SINE";
     default: return "?";
     }
 }
@@ -2442,7 +2442,7 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_esp_recon = create_button(screen, "ESP RECON", 164, 178, 150);
     lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 334, 178, 95);
     lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 449, 178, 95);
-    g_adv_mode_btn = create_button(screen, "MODE AUTO", 564, 214, 160);
+    g_adv_mode_btn = create_button(screen, "MODE AUTO", 744, 178, 160);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_esp_recon, adv_esp_recon_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
@@ -3623,6 +3623,11 @@ static void create_harmonic_table_page(void)
     lv_obj_set_style_bg_opa(g_adv_harmonic_table, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(g_adv_harmonic_table, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
     lv_obj_set_style_border_width(g_adv_harmonic_table, 1, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_adv_harmonic_table, lv_color_hex(COLOR_PANEL), LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(g_adv_harmonic_table, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_border_color(g_adv_harmonic_table, lv_color_hex(COLOR_LINE), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(g_adv_harmonic_table, 1, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(g_adv_harmonic_table, lv_color_hex(COLOR_TEXT), LV_PART_ITEMS);
     lv_obj_set_style_pad_left(g_adv_harmonic_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(g_adv_harmonic_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_top(g_adv_harmonic_table, 3, LV_PART_ITEMS);
