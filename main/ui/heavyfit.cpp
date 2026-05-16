@@ -40,6 +40,14 @@ constexpr uint32_t kHeavyFitGridCount = 24U;
 #define HEAVYFIT_BAND_PREFER_RMS_PERCENT 120
 #endif
 
+#ifndef HEAVYFIT_BANDPASS_EDGE_MAX_PERCENT
+#define HEAVYFIT_BANDPASS_EDGE_MAX_PERCENT 75
+#endif
+
+#ifndef HEAVYFIT_RESONANT_LP2_PREFER_RMS_PERCENT
+#define HEAVYFIT_RESONANT_LP2_PREFER_RMS_PERCENT 125
+#endif
+
 enum {
     MODEL_MASK_LP1 = 1U << 0,
     MODEL_MASK_HP1 = 1U << 1,
@@ -82,6 +90,9 @@ typedef struct {
     uint32_t valley_freq;
     bool low_high_low;
     bool high_low_high;
+    bool true_band_pass;
+    bool true_band_stop;
+    bool resonant_low_pass;
 } fit_shape_t;
 
 typedef struct {
@@ -897,6 +908,26 @@ static fit_shape_t classify_shape(void)
             static_cast<uint64_t>(edge_mid_lo) * 100ULL;
     shape.low_high_low = peak_in_middle && (edge_prominent_peak || mid_prominent_peak);
     shape.high_low_high = valley_in_middle && (edge_prominent_valley || mid_prominent_valley);
+    const bool low_edge_low_for_bp =
+        shape.peak_gain != 0U &&
+        static_cast<uint64_t>(shape.low_avg) * 100ULL <
+            static_cast<uint64_t>(shape.peak_gain) * HEAVYFIT_BANDPASS_EDGE_MAX_PERCENT;
+    const bool high_edge_low_for_bp =
+        shape.peak_gain != 0U &&
+        static_cast<uint64_t>(shape.high_avg) * 100ULL <
+            static_cast<uint64_t>(shape.peak_gain) * HEAVYFIT_BANDPASS_EDGE_MAX_PERCENT;
+    shape.true_band_pass = shape.low_high_low && low_edge_low_for_bp && high_edge_low_for_bp;
+    shape.true_band_stop =
+        shape.high_low_high &&
+        shape.valley_gain != 0U &&
+        static_cast<uint64_t>(shape.low_avg) * 100ULL >
+            static_cast<uint64_t>(shape.valley_gain) * HEAVYFIT_BAND_EDGE_PROMINENCE_PERCENT &&
+        static_cast<uint64_t>(shape.high_avg) * 100ULL >
+            static_cast<uint64_t>(shape.valley_gain) * HEAVYFIT_BAND_EDGE_PROMINENCE_PERCENT;
+    shape.resonant_low_pass =
+        shape.low_high_low && !low_edge_low_for_bp &&
+        static_cast<uint64_t>(shape.low_avg) * 100ULL >
+            static_cast<uint64_t>(shape.high_avg) * 115ULL;
 
     if (static_cast<uint64_t>(shape.low_avg) * 100ULL > static_cast<uint64_t>(shape.high_avg) * 125ULL) {
         shape.candidate_mask |= MODEL_MASK_LP;
@@ -904,17 +935,20 @@ static fit_shape_t classify_shape(void)
     if (static_cast<uint64_t>(shape.high_avg) * 100ULL > static_cast<uint64_t>(shape.low_avg) * 125ULL) {
         shape.candidate_mask |= MODEL_MASK_HP;
     }
-    if (shape.low_high_low) {
+    if (shape.resonant_low_pass) {
+        shape.candidate_mask |= MODEL_MASK_LP2;
+    }
+    if (shape.true_band_pass) {
         shape.candidate_mask |= MODEL_MASK_BP2;
     }
-    if (shape.high_low_high) {
+    if (shape.true_band_stop) {
         shape.candidate_mask |= MODEL_MASK_BS2;
     }
     if (first_count >= 3U && mid_count >= 3U && last_count >= 3U) {
-        if (mid_prominent_peak) {
+        if (mid_prominent_peak && shape.true_band_pass) {
             shape.candidate_mask |= MODEL_MASK_BP2;
         }
-        if (mid_prominent_valley) {
+        if (mid_prominent_valley && shape.true_band_stop) {
             shape.candidate_mask |= MODEL_MASK_BS2;
         }
     }
@@ -1045,7 +1079,7 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     fit_shape_t shape = classify_shape();
     stats.candidate_mask = shape.candidate_mask;
     ESP_LOGI(TAG,
-             "FIT shape: low=%lu high=%lu peak=%lu@%lu valley=%lu@%lu low_high_low=%u high_low_high=%u mask=0x%02lx outlier=%d..%d%% band_pref=%d%%",
+             "FIT shape: low=%lu high=%lu peak=%lu@%lu valley=%lu@%lu low_high_low=%u high_low_high=%u bp=%u bs=%u res_lp2=%u mask=0x%02lx outlier=%d..%d%% band_pref=%d%%",
              static_cast<unsigned long>(shape.low_avg),
              static_cast<unsigned long>(shape.high_avg),
              static_cast<unsigned long>(shape.peak_gain),
@@ -1054,6 +1088,9 @@ static void analyze_sweep_response(heavyfit_output_t *out)
              static_cast<unsigned long>(shape.valley_freq),
              shape.low_high_low ? 1U : 0U,
              shape.high_low_high ? 1U : 0U,
+             shape.true_band_pass ? 1U : 0U,
+             shape.true_band_stop ? 1U : 0U,
+             shape.resonant_low_pass ? 1U : 0U,
              static_cast<unsigned long>(shape.candidate_mask),
              HEAVYFIT_OUTLIER_LOW_PERCENT,
              HEAVYFIT_OUTLIER_HIGH_PERCENT,
@@ -1102,7 +1139,7 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     const uint32_t fit_start = now_ms();
     const double log_min = log10(static_cast<double>(min_freq));
     const double log_max = log10(static_cast<double>(max_freq));
-    static const double q_values[] = {0.50, 0.707, 1.00, 1.60};
+    static const double q_values[] = {0.50, 0.707, 1.00, 1.60, 2.50, 4.00};
     bool timed_out = false;
 
     for (uint32_t n = 0; n < kHeavyFitGridCount && !timed_out && !g_cancel; ++n) {
@@ -1189,15 +1226,28 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     const bool hp2_much_better = best_by_model[MODEL_TYPE_HP1].valid && best_by_model[MODEL_TYPE_HP2].valid &&
                                  (best_by_model[MODEL_TYPE_HP1].score - best_by_model[MODEL_TYPE_HP2].score) > 0.35;
     if (best.model_type == MODEL_TYPE_LP2 && best_by_model[MODEL_TYPE_LP1].valid &&
-        (!((high_slope < -30.0) || (best_by_model[MODEL_TYPE_LP2].q > 0.90)) || !lp2_much_better)) {
+        (!((high_slope < -30.0) ||
+           (best_by_model[MODEL_TYPE_LP2].q > 0.90) ||
+           shape.resonant_low_pass) ||
+         !lp2_much_better)) {
         best = best_by_model[MODEL_TYPE_LP1];
     } else if (best.model_type == MODEL_TYPE_HP2 && best_by_model[MODEL_TYPE_HP1].valid &&
                (!((low_slope > 30.0) || (best_by_model[MODEL_TYPE_HP2].q > 0.90)) || !hp2_much_better)) {
         best = best_by_model[MODEL_TYPE_HP1];
     }
 
+    if (shape.resonant_low_pass && best_by_model[MODEL_TYPE_LP2].valid &&
+        (!best.valid ||
+         best_by_model[MODEL_TYPE_LP2].rms_rel * 100.0 <=
+             best.rms_rel * static_cast<double>(HEAVYFIT_RESONANT_LP2_PREFER_RMS_PERCENT))) {
+        if (best.valid && best.model_type != MODEL_TYPE_LP2) {
+            second = best;
+        }
+        best = best_by_model[MODEL_TYPE_LP2];
+    }
+
 #if HEAVYFIT_ENABLE_BAND_SHAPE_PRIOR
-    if (shape.low_high_low && best_by_model[MODEL_TYPE_BP2].valid &&
+    if (shape.true_band_pass && best_by_model[MODEL_TYPE_BP2].valid &&
         (!best.valid ||
          best_by_model[MODEL_TYPE_BP2].rms_rel * 100.0 <=
              best.rms_rel * static_cast<double>(HEAVYFIT_BAND_PREFER_RMS_PERCENT))) {
@@ -1206,7 +1256,7 @@ static void analyze_sweep_response(heavyfit_output_t *out)
         }
         best = best_by_model[MODEL_TYPE_BP2];
     }
-    if (shape.high_low_high && best_by_model[MODEL_TYPE_BS2].valid &&
+    if (shape.true_band_stop && best_by_model[MODEL_TYPE_BS2].valid &&
         (!best.valid ||
          best_by_model[MODEL_TYPE_BS2].rms_rel * 100.0 <=
              best.rms_rel * static_cast<double>(HEAVYFIT_BAND_PREFER_RMS_PERCENT))) {
