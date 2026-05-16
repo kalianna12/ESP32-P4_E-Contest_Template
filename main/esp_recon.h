@@ -13,6 +13,10 @@ extern "C" {
 #define ESP_RECON_SAMPLE_COUNT 1024U
 #endif
 
+#ifndef ESP_RECON_OUTPUT_SAMPLE_COUNT
+#define ESP_RECON_OUTPUT_SAMPLE_COUNT 4096U
+#endif
+
 // 0: time-domain de-mean + normalize only.
 // 1: DFT/IFFT, magnitude compensation only; keep captured phase. Recommended first.
 // 2: DFT/IFFT, magnitude + phase compensation.
@@ -24,7 +28,9 @@ extern "C" {
 #define ESP_RECON_TARGET_PEAK 8000
 #endif
 
-#define ESP_RECON_HARMONIC_MAX 8U
+#ifndef ESP_RECON_HARMONIC_MAX
+#define ESP_RECON_HARMONIC_MAX 20U
+#endif
 
 typedef struct {
     uint32_t index;
@@ -36,7 +42,7 @@ typedef struct {
 } esp_recon_harmonic_t;
 
 typedef struct {
-    int16_t samples[ESP_RECON_SAMPLE_COUNT];
+    int16_t samples[ESP_RECON_OUTPUT_SAMPLE_COUNT];
     uint32_t sample_count;
     uint32_t sample_rate_hz;
     int32_t cap_min;

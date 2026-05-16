@@ -38,7 +38,8 @@ constexpr uint8_t kMagic1 = 0x5A;
 constexpr uint8_t kPayloadLen = 112;
 constexpr size_t kFrameLen = 128;
 constexpr size_t kChecksumOffset = 116;
-constexpr uint32_t kDefaultSampleCount = 1024;
+constexpr uint32_t kMaxSampleCount = 4096;
+constexpr uint32_t kDefaultSampleCount = 4096;
 constexpr uint32_t kDefaultSampleRateHz = 100000;
 constexpr uint32_t kSamplesPerChunk = 30;
 
@@ -384,7 +385,7 @@ bool DdsDirect_Init(void)
 
 bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t sample_rate_hz)
 {
-    if (samples == nullptr || sample_count == 0U || sample_count > 1024U) {
+    if (samples == nullptr || sample_count == 0U || sample_count > kMaxSampleCount) {
         ESP_LOGE(TAG, "Invalid wave: samples=%p count=%lu", samples,
                  static_cast<unsigned long>(sample_count));
         return false;

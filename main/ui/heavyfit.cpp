@@ -16,6 +16,30 @@ constexpr uint32_t kHeavyFitTimeBudgetMs = 10000U;
 constexpr uint32_t kHeavyFitMaxSamples = 300U;
 constexpr uint32_t kHeavyFitGridCount = 24U;
 
+#ifndef HEAVYFIT_ENABLE_BAND_SHAPE_PRIOR
+#define HEAVYFIT_ENABLE_BAND_SHAPE_PRIOR 1
+#endif
+
+#ifndef HEAVYFIT_OUTLIER_LOW_PERCENT
+#define HEAVYFIT_OUTLIER_LOW_PERCENT 45
+#endif
+
+#ifndef HEAVYFIT_OUTLIER_HIGH_PERCENT
+#define HEAVYFIT_OUTLIER_HIGH_PERCENT 220
+#endif
+
+#ifndef HEAVYFIT_BAND_EDGE_PROMINENCE_PERCENT
+#define HEAVYFIT_BAND_EDGE_PROMINENCE_PERCENT 110
+#endif
+
+#ifndef HEAVYFIT_BAND_MID_PROMINENCE_PERCENT
+#define HEAVYFIT_BAND_MID_PROMINENCE_PERCENT 106
+#endif
+
+#ifndef HEAVYFIT_BAND_PREFER_RMS_PERCENT
+#define HEAVYFIT_BAND_PREFER_RMS_PERCENT 120
+#endif
+
 enum {
     MODEL_MASK_LP1 = 1U << 0,
     MODEL_MASK_HP1 = 1U << 1,
@@ -56,6 +80,8 @@ typedef struct {
     uint32_t peak_freq;
     uint32_t valley_gain;
     uint32_t valley_freq;
+    bool low_high_low;
+    bool high_low_high;
 } fit_shape_t;
 
 typedef struct {
@@ -310,8 +336,8 @@ static fit_reject_reason_t fit_point_reject_reason_strict(uint32_t index)
         if (median_gain > 0) {
             const int64_t gain = p->gain_x1000;
             const int64_t median = median_gain;
-            if (gain * 100LL < median * 60LL ||
-                gain * 100LL > median * 140LL) {
+            if (gain * 100LL < median * HEAVYFIT_OUTLIER_LOW_PERCENT ||
+                gain * 100LL > median * HEAVYFIT_OUTLIER_HIGH_PERCENT) {
                 return FIT_REJECT_OUTLIER;
             }
         }
@@ -847,25 +873,48 @@ static fit_shape_t classify_shape(void)
     const uint32_t edge_mid_lo = (first_avg < last_avg) ? first_avg : last_avg;
     const uint32_t edge_hi = (shape.low_avg > shape.high_avg) ? shape.low_avg : shape.high_avg;
     const uint32_t edge_lo = (shape.low_avg < shape.high_avg) ? shape.low_avg : shape.high_avg;
+    const bool peak_in_middle =
+        peak_pos > (shape.valid_count / 5U) && peak_pos < ((shape.valid_count * 4U) / 5U);
+    const bool valley_in_middle =
+        valley_pos > (shape.valid_count / 5U) && valley_pos < ((shape.valid_count * 4U) / 5U);
+    const bool edge_prominent_peak =
+        edge_hi != 0U &&
+        static_cast<uint64_t>(shape.peak_gain) * 100ULL >
+            static_cast<uint64_t>(edge_hi) * HEAVYFIT_BAND_EDGE_PROMINENCE_PERCENT;
+    const bool edge_prominent_valley =
+        edge_lo != 0U &&
+        static_cast<uint64_t>(shape.valley_gain) * HEAVYFIT_BAND_EDGE_PROMINENCE_PERCENT <
+            static_cast<uint64_t>(edge_lo) * 100ULL;
+    const bool mid_prominent_peak =
+        first_count >= 3U && mid_count >= 3U && last_count >= 3U &&
+        edge_mid_hi != 0U &&
+        static_cast<uint64_t>(mid_avg) * 100ULL >
+            static_cast<uint64_t>(edge_mid_hi) * HEAVYFIT_BAND_MID_PROMINENCE_PERCENT;
+    const bool mid_prominent_valley =
+        first_count >= 3U && mid_count >= 3U && last_count >= 3U &&
+        edge_mid_lo != 0U &&
+        static_cast<uint64_t>(mid_avg) * HEAVYFIT_BAND_MID_PROMINENCE_PERCENT <
+            static_cast<uint64_t>(edge_mid_lo) * 100ULL;
+    shape.low_high_low = peak_in_middle && (edge_prominent_peak || mid_prominent_peak);
+    shape.high_low_high = valley_in_middle && (edge_prominent_valley || mid_prominent_valley);
+
     if (static_cast<uint64_t>(shape.low_avg) * 100ULL > static_cast<uint64_t>(shape.high_avg) * 125ULL) {
         shape.candidate_mask |= MODEL_MASK_LP;
     }
     if (static_cast<uint64_t>(shape.high_avg) * 100ULL > static_cast<uint64_t>(shape.low_avg) * 125ULL) {
         shape.candidate_mask |= MODEL_MASK_HP;
     }
-    if (peak_pos > (shape.valid_count / 5U) && peak_pos < ((shape.valid_count * 4U) / 5U) &&
-        static_cast<uint64_t>(shape.peak_gain) * 100ULL > static_cast<uint64_t>(edge_hi) * 112ULL) {
+    if (shape.low_high_low) {
         shape.candidate_mask |= MODEL_MASK_BP2;
     }
-    if (valley_pos > (shape.valid_count / 5U) && valley_pos < ((shape.valid_count * 4U) / 5U) &&
-        static_cast<uint64_t>(shape.valley_gain) * 112ULL < static_cast<uint64_t>(edge_lo) * 100ULL) {
+    if (shape.high_low_high) {
         shape.candidate_mask |= MODEL_MASK_BS2;
     }
     if (first_count >= 3U && mid_count >= 3U && last_count >= 3U) {
-        if (static_cast<uint64_t>(mid_avg) * 100ULL > static_cast<uint64_t>(edge_mid_hi) * 108ULL) {
+        if (mid_prominent_peak) {
             shape.candidate_mask |= MODEL_MASK_BP2;
         }
-        if (static_cast<uint64_t>(mid_avg) * 108ULL < static_cast<uint64_t>(edge_mid_lo) * 100ULL) {
+        if (mid_prominent_valley) {
             shape.candidate_mask |= MODEL_MASK_BS2;
         }
     }
@@ -995,6 +1044,20 @@ static void analyze_sweep_response(heavyfit_output_t *out)
     build_fit_work_points();
     fit_shape_t shape = classify_shape();
     stats.candidate_mask = shape.candidate_mask;
+    ESP_LOGI(TAG,
+             "FIT shape: low=%lu high=%lu peak=%lu@%lu valley=%lu@%lu low_high_low=%u high_low_high=%u mask=0x%02lx outlier=%d..%d%% band_pref=%d%%",
+             static_cast<unsigned long>(shape.low_avg),
+             static_cast<unsigned long>(shape.high_avg),
+             static_cast<unsigned long>(shape.peak_gain),
+             static_cast<unsigned long>(shape.peak_freq),
+             static_cast<unsigned long>(shape.valley_gain),
+             static_cast<unsigned long>(shape.valley_freq),
+             shape.low_high_low ? 1U : 0U,
+             shape.high_low_high ? 1U : 0U,
+             static_cast<unsigned long>(shape.candidate_mask),
+             HEAVYFIT_OUTLIER_LOW_PERCENT,
+             HEAVYFIT_OUTLIER_HIGH_PERCENT,
+             HEAVYFIT_BAND_PREFER_RMS_PERCENT);
 
     uint32_t min_freq = 0;
     uint32_t max_freq = 0;
@@ -1132,6 +1195,27 @@ static void analyze_sweep_response(heavyfit_output_t *out)
                (!((low_slope > 30.0) || (best_by_model[MODEL_TYPE_HP2].q > 0.90)) || !hp2_much_better)) {
         best = best_by_model[MODEL_TYPE_HP1];
     }
+
+#if HEAVYFIT_ENABLE_BAND_SHAPE_PRIOR
+    if (shape.low_high_low && best_by_model[MODEL_TYPE_BP2].valid &&
+        (!best.valid ||
+         best_by_model[MODEL_TYPE_BP2].rms_rel * 100.0 <=
+             best.rms_rel * static_cast<double>(HEAVYFIT_BAND_PREFER_RMS_PERCENT))) {
+        if (best.valid && best.model_type != MODEL_TYPE_BP2) {
+            second = best;
+        }
+        best = best_by_model[MODEL_TYPE_BP2];
+    }
+    if (shape.high_low_high && best_by_model[MODEL_TYPE_BS2].valid &&
+        (!best.valid ||
+         best_by_model[MODEL_TYPE_BS2].rms_rel * 100.0 <=
+             best.rms_rel * static_cast<double>(HEAVYFIT_BAND_PREFER_RMS_PERCENT))) {
+        if (best.valid && best.model_type != MODEL_TYPE_BS2) {
+            second = best;
+        }
+        best = best_by_model[MODEL_TYPE_BS2];
+    }
+#endif
 
     int32_t confidence = confidence_from_candidate(&best, &second);
     const bool same_family_ambiguous =

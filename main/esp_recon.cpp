@@ -14,11 +14,20 @@ namespace {
 
 constexpr char TAG[] = "EspRecon";
 constexpr uint32_t kN = ESP_RECON_SAMPLE_COUNT;
+constexpr uint32_t kOutN = ESP_RECON_OUTPUT_SAMPLE_COUNT;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kTwoPi = 2.0f * kPi;
 constexpr float kMinGain = 0.05f;
 constexpr float kMaxInvGain = 16.0f;
 constexpr uint32_t kYieldEveryBins = 16U;
+
+#ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
+#define ESP_RECON_HARMONIC_SEARCH_SPAN 3U
+#endif
+
+#ifndef ESP_RECON_PERIODIC_SYNTH_ENABLE
+#define ESP_RECON_PERIODIC_SYNTH_ENABLE 1
+#endif
 
 static esp_recon_harmonic_t g_last_harmonics[ESP_RECON_HARMONIC_MAX] = {};
 static uint32_t g_last_harmonic_count = 0;
@@ -27,7 +36,8 @@ struct Work {
     float xr[kN];
     float xi[kN];
     float tr[kN];
-    int16_t wave[kN];
+    float synth[kOutN];
+    int16_t wave[kOutN];
 };
 
 static Work *AllocWork()
@@ -122,7 +132,7 @@ static void MakeLoopContinuous(float *x, uint32_t n)
         return;
     }
 
-    // The DAC repeats the 1024-point RAM forever. If the captured/rebuilt
+    // The DAC repeats the arbitrary-wave RAM forever. If the captured/rebuilt
     // frame does not contain an integer number of periods, sample[n-1] jumps
     // back to sample[0] at wrap and the scope shows a notch. Remove the linear
     // end-to-start mismatch first.
@@ -265,39 +275,90 @@ static uint32_t DominantBin(const Work *w, uint32_t n)
     return best;
 }
 
-static void LogHarmonics(const Work *w, uint32_t n, uint32_t sample_rate_hz, esp_recon_result_t *out)
+static float BinMag(const Work *w, uint32_t bin)
 {
-    uint32_t top_bin[8] = {};
-    float top_mag[8] = {};
-    for (uint32_t k = 1; k < n / 2U; ++k) {
-        const float mag = sqrtf(w->xr[k] * w->xr[k] + w->xi[k] * w->xi[k]) * 2.0f / static_cast<float>(n);
-        for (uint32_t s = 0; s < 8U; ++s) {
-            if (mag > top_mag[s]) {
-                for (uint32_t j = 7U; j > s; --j) {
-                    top_mag[j] = top_mag[j - 1U];
-                    top_bin[j] = top_bin[j - 1U];
-                }
-                top_mag[s] = mag;
-                top_bin[s] = k;
-                break;
-            }
+    return sqrtf(w->xr[bin] * w->xr[bin] + w->xi[bin] * w->xi[bin]);
+}
+
+static float RefinePeakBin(const Work *w, uint32_t n, uint32_t bin)
+{
+    if (bin <= 1U || bin + 1U >= n / 2U) {
+        return static_cast<float>(bin);
+    }
+    const float ym1 = BinMag(w, bin - 1U);
+    const float y0 = BinMag(w, bin);
+    const float yp1 = BinMag(w, bin + 1U);
+    const float denom = ym1 - 2.0f * y0 + yp1;
+    if (fabsf(denom) < 1.0e-6f) {
+        return static_cast<float>(bin);
+    }
+    float delta = 0.5f * (ym1 - yp1) / denom;
+    if (delta > 0.5f) {
+        delta = 0.5f;
+    } else if (delta < -0.5f) {
+        delta = -0.5f;
+    }
+    return static_cast<float>(bin) + delta;
+}
+
+static uint32_t FindLocalPeakBin(const Work *w, uint32_t n, float expected_bin)
+{
+    const uint32_t nyquist = n / 2U;
+    int32_t center = static_cast<int32_t>(lrintf(expected_bin));
+    if (center < 1) {
+        center = 1;
+    }
+    const int32_t span = static_cast<int32_t>(ESP_RECON_HARMONIC_SEARCH_SPAN);
+    int32_t start = center - span;
+    int32_t stop = center + span;
+    if (start < 1) {
+        start = 1;
+    }
+    if (stop >= static_cast<int32_t>(nyquist)) {
+        stop = static_cast<int32_t>(nyquist) - 1;
+    }
+
+    uint32_t best = static_cast<uint32_t>(start);
+    float best_mag = -1.0f;
+    for (int32_t k = start; k <= stop; ++k) {
+        const float mag = BinMag(w, static_cast<uint32_t>(k));
+        if (mag > best_mag) {
+            best_mag = mag;
+            best = static_cast<uint32_t>(k);
         }
     }
+    return best;
+}
+
+static void LogHarmonics(const Work *w,
+                         uint32_t n,
+                         uint32_t sample_rate_hz,
+                         float fundamental_bin,
+                         esp_recon_result_t *out)
+{
     g_last_harmonic_count = 0;
     if (out != nullptr) {
         out->harmonic_count = 0;
     }
-    for (uint32_t i = 0; i < 8U; ++i) {
-        if (top_bin[i] == 0U) {
-            continue;
+    if (fundamental_bin < 0.5f) {
+        return;
+    }
+
+    const float nyquist_bin = static_cast<float>(n / 2U);
+    for (uint32_t harmonic = 1U; harmonic <= ESP_RECON_HARMONIC_MAX; ++harmonic) {
+        const float expected_bin = fundamental_bin * static_cast<float>(harmonic);
+        if (expected_bin >= nyquist_bin) {
+            break;
         }
-        const uint32_t freq_hz = (top_bin[i] * sample_rate_hz) / n;
-        const int32_t amp = static_cast<int32_t>(lrintf(top_mag[i]));
+        const uint32_t peak_bin = FindLocalPeakBin(w, n, expected_bin);
+        const float mag = BinMag(w, peak_bin) * 2.0f / static_cast<float>(n);
+        const uint32_t freq_hz = (peak_bin * sample_rate_hz) / n;
+        const int32_t amp = static_cast<int32_t>(lrintf(mag));
         const int32_t phase_x10 =
-            static_cast<int32_t>(lrintf(atan2f(w->xi[top_bin[i]], w->xr[top_bin[i]]) * (1800.0f / kPi)));
+            static_cast<int32_t>(lrintf(atan2f(w->xr[peak_bin], -w->xi[peak_bin]) * (1800.0f / kPi)));
         esp_recon_harmonic_t h = {};
-        h.index = i + 1U;
-        h.bin = top_bin[i];
+        h.index = harmonic;
+        h.bin = peak_bin;
         h.freq_hz = freq_hz;
         h.amp_mv = amp;
         h.phase_deg_x10 = phase_x10;
@@ -309,12 +370,73 @@ static void LogHarmonics(const Work *w, uint32_t n, uint32_t sample_rate_hz, esp
             out->harmonics[out->harmonic_count++] = h;
         }
         ESP_LOGW(TAG,
-                 "H%lu bin=%lu freq=%luHz amp=%.1f",
-                 static_cast<unsigned long>(i + 1U),
-                 static_cast<unsigned long>(top_bin[i]),
+                 "H%lu expect_bin=%.2f peak_bin=%lu freq=%luHz amp=%.1f phase=%.1fdeg",
+                 static_cast<unsigned long>(harmonic),
+                 static_cast<double>(expected_bin),
+                 static_cast<unsigned long>(peak_bin),
                  static_cast<unsigned long>(freq_hz),
-                 static_cast<double>(top_mag[i]));
+                 static_cast<double>(mag),
+                 static_cast<double>(phase_x10) / 10.0);
     }
+}
+
+static bool BuildPeriodicWaveFromHarmonics(const Work *w,
+                                           const esp_recon_result_t *out,
+                                           uint32_t input_n,
+                                           uint32_t sample_rate_hz,
+                                           float *dst,
+                                           uint32_t dst_n,
+                                           uint32_t *playback_f0_hz)
+{
+    if (w == nullptr || out == nullptr || dst == nullptr || input_n == 0U ||
+        sample_rate_hz == 0U || dst_n < 8U || out->harmonic_count == 0U ||
+        out->dominant_freq_hz == 0U) {
+        return false;
+    }
+
+    uint32_t cycles = static_cast<uint32_t>(
+        lrintf((static_cast<float>(out->dominant_freq_hz) * static_cast<float>(dst_n)) /
+               static_cast<float>(sample_rate_hz)));
+    if (cycles == 0U) {
+        cycles = 1U;
+    }
+    if (cycles >= dst_n / 2U) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < dst_n; ++i) {
+        float y = 0.0f;
+        for (uint32_t h = 0; h < out->harmonic_count; ++h) {
+            const esp_recon_harmonic_t *harm = &out->harmonics[h];
+            if (harm->index == 0U || harm->bin == 0U || harm->bin >= input_n / 2U) {
+                continue;
+            }
+            if (harm->index * cycles >= dst_n / 2U) {
+                continue;
+            }
+            const float amp = BinMag(w, harm->bin) * 2.0f / static_cast<float>(input_n);
+            if (amp < 0.5f) {
+                continue;
+            }
+            const float phase_cos = atan2f(-w->xi[harm->bin], w->xr[harm->bin]);
+            const float theta =
+                kTwoPi *
+                static_cast<float>(harm->index * cycles) *
+                static_cast<float>(i) /
+                static_cast<float>(dst_n);
+            y += amp * cosf(theta + phase_cos);
+        }
+        dst[i] = y;
+        if ((i & 127U) == 0U) {
+            vTaskDelay(1);
+        }
+    }
+
+    if (playback_f0_hz != nullptr) {
+        *playback_f0_hz = static_cast<uint32_t>(
+            (static_cast<uint64_t>(cycles) * sample_rate_hz + dst_n / 2U) / dst_n);
+    }
+    return true;
 }
 
 } // namespace
@@ -350,8 +472,11 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
 #else
     ForwardDft(capture, sample_count, out->cap_mean, w);
     out->dominant_bin = DominantBin(w, sample_count);
-    out->dominant_freq_hz = (out->dominant_bin * sample_rate_hz) / sample_count;
-    LogHarmonics(w, sample_count, sample_rate_hz, out);
+    const float fundamental_bin = RefinePeakBin(w, sample_count, out->dominant_bin);
+    out->dominant_freq_hz = static_cast<uint32_t>(
+        lrintf((fundamental_bin * static_cast<float>(sample_rate_hz)) /
+               static_cast<float>(sample_count)));
+    LogHarmonics(w, sample_count, sample_rate_hz, fundamental_bin, out);
 
     // Keep DC removed. Positive and negative bins are both compensated.
     w->xr[0] = 0.0f;
@@ -389,14 +514,30 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     InverseDft(sample_count, w);
 #endif
 
-    MakeLoopContinuous(w->tr, sample_count);
-    NormalizeToInt16(w->tr, sample_count, ESP_RECON_TARGET_PEAK, w->wave,
+    uint32_t output_count = sample_count;
+    const float *output_src = w->tr;
+    uint32_t playback_f0_hz = 0U;
+#if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE
+    if (BuildPeriodicWaveFromHarmonics(w, out, sample_count, sample_rate_hz,
+                                       w->synth, kOutN, &playback_f0_hz)) {
+        output_src = w->synth;
+        output_count = kOutN;
+    } else
+#endif
+    {
+        MakeLoopContinuous(w->tr, sample_count);
+        output_src = w->tr;
+        output_count = sample_count;
+    }
+
+    NormalizeToInt16(output_src, output_count, ESP_RECON_TARGET_PEAK, w->wave,
                      &out->out_min, &out->out_max);
+    out->sample_count = output_count;
     out->out_vpp = out->out_max - out->out_min;
-    memcpy(out->samples, w->wave, sizeof(out->samples));
+    memcpy(out->samples, w->wave, output_count * sizeof(out->samples[0]));
 
     ESP_LOGW(TAG,
-             "recon stage=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld dom=%luHz",
+             "recon stage=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu out_n=%lu dom=%luHz play_f0=%luHz",
              ESP_RECON_STAGE,
              static_cast<long>(out->cap_min),
              static_cast<long>(out->cap_max),
@@ -405,7 +546,10 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
              static_cast<long>(out->out_min),
              static_cast<long>(out->out_max),
              static_cast<long>(out->out_vpp),
-             static_cast<unsigned long>(out->dominant_freq_hz));
+             static_cast<unsigned long>(sample_count),
+             static_cast<unsigned long>(out->sample_count),
+             static_cast<unsigned long>(out->dominant_freq_hz),
+             static_cast<unsigned long>(playback_f0_hz));
 
     heap_caps_free(w);
     return true;
