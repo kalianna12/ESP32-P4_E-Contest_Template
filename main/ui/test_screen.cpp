@@ -208,6 +208,7 @@ static bool chart_point_visible(uint32_t index);
 static void create_full_table_page(void);
 static void render_full_table_page(void);
 static void update_full_table_page_label(void);
+static void format_point_flags(char *buf, size_t len, uint32_t flags);
 static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
 static void request_basic_dds_freq(uint32_t freq_hz);
 static void basic_dds_follow_status(const freqresp_ui_status_t *s);
