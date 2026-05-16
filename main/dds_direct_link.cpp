@@ -383,36 +383,6 @@ bool DdsDirect_Init(void)
     return true;
 }
 
-bool DdsDirect_SetBasicFreq(uint32_t freq_hz)
-{
-    if (freq_hz == 0U) {
-        ESP_LOGE(TAG, "Invalid basic DDS freq: 0");
-        return false;
-    }
-    if (!EnsureReady()) {
-        return false;
-    }
-
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-
-    const uint32_t seq = NextSeq();
-    BeginFrame(0xD1, seq);
-    PutU32(g_tx, 8, 1U);       // DDS_CMD_SET_FREQ
-    PutU32(g_tx, 12, freq_hz);
-    PutU32(g_tx, 16, 1000U);   // nominal amplitude field, kept for D1 compatibility
-    FinishFrame();
-    const bool ok = TransferFrame("D1");
-
-    xSemaphoreGive(g_lock);
-
-    if (!ok) {
-        ESP_LOGW(TAG, "DDS basic set failed: seq=0x%08lX freq=%lu",
-                 static_cast<unsigned long>(seq),
-                 static_cast<unsigned long>(freq_hz));
-    }
-    return ok;
-}
-
 bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t sample_rate_hz)
 {
     if (samples == nullptr || sample_count == 0U || sample_count > kMaxSampleCount) {

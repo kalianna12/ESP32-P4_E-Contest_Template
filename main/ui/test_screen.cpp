@@ -210,7 +210,9 @@ static void render_full_table_page(void);
 static void update_full_table_page_label(void);
 static void format_point_flags(char *buf, size_t len, uint32_t flags);
 static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
+#if ENABLE_BASIC_ESP_DDS_CONTROL
 static void request_basic_dds_freq(uint32_t freq_hz);
+#endif
 static void basic_dds_follow_status(const freqresp_ui_status_t *s);
 
 static constexpr uint32_t kLabelRenderIntervalMs = 50U;
@@ -219,7 +221,7 @@ static constexpr uint32_t kFitDelayMs = 300U;
 static constexpr uint32_t kPhaseValidFlag = 0x00000200U;
 
 #ifndef ENABLE_BASIC_ESP_DDS_CONTROL
-#define ENABLE_BASIC_ESP_DDS_CONTROL 1
+#define ENABLE_BASIC_ESP_DDS_CONTROL 0
 #endif
 
 #ifndef BASIC_DDS_FOLLOW_IDLE_MS
@@ -1629,6 +1631,7 @@ static void render_basic_status(const freqresp_ui_status_t *s)
     }
 }
 
+#if ENABLE_BASIC_ESP_DDS_CONTROL
 static void basic_dds_task_entry(void *arg)
 {
     (void)arg;
@@ -1690,6 +1693,7 @@ static void request_basic_dds_freq(uint32_t freq_hz)
     (void)freq_hz;
 #endif
 }
+#endif
 
 static void basic_dds_follow_status(const freqresp_ui_status_t *s)
 {
@@ -1718,8 +1722,6 @@ static void start_button_event_cb(lv_event_t *event)
     g_basic_dds_last_requested_freq = 0;
     request_basic_dds_freq((g_mode == MODE_SWEEP) ? g_start_freq_hz : g_single_freq_hz);
     SpiLink_SetPendingCommand(CMD_SET_ESP_DDS_MODE, 1U, 0U);
-#else
-    SpiLink_SetPendingCommand(CMD_SET_ESP_DDS_MODE, 0U, 0U);
 #endif
     SpiLink_SetPendingCommand(CMD_CLEAR_TABLE, 0U, 0U);
 
