@@ -13,7 +13,7 @@
 #include "freertos/task.h"
 
 #ifndef ENABLE_DDS_DIRECT_VERBOSE_ACK
-#define ENABLE_DDS_DIRECT_VERBOSE_ACK 0
+#define ENABLE_DDS_DIRECT_VERBOSE_ACK 1
 #endif
 
 namespace {

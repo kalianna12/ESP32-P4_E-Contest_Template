@@ -112,6 +112,20 @@ uint32_t last_point_index = 0;
 uint32_t last_freq_hz = 0;
 TickType_t last_log_tick = 0;
 TickType_t last_invalid_log_tick = 0;
+bool have_last_status_log = false;
+uint8_t last_status_state = 0xFF;
+uint8_t last_status_mode = 0xFF;
+uint8_t last_status_link_ok = 0xFF;
+uint32_t last_status_freq_hz = 0xFFFFFFFFU;
+uint32_t last_status_point_index = 0xFFFFFFFFU;
+uint32_t last_status_total_points = 0xFFFFFFFFU;
+uint32_t last_status_dds_ack_flags = 0xFFFFFFFFU;
+bool have_last_adv_status_log = false;
+uint32_t last_adv_log_stage = 0xFFFFFFFFU;
+uint32_t last_adv_log_error = 0xFFFFFFFFU;
+uint32_t last_adv_log_flags = 0xFFFFFFFFU;
+uint32_t last_adv_log_cmd = 0xFFFFFFFFU;
+uint32_t last_adv_log_cmd_seq = 0xFFFFFFFFU;
 freqresp_ui_status_t g_last_measurement_status = {};
 bool g_have_measurement_status = false;
 bool g_have_phase_history = false;
@@ -207,6 +221,46 @@ uint32_t GetU32(const uint8_t *buffer, size_t offset)
 int32_t GetI32(const uint8_t *buffer, size_t offset)
 {
     return static_cast<int32_t>(GetU32(buffer, offset));
+}
+
+const char *CommandName(uint32_t cmd)
+{
+    switch (cmd) {
+    case CMD_START: return "START";
+    case CMD_STOP: return "STOP";
+    case CMD_SET_MODE: return "SET_MODE";
+    case CMD_SET_START_FREQ: return "SET_START_FREQ";
+    case CMD_SET_STOP_FREQ: return "SET_STOP_FREQ";
+    case CMD_SET_STEP_FREQ: return "SET_STEP_FREQ";
+    case CMD_SET_SINGLE_FREQ: return "SET_SINGLE_FREQ";
+    case CMD_CLEAR_TABLE: return "CLEAR_TABLE";
+    case CMD_ADV_CAPTURE: return "ADV_CAPTURE";
+    case CMD_ADV_RECONSTRUCT: return "ADV_RECONSTRUCT";
+    case CMD_ADV_SEND_TO_DDS: return "ADV_SEND_TO_DDS";
+    case CMD_ADC_TEST_START: return "ADC_TEST_START";
+    case CMD_ADC_TEST_STOP: return "ADC_TEST_STOP";
+    default: return "UNKNOWN";
+    }
+}
+
+const char *StateName(uint8_t state)
+{
+    switch (state) {
+    case FREQRESP_STATE_IDLE: return "IDLE";
+    case FREQRESP_STATE_SCANNING: return "SCANNING";
+    case FREQRESP_STATE_DONE: return "DONE";
+    case FREQRESP_STATE_ERROR: return "ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+const char *ModeName(uint8_t mode)
+{
+    switch (mode) {
+    case MODE_SWEEP: return "SWEEP";
+    case MODE_SINGLE: return "SINGLE";
+    default: return "UNKNOWN";
+    }
 }
 
 int16_t GetI16(const uint8_t *buffer, size_t offset)
@@ -511,6 +565,119 @@ bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
     return true;
 }
 
+void MaybeLogBasicStatusDiagnostics(const uint8_t *frame, const freqresp_ui_status_t *status)
+{
+    if (frame == nullptr || status == nullptr) {
+        return;
+    }
+
+    const uint32_t dds_exp_seq = GetU32(frame, 80);
+    const uint32_t dds_exp_cmd = GetU32(frame, 84);
+    const uint32_t dds_exp_freq = GetU32(frame, 88);
+    const uint32_t dds_ack_seq = GetU32(frame, 92);
+    const uint32_t dds_ack_cmd = GetU32(frame, 96);
+    const uint32_t dds_ack_freq = GetU32(frame, 100);
+    const uint32_t dds_ack_flags = GetU32(frame, 104);
+    const uint8_t adc_fsm_state = frame[108];
+    const uint8_t dds_retry = frame[109] & 0x03U;
+    const uint8_t spi_b_bits = frame[110];
+    const bool dds_ack_bad =
+        dds_exp_seq != 0U &&
+        ((dds_ack_flags & 0x03U) != 0x03U ||
+         dds_ack_seq != dds_exp_seq ||
+         dds_ack_cmd != dds_exp_cmd ||
+         dds_ack_freq != dds_exp_freq);
+
+    const bool changed =
+        !have_last_status_log ||
+        status->state != last_status_state ||
+        status->mode != last_status_mode ||
+        status->link_ok != last_status_link_ok ||
+        status->current_freq_hz != last_status_freq_hz ||
+        status->point_index != last_status_point_index ||
+        status->total_points != last_status_total_points ||
+        dds_ack_flags != last_status_dds_ack_flags ||
+        dds_ack_bad;
+
+    if (!changed) {
+        return;
+    }
+
+    have_last_status_log = true;
+    last_status_state = status->state;
+    last_status_mode = status->mode;
+    last_status_link_ok = status->link_ok;
+    last_status_freq_hz = status->current_freq_hz;
+    last_status_point_index = status->point_index;
+    last_status_total_points = status->total_points;
+    last_status_dds_ack_flags = dds_ack_flags;
+
+    ESP_LOGW(TAG,
+             "PYNQ status %s/%s link=%u freq=%lu point=%lu/%lu prog=%lu "
+             "DDS exp(seq=%lu cmd=%lu freq=%lu) ack(seq=%lu cmd=%lu freq=%lu flags=0x%08lX) "
+             "adc_fsm=%u retry=%u spi_b=0x%02X%s",
+             StateName(status->state),
+             ModeName(status->mode),
+             static_cast<unsigned>(status->link_ok),
+             static_cast<unsigned long>(status->current_freq_hz),
+             static_cast<unsigned long>(status->point_index),
+             static_cast<unsigned long>(status->total_points),
+             static_cast<unsigned long>(status->progress_permille),
+             static_cast<unsigned long>(dds_exp_seq),
+             static_cast<unsigned long>(dds_exp_cmd),
+             static_cast<unsigned long>(dds_exp_freq),
+             static_cast<unsigned long>(dds_ack_seq),
+             static_cast<unsigned long>(dds_ack_cmd),
+             static_cast<unsigned long>(dds_ack_freq),
+             static_cast<unsigned long>(dds_ack_flags),
+             static_cast<unsigned>(adc_fsm_state),
+             static_cast<unsigned>(dds_retry),
+             static_cast<unsigned>(spi_b_bits),
+             dds_ack_bad ? " DDS_ACK_BAD" : "");
+}
+
+void MaybeLogAdvStatusDiagnostics(const adv_status_t *status)
+{
+    if (status == nullptr) {
+        return;
+    }
+
+    const bool changed =
+        !have_last_adv_status_log ||
+        status->debug_stage != last_adv_log_stage ||
+        status->error_code != last_adv_log_error ||
+        status->flags != last_adv_log_flags ||
+        status->last_cmd_seen != last_adv_log_cmd ||
+        status->last_cmd_seq != last_adv_log_cmd_seq;
+
+    if (!changed) {
+        return;
+    }
+
+    have_last_adv_status_log = true;
+    last_adv_log_stage = status->debug_stage;
+    last_adv_log_error = status->error_code;
+    last_adv_log_flags = status->flags;
+    last_adv_log_cmd = status->last_cmd_seen;
+    last_adv_log_cmd_seq = status->last_cmd_seq;
+
+    ESP_LOGW(TAG,
+             "ADV status state=%lu err=%lu flags=0x%08lX stage=%lu sub=%lu "
+             "last_cmd=%lu(%s) cmd_seq=%lu accepted=%lu reject=%lu cap=%lu recon=%lu",
+             static_cast<unsigned long>(status->adv_state),
+             static_cast<unsigned long>(status->error_code),
+             static_cast<unsigned long>(status->flags),
+             static_cast<unsigned long>(status->debug_stage),
+             static_cast<unsigned long>(status->debug_substage),
+             static_cast<unsigned long>(status->last_cmd_seen),
+             CommandName(status->last_cmd_seen),
+             static_cast<unsigned long>(status->last_cmd_seq),
+             static_cast<unsigned long>(status->last_cmd_accepted),
+             static_cast<unsigned long>(status->last_cmd_reject_reason),
+             static_cast<unsigned long>(status->capture_done_count),
+             static_cast<unsigned long>(status->recon_done_count));
+}
+
 bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_t *out)
 {
     if (frame == nullptr || out == nullptr || len < kFrameLen) {
@@ -730,6 +897,14 @@ void PrepareTxBuffer()
         }
         seq = g_cmd_seq;
         portEXIT_CRITICAL(&g_cmd_lock);
+
+        ESP_LOGW(TAG,
+                 "ESP->PYNQ CMD seq=%lu cmd=%lu(%s) arg0=%lu arg1=%lu",
+                 static_cast<unsigned long>(seq),
+                 static_cast<unsigned long>(pending.cmd),
+                 CommandName(pending.cmd),
+                 static_cast<unsigned long>(pending.arg0),
+                 static_cast<unsigned long>(pending.arg1));
     }
 
     size_t o = kFrameHeaderLen;
@@ -970,6 +1145,20 @@ void SpiLink_Init(void)
     last_freq_hz = 0;
     last_log_tick = 0;
     last_invalid_log_tick = 0;
+    have_last_status_log = false;
+    last_status_state = 0xFF;
+    last_status_mode = 0xFF;
+    last_status_link_ok = 0xFF;
+    last_status_freq_hz = 0xFFFFFFFFU;
+    last_status_point_index = 0xFFFFFFFFU;
+    last_status_total_points = 0xFFFFFFFFU;
+    last_status_dds_ack_flags = 0xFFFFFFFFU;
+    have_last_adv_status_log = false;
+    last_adv_log_stage = 0xFFFFFFFFU;
+    last_adv_log_error = 0xFFFFFFFFU;
+    last_adv_log_flags = 0xFFFFFFFFU;
+    last_adv_log_cmd = 0xFFFFFFFFU;
+    last_adv_log_cmd_seq = 0xFFFFFFFFU;
     SpiLink_ClearMeasurementCache();
     spi_ready = true;
 
@@ -1210,6 +1399,7 @@ void SpiLink_Task(void)
     adv_status_t adv_status = {};
     if (ParseAdvStatusFrame(parse_frame, kFrameLen, &adv_status)) {
         ++ok_count;
+        MaybeLogAdvStatusDiagnostics(&adv_status);
         if (g_adv_status_queue != nullptr) {
             xQueueSend(g_adv_status_queue, &adv_status, 0);
         }
@@ -1273,6 +1463,17 @@ void SpiLink_Task(void)
 
             last_point_index = status.point_index;
             last_freq_hz = status.current_freq_hz;
+            ESP_LOGW(TAG,
+                     "PYNQ point idx=%lu/%lu freq=%lu vin=%ld vout=%ld gain=%ld phase=%ld flags=0x%08lX phase_valid=%u",
+                     static_cast<unsigned long>(status.point_index),
+                     static_cast<unsigned long>(status.total_points),
+                     static_cast<unsigned long>(status.current_freq_hz),
+                     static_cast<long>(status.vin_mv),
+                     static_cast<long>(status.vout_mv),
+                     static_cast<long>(status.gain_x1000),
+                     static_cast<long>(status.phase_deg_x10),
+                     static_cast<unsigned long>(status.flags),
+                     status.phase_valid ? 1U : 0U);
             point_queue_item_t point_item = {};
             FillPointQueueItem(&status, &point_item);
             if (xQueueSend(g_point_queue, &point_item, 0) != pdTRUE) {
@@ -1281,6 +1482,7 @@ void SpiLink_Task(void)
             MaybeUpdatePointQueueHighWater();
         } else {
             status.has_measurement = false;
+            MaybeLogBasicStatusDiagnostics(parse_frame, &status);
             xQueueOverwrite(g_status_queue, &status);
         }
         MaybeLogSpiStats();
