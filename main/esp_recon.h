@@ -46,7 +46,7 @@ extern "C" {
 #endif
 
 #ifndef ESP_RECON_HARMONIC_MAX
-#define ESP_RECON_HARMONIC_MAX 200U
+#define ESP_RECON_HARMONIC_MAX 100U
 #endif
 
 typedef enum {
