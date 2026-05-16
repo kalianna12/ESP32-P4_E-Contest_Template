@@ -48,7 +48,7 @@
 #endif
 
 #ifndef FULL_TABLE_PAGE_ROWS
-#define FULL_TABLE_PAGE_ROWS 60U
+#define FULL_TABLE_PAGE_ROWS 30U
 #endif
 
 #define TEST_SCREEN_W 1024
@@ -116,11 +116,15 @@ static lv_chart_series_t *g_adv_output_series = nullptr;
 static lv_obj_t *g_adv_recon_chart = nullptr;
 static lv_chart_series_t *g_adv_recon_series = nullptr;
 static constexpr uint32_t ADV_HARMONIC_MAIN_ROWS = 12U;
+static constexpr uint32_t ADV_HARMONIC_MAIN_COL_ROWS = 6U;
+static constexpr uint32_t ADV_HARMONIC_TABLE_PAGE_ROWS = 15U;
 static lv_obj_t *g_adv_harmonic_rows[ADV_HARMONIC_MAIN_ROWS + 1U] = {};
 static lv_obj_t *g_adv_harmonic_table = nullptr;
+static lv_obj_t *g_adv_harmonic_table_page_label = nullptr;
 static adv_harmonic_t g_adv_harmonics[ADV_HARMONIC_MAX] = {};
 static bool g_adv_harmonic_valid[ADV_HARMONIC_MAX] = {};
 static uint32_t g_adv_harmonic_count = 0;
+static uint32_t g_adv_harmonic_table_page = 0;
 static uint32_t g_last_adv_capture_done_count = 0;
 static uint32_t g_last_adv_recon_done_count = 0;
 static bool g_adv_capture_pending = false;
@@ -208,6 +212,8 @@ static bool chart_point_visible(uint32_t index);
 static void create_full_table_page(void);
 static void render_full_table_page(void);
 static void update_full_table_page_label(void);
+static void render_harmonic_table_page(void);
+static bool harmonic_index_on_current_table_page(uint32_t index);
 static void format_point_flags(char *buf, size_t len, uint32_t flags);
 static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
 #if ENABLE_BASIC_ESP_DDS_CONTROL
@@ -325,6 +331,7 @@ static void create_hline(lv_obj_t *parent, int32_t y)
     lv_obj_set_pos(line, 20, y);
     lv_obj_set_size(line, 984, 2);
     lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_radius(line, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(line, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
@@ -337,6 +344,7 @@ static void create_vline(lv_obj_t *parent, int32_t x, int32_t y, int32_t h)
     lv_obj_set_pos(line, x, y);
     lv_obj_set_size(line, 2, h);
     lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_radius(line, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(line, lv_color_hex(COLOR_LINE), LV_PART_MAIN);
@@ -1998,6 +2006,9 @@ static void process_dds_direct_result(void)
                 }
             }
             refresh_harmonic_rows();
+            if (g_adv_harmonic_table != nullptr) {
+                render_harmonic_table_page();
+            }
         }
         set_adv_result(ok ? "ESP RECON DDS DONE" : "ESP RECON DDS FAIL",
                        ok ? COLOR_GREEN : COLOR_RED);
@@ -2186,6 +2197,7 @@ static void create_spi_test_page(void)
         g_adv_harmonic_rows[i] = nullptr;
     }
     g_adv_harmonic_table = nullptr;
+    g_adv_harmonic_table_page_label = nullptr;
 
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(screen, TEST_SCREEN_W, TEST_SCREEN_H);
@@ -2275,6 +2287,7 @@ static void create_reconstruction_page(void)
     g_adv_recon_chart = nullptr;
     g_adv_recon_series = nullptr;
     g_adv_harmonic_table = nullptr;
+    g_adv_harmonic_table_page_label = nullptr;
     memset(g_adv_harmonic_rows, 0, sizeof(g_adv_harmonic_rows));
 #if ENABLE_SPI_TEST_WINDOW
     g_spi_test_link = nullptr;
@@ -2357,13 +2370,17 @@ static void create_reconstruction_page(void)
 
     create_label(screen, "Harmonics", 24, 280, 220, &lv_font_montserrat_20, COLOR_BLUE);
     for (uint32_t i = 0; i <= ADV_HARMONIC_MAIN_ROWS; ++i) {
+        const bool header = (i == 0U);
+        const uint32_t data_row = header ? 0U : (i - 1U);
+        const uint32_t col = header ? 0U : (data_row / ADV_HARMONIC_MAIN_COL_ROWS);
+        const uint32_t row = header ? 0U : (data_row % ADV_HARMONIC_MAIN_COL_ROWS);
         g_adv_harmonic_rows[i] = create_label(screen,
                                               "",
-                                              24,
-                                              312 + static_cast<int32_t>(i * 18U),
-                                              560,
+                                              header ? 24 : (24 + static_cast<int32_t>(col * 470U)),
+                                              header ? 310 : (334 + static_cast<int32_t>(row * 25U)),
+                                              header ? 920 : 440,
                                               &lv_font_montserrat_14,
-                                              i == 0U ? COLOR_SUBTEXT : COLOR_TEXT);
+                                              header ? COLOR_SUBTEXT : COLOR_TEXT);
     }
     refresh_harmonic_rows();
 
@@ -2406,6 +2423,7 @@ static void create_main_page(void)
         g_adv_harmonic_rows[i] = nullptr;
     }
     g_adv_harmonic_table = nullptr;
+    g_adv_harmonic_table_page_label = nullptr;
 #if ENABLE_SPI_TEST_WINDOW
     g_spi_test_link = nullptr;
     g_spi_test_rx = nullptr;
@@ -3096,8 +3114,9 @@ void test_screen_update_adv_harmonic(const adv_harmonic_t *harmonic)
     }
     refresh_harmonic_rows();
 
-    if (g_adv_harmonic_table != nullptr) {
-        const uint32_t row = harmonic->index;
+    if (g_adv_harmonic_table != nullptr && harmonic_index_on_current_table_page(harmonic->index)) {
+        const uint32_t first = g_adv_harmonic_table_page * ADV_HARMONIC_TABLE_PAGE_ROWS + 1U;
+        const uint32_t page_row = harmonic->index - first + 1U;
         char no[12];
         char freq[24];
         char amp[24];
@@ -3110,11 +3129,11 @@ void test_screen_update_adv_harmonic(const adv_harmonic_t *harmonic)
         snprintf(amp, sizeof(amp), "%ld mV", static_cast<long>(harmonic->amp_mv));
         format_phase(phase, sizeof(phase), harmonic->phase_deg_x10);
         snprintf(flags, sizeof(flags), "0x%lX", static_cast<unsigned long>(harmonic->flags));
-        set_table_cell(g_adv_harmonic_table, row, 0, no);
-        set_table_cell(g_adv_harmonic_table, row, 1, freq);
-        set_table_cell(g_adv_harmonic_table, row, 2, amp);
-        set_table_cell(g_adv_harmonic_table, row, 3, phase);
-        set_table_cell(g_adv_harmonic_table, row, 4, flags);
+        set_table_cell(g_adv_harmonic_table, page_row, 0, no);
+        set_table_cell(g_adv_harmonic_table, page_row, 1, freq);
+        set_table_cell(g_adv_harmonic_table, page_row, 2, amp);
+        set_table_cell(g_adv_harmonic_table, page_row, 3, phase);
+        set_table_cell(g_adv_harmonic_table, page_row, 4, flags);
     }
 }
 
@@ -3154,7 +3173,7 @@ static void update_full_table_page_label(void)
         return;
     }
 
-    char buf[96];
+    char buf[48];
     const uint32_t pages = full_table_page_count();
     const uint32_t page = (g_full_table_page < pages) ? g_full_table_page : (pages - 1U);
     const uint32_t start = (g_table_count == 0U) ? 0U : (page * FULL_TABLE_PAGE_ROWS + 1U);
@@ -3162,7 +3181,7 @@ static void update_full_table_page_label(void)
     if (end > g_table_count) {
         end = g_table_count;
     }
-    snprintf(buf, sizeof(buf), "Page %lu/%lu  Rows %lu-%lu",
+    snprintf(buf, sizeof(buf), "P%lu/%lu R%lu-%lu",
              static_cast<unsigned long>(page + 1U),
              static_cast<unsigned long>(pages),
              static_cast<unsigned long>(start),
@@ -3304,6 +3323,132 @@ static void full_table_next_event_cb(lv_event_t *event)
     }
 }
 
+static uint32_t harmonic_table_page_count(void)
+{
+    return (ADV_HARMONIC_MAX + ADV_HARMONIC_TABLE_PAGE_ROWS - 1U) /
+           ADV_HARMONIC_TABLE_PAGE_ROWS;
+}
+
+static void update_harmonic_table_page_label(void)
+{
+    if (g_adv_harmonic_table_page_label == nullptr) {
+        return;
+    }
+
+    const uint32_t pages = harmonic_table_page_count();
+    if (g_adv_harmonic_table_page >= pages) {
+        g_adv_harmonic_table_page = pages - 1U;
+    }
+    const uint32_t start = g_adv_harmonic_table_page * ADV_HARMONIC_TABLE_PAGE_ROWS + 1U;
+    uint32_t end = (g_adv_harmonic_table_page + 1U) * ADV_HARMONIC_TABLE_PAGE_ROWS;
+    if (end > ADV_HARMONIC_MAX) {
+        end = ADV_HARMONIC_MAX;
+    }
+
+    char buf[48];
+    snprintf(buf,
+             sizeof(buf),
+             "H%lu-%lu P%lu/%lu",
+             static_cast<unsigned long>(start),
+             static_cast<unsigned long>(end),
+             static_cast<unsigned long>(g_adv_harmonic_table_page + 1U),
+             static_cast<unsigned long>(pages));
+    lv_label_set_text(g_adv_harmonic_table_page_label, buf);
+}
+
+static bool harmonic_index_on_current_table_page(uint32_t index)
+{
+    if (index == 0U || index > ADV_HARMONIC_MAX) {
+        return false;
+    }
+    const uint32_t start = g_adv_harmonic_table_page * ADV_HARMONIC_TABLE_PAGE_ROWS + 1U;
+    const uint32_t end = start + ADV_HARMONIC_TABLE_PAGE_ROWS - 1U;
+    return index >= start && index <= end;
+}
+
+static void render_harmonic_table_page(void)
+{
+    if (g_adv_harmonic_table == nullptr) {
+        return;
+    }
+
+    const uint32_t pages = harmonic_table_page_count();
+    if (g_adv_harmonic_table_page >= pages) {
+        g_adv_harmonic_table_page = pages - 1U;
+    }
+
+    lv_table_set_col_cnt(g_adv_harmonic_table, 5);
+    lv_table_set_row_cnt(g_adv_harmonic_table, ADV_HARMONIC_TABLE_PAGE_ROWS + 1U);
+    lv_table_set_col_width(g_adv_harmonic_table, 0, 64);
+    lv_table_set_col_width(g_adv_harmonic_table, 1, 180);
+    lv_table_set_col_width(g_adv_harmonic_table, 2, 150);
+    lv_table_set_col_width(g_adv_harmonic_table, 3, 170);
+    lv_table_set_col_width(g_adv_harmonic_table, 4, 190);
+
+    set_table_cell(g_adv_harmonic_table, 0, 0, "No");
+    set_table_cell(g_adv_harmonic_table, 0, 1, "Freq");
+    set_table_cell(g_adv_harmonic_table, 0, 2, "Amp");
+    set_table_cell(g_adv_harmonic_table, 0, 3, "Phase");
+    set_table_cell(g_adv_harmonic_table, 0, 4, "Flags");
+
+    const uint32_t first = g_adv_harmonic_table_page * ADV_HARMONIC_TABLE_PAGE_ROWS;
+    for (uint32_t i = 0; i < ADV_HARMONIC_TABLE_PAGE_ROWS; ++i) {
+        const uint32_t slot = first + i;
+        const uint32_t row = i + 1U;
+        char no[12];
+        char freq[24];
+        char amp[24];
+        char phase[24];
+        char flags[24];
+
+        snprintf(no, sizeof(no), "%lu", static_cast<unsigned long>(slot + 1U));
+        if (slot >= ADV_HARMONIC_MAX || !g_adv_harmonic_valid[slot]) {
+            set_table_cell(g_adv_harmonic_table, row, 0, no);
+            set_table_cell(g_adv_harmonic_table, row, 1, "--");
+            set_table_cell(g_adv_harmonic_table, row, 2, "--");
+            set_table_cell(g_adv_harmonic_table, row, 3, "--");
+            set_table_cell(g_adv_harmonic_table, row, 4, "--");
+            continue;
+        }
+
+        char freq_num[16];
+        format_freq(freq_num, sizeof(freq_num), g_adv_harmonics[slot].freq_hz);
+        snprintf(freq, sizeof(freq), "%s Hz", freq_num);
+        snprintf(amp, sizeof(amp), "%ld mV", static_cast<long>(g_adv_harmonics[slot].amp_mv));
+        format_phase(phase, sizeof(phase), g_adv_harmonics[slot].phase_deg_x10);
+        snprintf(flags, sizeof(flags), "0x%lX", static_cast<unsigned long>(g_adv_harmonics[slot].flags));
+        set_table_cell(g_adv_harmonic_table, row, 0, no);
+        set_table_cell(g_adv_harmonic_table, row, 1, freq);
+        set_table_cell(g_adv_harmonic_table, row, 2, amp);
+        set_table_cell(g_adv_harmonic_table, row, 3, phase);
+        set_table_cell(g_adv_harmonic_table, row, 4, flags);
+    }
+
+    update_harmonic_table_page_label();
+}
+
+static void harmonic_table_prev_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+    if (g_adv_harmonic_table_page > 0U) {
+        --g_adv_harmonic_table_page;
+        render_harmonic_table_page();
+    }
+}
+
+static void harmonic_table_next_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+    if ((g_adv_harmonic_table_page + 1U) < harmonic_table_page_count()) {
+        ++g_adv_harmonic_table_page;
+        render_harmonic_table_page();
+    }
+}
+
 static void create_harmonic_table_page(void)
 {
 #if LVGL_VERSION_MAJOR >= 9
@@ -3324,6 +3469,7 @@ static void create_harmonic_table_page(void)
     g_chart_gain = nullptr;
     g_latest = nullptr;
     g_adv_harmonic_table = nullptr;
+    g_adv_harmonic_table_page_label = nullptr;
     g_adv_status = nullptr;
     g_adv_model_line = nullptr;
     g_adv_model_range_line = nullptr;
@@ -3341,14 +3487,27 @@ static void create_harmonic_table_page(void)
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
     create_label(screen, "Harmonic Table", 24, 14, 320, &lv_font_montserrat_24, COLOR_TEXT);
+    g_adv_harmonic_table_page_label = create_label(screen,
+                                                   "H-- P--",
+                                                   420,
+                                                   20,
+                                                   180,
+                                                   &lv_font_montserrat_14,
+                                                   COLOR_YELLOW);
+    lv_obj_t *prev = create_button(screen, "Prev", 650, 12, 70);
+    lv_obj_add_event_cb(prev, harmonic_table_prev_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *next = create_button(screen, "Next", 730, 12, 70);
+    lv_obj_add_event_cb(next, harmonic_table_next_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *back = create_button(screen, "Back", 900, 12, 100);
     lv_obj_add_event_cb(back, harmonic_back_event_cb, LV_EVENT_CLICKED, nullptr);
     create_hline(screen, 55);
 
     g_adv_harmonic_table = lv_table_create(screen);
     lv_obj_set_pos(g_adv_harmonic_table, 20, 70);
-    lv_obj_set_size(g_adv_harmonic_table, 984, 510);
-    lv_obj_set_scrollbar_mode(g_adv_harmonic_table, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_size(g_adv_harmonic_table, 984, 500);
+    lv_obj_set_scrollbar_mode(g_adv_harmonic_table, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(g_adv_harmonic_table, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_adv_harmonic_table, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_text_font(g_adv_harmonic_table, &lv_font_montserrat_14, LV_PART_ITEMS);
     lv_obj_set_style_text_color(g_adv_harmonic_table, lv_color_hex(COLOR_TEXT), LV_PART_ITEMS);
     lv_obj_set_style_bg_color(g_adv_harmonic_table, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
@@ -3357,52 +3516,10 @@ static void create_harmonic_table_page(void)
     lv_obj_set_style_border_width(g_adv_harmonic_table, 1, LV_PART_MAIN);
     lv_obj_set_style_pad_left(g_adv_harmonic_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(g_adv_harmonic_table, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_top(g_adv_harmonic_table, 5, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(g_adv_harmonic_table, 5, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(g_adv_harmonic_table, 3, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(g_adv_harmonic_table, 3, LV_PART_ITEMS);
 
-    lv_table_set_col_cnt(g_adv_harmonic_table, 5);
-    lv_table_set_row_cnt(g_adv_harmonic_table, ADV_HARMONIC_MAX + 1U);
-    lv_table_set_col_width(g_adv_harmonic_table, 0, 80);
-    lv_table_set_col_width(g_adv_harmonic_table, 1, 180);
-    lv_table_set_col_width(g_adv_harmonic_table, 2, 160);
-    lv_table_set_col_width(g_adv_harmonic_table, 3, 180);
-    lv_table_set_col_width(g_adv_harmonic_table, 4, 180);
-
-    set_table_cell(g_adv_harmonic_table, 0, 0, "No");
-    set_table_cell(g_adv_harmonic_table, 0, 1, "Freq");
-    set_table_cell(g_adv_harmonic_table, 0, 2, "Amp");
-    set_table_cell(g_adv_harmonic_table, 0, 3, "Phase");
-    set_table_cell(g_adv_harmonic_table, 0, 4, "Flags");
-
-    for (uint32_t i = 0; i < ADV_HARMONIC_MAX; ++i) {
-        const uint32_t row = i + 1U;
-        char no[12];
-        char freq[24];
-        char amp[24];
-        char phase[24];
-        char flags[24];
-        snprintf(no, sizeof(no), "%lu", static_cast<unsigned long>(i + 1U));
-        if (!g_adv_harmonic_valid[i]) {
-            set_table_cell(g_adv_harmonic_table, row, 0, no);
-            set_table_cell(g_adv_harmonic_table, row, 1, "--");
-            set_table_cell(g_adv_harmonic_table, row, 2, "--");
-            set_table_cell(g_adv_harmonic_table, row, 3, "--");
-            set_table_cell(g_adv_harmonic_table, row, 4, "--");
-            continue;
-        }
-
-        char freq_num[16];
-        format_freq(freq_num, sizeof(freq_num), g_adv_harmonics[i].freq_hz);
-        snprintf(freq, sizeof(freq), "%s Hz", freq_num);
-        snprintf(amp, sizeof(amp), "%ld mV", static_cast<long>(g_adv_harmonics[i].amp_mv));
-        format_phase(phase, sizeof(phase), g_adv_harmonics[i].phase_deg_x10);
-        snprintf(flags, sizeof(flags), "0x%lX", static_cast<unsigned long>(g_adv_harmonics[i].flags));
-        set_table_cell(g_adv_harmonic_table, row, 0, no);
-        set_table_cell(g_adv_harmonic_table, row, 1, freq);
-        set_table_cell(g_adv_harmonic_table, row, 2, amp);
-        set_table_cell(g_adv_harmonic_table, row, 3, phase);
-        set_table_cell(g_adv_harmonic_table, row, 4, flags);
-    }
+    render_harmonic_table_page();
 }
 
 static void format_point_flags(char *buf, size_t len, uint32_t flags)
@@ -3452,21 +3569,23 @@ static void create_full_table_page(void)
     char points_buf[32];
     snprintf(points_buf, sizeof(points_buf), "Points: %lu", static_cast<unsigned long>(g_table_count));
 
-    create_label(screen, "Full Data Table", 24, 14, 320, &lv_font_montserrat_24, COLOR_TEXT);
-    create_label(screen, points_buf, 360, 18, 220, &lv_font_montserrat_20, COLOR_GREEN);
-    g_full_table_page_label = create_label(screen, "Page --", 570, 20, 160, &lv_font_montserrat_14, COLOR_YELLOW);
-    lv_obj_t *prev = create_button(screen, "Prev", 735, 12, 70);
+    create_label(screen, "Full Data Table", 24, 14, 300, &lv_font_montserrat_24, COLOR_TEXT);
+    create_label(screen, points_buf, 340, 18, 170, &lv_font_montserrat_20, COLOR_GREEN);
+    g_full_table_page_label = create_label(screen, "P-- R--", 530, 20, 170, &lv_font_montserrat_14, COLOR_YELLOW);
+    lv_obj_t *prev = create_button(screen, "Prev", 720, 12, 70);
     lv_obj_add_event_cb(prev, full_table_prev_event_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *next = create_button(screen, "Next", 815, 12, 70);
+    lv_obj_t *next = create_button(screen, "Next", 800, 12, 70);
     lv_obj_add_event_cb(next, full_table_next_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *back = create_button(screen, "Back", 900, 12, 100);
     lv_obj_add_event_cb(back, back_button_event_cb, LV_EVENT_CLICKED, nullptr);
     create_hline(screen, 55);
 
     g_full_table = lv_table_create(screen);
-    lv_obj_set_pos(g_full_table, 20, 70);
-    lv_obj_set_size(g_full_table, 984, 510);
-    lv_obj_set_scrollbar_mode(g_full_table, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_pos(g_full_table, 20, 64);
+    lv_obj_set_size(g_full_table, 984, 526);
+    lv_obj_set_scrollbar_mode(g_full_table, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(g_full_table, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_full_table, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_text_font(g_full_table, &lv_font_montserrat_14, LV_PART_ITEMS);
     lv_obj_set_style_text_color(g_full_table, lv_color_hex(COLOR_TEXT), LV_PART_ITEMS);
     lv_obj_set_style_bg_color(g_full_table, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
@@ -3480,8 +3599,8 @@ static void create_full_table_page(void)
     lv_obj_set_style_text_color(g_full_table, lv_color_hex(COLOR_TEXT), LV_PART_ITEMS);
     lv_obj_set_style_pad_left(g_full_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(g_full_table, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_top(g_full_table, 6, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(g_full_table, 6, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(g_full_table, 1, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(g_full_table, 1, LV_PART_ITEMS);
 
     render_full_table_page();
 }
