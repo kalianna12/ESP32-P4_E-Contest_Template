@@ -358,12 +358,27 @@ static void LogHarmonics(const Work *w,
     }
 
     const float nyquist_bin = static_cast<float>(n / 2U);
+    bool used_bins[kN / 2U] = {};
     for (uint32_t harmonic = 1U; harmonic <= ESP_RECON_HARMONIC_MAX; ++harmonic) {
+#if ESP_RECON_SYNTH_ODD_HARMONICS_ONLY
+        if ((harmonic & 1U) == 0U) {
+            continue;
+        }
+#endif
         const float expected_bin = fundamental_bin * static_cast<float>(harmonic);
         if (expected_bin >= nyquist_bin) {
             break;
         }
         const uint32_t peak_bin = FindLocalPeakBin(w, n, expected_bin);
+        if (peak_bin == 0U || peak_bin >= n / 2U || used_bins[peak_bin]) {
+            ESP_LOGW(TAG,
+                     "H%lu skip duplicate/invalid peak_bin=%lu expect_bin=%.2f",
+                     static_cast<unsigned long>(harmonic),
+                     static_cast<unsigned long>(peak_bin),
+                     static_cast<double>(expected_bin));
+            continue;
+        }
+        used_bins[peak_bin] = true;
         const float mag = BinMag(w, peak_bin) * 2.0f / static_cast<float>(n);
         const uint32_t freq_hz = (peak_bin * sample_rate_hz) / n;
         const int32_t amp = static_cast<int32_t>(lrintf(mag));

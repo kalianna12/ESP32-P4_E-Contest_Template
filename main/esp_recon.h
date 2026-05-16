@@ -45,7 +45,7 @@ extern "C" {
 #endif
 
 #ifndef ESP_RECON_HARMONIC_MAX
-#define ESP_RECON_HARMONIC_MAX 20U
+#define ESP_RECON_HARMONIC_MAX 50U
 #endif
 
 typedef struct {

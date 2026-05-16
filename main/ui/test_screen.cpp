@@ -105,7 +105,7 @@ static lv_obj_t *g_adv_output_chart = nullptr;
 static lv_chart_series_t *g_adv_output_series = nullptr;
 static lv_obj_t *g_adv_recon_chart = nullptr;
 static lv_chart_series_t *g_adv_recon_series = nullptr;
-static constexpr uint32_t ADV_HARMONIC_MAIN_ROWS = 8U;
+static constexpr uint32_t ADV_HARMONIC_MAIN_ROWS = 12U;
 static lv_obj_t *g_adv_harmonic_rows[ADV_HARMONIC_MAIN_ROWS + 1U] = {};
 static lv_obj_t *g_adv_harmonic_table = nullptr;
 static adv_harmonic_t g_adv_harmonics[ADV_HARMONIC_MAX] = {};
@@ -1872,15 +1872,22 @@ static void process_dds_direct_result(void)
             const uint32_t count = EspRecon_GetLastHarmonics(harmonics, ESP_RECON_HARMONIC_MAX);
             memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
             memset(g_adv_harmonics, 0, sizeof(g_adv_harmonics));
-            g_adv_harmonic_count = count;
-            for (uint32_t i = 0; i < count && i < ADV_HARMONIC_MAX; ++i) {
-                g_adv_harmonics[i].seq = 0U;
-                g_adv_harmonics[i].index = harmonics[i].index;
-                g_adv_harmonics[i].freq_hz = harmonics[i].freq_hz;
-                g_adv_harmonics[i].amp_mv = harmonics[i].amp_mv;
-                g_adv_harmonics[i].phase_deg_x10 = harmonics[i].phase_deg_x10;
-                g_adv_harmonics[i].flags = harmonics[i].flags;
-                g_adv_harmonic_valid[i] = true;
+            g_adv_harmonic_count = 0U;
+            for (uint32_t i = 0; i < count; ++i) {
+                if (harmonics[i].index == 0U || harmonics[i].index > ADV_HARMONIC_MAX) {
+                    continue;
+                }
+                const uint32_t slot = harmonics[i].index - 1U;
+                g_adv_harmonics[slot].seq = 0U;
+                g_adv_harmonics[slot].index = harmonics[i].index;
+                g_adv_harmonics[slot].freq_hz = harmonics[i].freq_hz;
+                g_adv_harmonics[slot].amp_mv = harmonics[i].amp_mv;
+                g_adv_harmonics[slot].phase_deg_x10 = harmonics[i].phase_deg_x10;
+                g_adv_harmonics[slot].flags = harmonics[i].flags;
+                g_adv_harmonic_valid[slot] = true;
+                if (g_adv_harmonic_count < harmonics[i].index) {
+                    g_adv_harmonic_count = harmonics[i].index;
+                }
             }
             refresh_harmonic_rows();
         }
