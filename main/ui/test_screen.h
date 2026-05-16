@@ -62,6 +62,7 @@ typedef enum {
     CMD_ADV_SEND_TO_DDS = 22,
     CMD_ADC_TEST_START = 30,
     CMD_ADC_TEST_STOP = 31,
+    CMD_SET_ESP_DDS_MODE = 32,
 } freqresp_command_t;
 
 typedef struct {

@@ -43,6 +43,14 @@
 #define ENABLE_ADV_CAP_AUTO_SQUARE 0
 #endif
 
+#ifndef ENABLE_BASIC_DDS_FREQ_LOG
+#define ENABLE_BASIC_DDS_FREQ_LOG 0
+#endif
+
+#ifndef FULL_TABLE_PAGE_ROWS
+#define FULL_TABLE_PAGE_ROWS 60U
+#endif
+
 #define TEST_SCREEN_W 1024
 #define TEST_SCREEN_H 600
 
@@ -92,7 +100,9 @@ static lv_obj_t *g_latest = nullptr;
 static lv_obj_t *g_open_table_btn = nullptr;
 
 static lv_obj_t *g_full_table = nullptr;
+static lv_obj_t *g_full_table_page_label = nullptr;
 static bool g_full_table_dirty = false;
+static uint32_t g_full_table_page = 0;
 static bool g_main_page_active = false;
 static bool g_reconstruction_page_active = false;
 static bool g_spi_test_page_active = false;
@@ -148,6 +158,10 @@ static bool g_cap_send_square_after_complete = false;
 static TaskHandle_t g_dds_direct_task = nullptr;
 static volatile bool g_dds_direct_busy = false;
 static volatile uint32_t g_dds_direct_result = 0;
+static TaskHandle_t g_basic_dds_task = nullptr;
+static volatile bool g_basic_dds_task_running = false;
+static volatile uint32_t g_basic_dds_pending_freq = 0;
+static uint32_t g_basic_dds_last_requested_freq = 0;
 static bool g_model_saved_for_current_sweep = false;
 static bool g_fit_done_for_current_sweep = false;
 static bool g_fit_pending = false;
@@ -192,12 +206,24 @@ static void process_heavyfit_result(void);
 static void process_dds_direct_result(void);
 static bool chart_point_visible(uint32_t index);
 static void create_full_table_page(void);
+static void render_full_table_page(void);
+static void update_full_table_page_label(void);
 static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
+static void request_basic_dds_freq(uint32_t freq_hz);
+static void basic_dds_follow_status(const freqresp_ui_status_t *s);
 
 static constexpr uint32_t kLabelRenderIntervalMs = 50U;
 static constexpr uint32_t kChartRenderIntervalMs = 50U;
 static constexpr uint32_t kFitDelayMs = 300U;
 static constexpr uint32_t kPhaseValidFlag = 0x00000200U;
+
+#ifndef ENABLE_BASIC_ESP_DDS_CONTROL
+#define ENABLE_BASIC_ESP_DDS_CONTROL 1
+#endif
+
+#ifndef BASIC_DDS_FOLLOW_IDLE_MS
+#define BASIC_DDS_FOLLOW_IDLE_MS 100U
+#endif
 
 static bool ensure_ui_work_buffers(void)
 {
@@ -712,6 +738,7 @@ static void ClearAllSweepData(void)
         for (uint32_t col = 1; col < 9; ++col) {
             lv_table_set_cell_value(g_full_table, 1, col, "");
         }
+        update_full_table_page_label();
     }
     g_full_table_dirty = false;
     update_adv_model_line();
@@ -879,6 +906,7 @@ static void append_table_point(const freqresp_ui_status_t *s)
     point->phase_deg_x10 = s->phase_deg_x10;
     point->flags = s->flags;
     point->phase_valid = s->phase_valid;
+    g_full_table_dirty = true;
 
     if (chart_point_visible(g_table_count - 1U)) {
         queue_chart_point(s->gain_x1000);
@@ -1600,6 +1628,80 @@ static void render_basic_status(const freqresp_ui_status_t *s)
     }
 }
 
+static void basic_dds_task_entry(void *arg)
+{
+    (void)arg;
+
+    uint32_t idle_ms = 0;
+    while (idle_ms < BASIC_DDS_FOLLOW_IDLE_MS) {
+        const uint32_t freq_hz = g_basic_dds_pending_freq;
+        if (freq_hz != 0U) {
+            g_basic_dds_pending_freq = 0;
+            idle_ms = 0;
+            const bool ok = DdsDirect_SetBasicFreq(freq_hz);
+            if (!ok) {
+                g_basic_dds_last_requested_freq = 0;
+            }
+#if ENABLE_BASIC_DDS_FREQ_LOG
+            ESP_LOGW(TAG_UI, "Basic DDS direct freq %s: %lu Hz",
+                     ok ? "ok" : "failed",
+                     static_cast<unsigned long>(freq_hz));
+#endif
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            idle_ms += 5U;
+        }
+    }
+
+    g_basic_dds_task_running = false;
+    g_basic_dds_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+static void request_basic_dds_freq(uint32_t freq_hz)
+{
+#if ENABLE_BASIC_ESP_DDS_CONTROL
+    if (freq_hz == 0U || freq_hz == g_basic_dds_last_requested_freq) {
+        return;
+    }
+
+    g_basic_dds_last_requested_freq = freq_hz;
+    g_basic_dds_pending_freq = freq_hz;
+
+    if (!g_basic_dds_task_running) {
+        g_basic_dds_task_running = true;
+        const BaseType_t created = xTaskCreatePinnedToCore(
+            basic_dds_task_entry,
+            "basic_dds_freq",
+            4096,
+            nullptr,
+            2,
+            &g_basic_dds_task,
+            1);
+        if (created != pdPASS) {
+            g_basic_dds_task_running = false;
+            g_basic_dds_task = nullptr;
+            g_basic_dds_last_requested_freq = 0;
+            ESP_LOGE(TAG_UI, "Create basic DDS task failed");
+        }
+    }
+#else
+    (void)freq_hz;
+#endif
+}
+
+static void basic_dds_follow_status(const freqresp_ui_status_t *s)
+{
+#if ENABLE_BASIC_ESP_DDS_CONTROL
+    if (s == nullptr || s->state != FREQRESP_STATE_SCANNING || s->current_freq_hz == 0U) {
+        return;
+    }
+    request_basic_dds_freq(s->current_freq_hz);
+#else
+    (void)s;
+#endif
+}
+
 static void start_button_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
@@ -1611,6 +1713,13 @@ static void start_button_event_cb(lv_event_t *event)
     }
 
     ClearAllSweepData();
+#if ENABLE_BASIC_ESP_DDS_CONTROL
+    g_basic_dds_last_requested_freq = 0;
+    request_basic_dds_freq((g_mode == MODE_SWEEP) ? g_start_freq_hz : g_single_freq_hz);
+    SpiLink_SetPendingCommand(CMD_SET_ESP_DDS_MODE, 1U, 0U);
+#else
+    SpiLink_SetPendingCommand(CMD_SET_ESP_DDS_MODE, 0U, 0U);
+#endif
     SpiLink_SetPendingCommand(CMD_CLEAR_TABLE, 0U, 0U);
 
     if (g_mode == MODE_SWEEP) {
@@ -1684,10 +1793,6 @@ static void keyboard_event_cb(lv_event_t *event)
 static void open_table_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
-        if (g_full_table_dirty) {
-            ESP_LOGI(TAG_UI, "Full table dirty; rendering updated fit columns");
-        }
-        g_full_table_dirty = false;
         create_full_table_page();
     }
 }
@@ -2060,6 +2165,7 @@ static void create_spi_test_page(void)
     g_spi_test_page_active = true;
 
     g_full_table = nullptr;
+    g_full_table_page_label = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
@@ -2154,6 +2260,7 @@ static void create_reconstruction_page(void)
     g_reconstruction_page_active = true;
     g_spi_test_page_active = false;
     g_full_table = nullptr;
+    g_full_table_page_label = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
@@ -2283,6 +2390,7 @@ static void create_main_page(void)
     g_reconstruction_page_active = false;
     g_spi_test_page_active = false;
     g_full_table = nullptr;
+    g_full_table_page_label = nullptr;
     g_adv_status = nullptr;
     g_adv_model_line = nullptr;
     g_adv_model_range_line = nullptr;
@@ -2512,6 +2620,7 @@ void test_screen_update_measurement(const freqresp_ui_status_t *s)
     }
 
     freqresp_ui_status_t view = *s;
+    basic_dds_follow_status(&view);
 
     if (!view.has_measurement) {
         if (g_main_page_active && g_top_status != nullptr) {
@@ -3028,6 +3137,170 @@ static void set_table_cell(lv_obj_t *table, uint32_t row, uint32_t col, const ch
     lv_table_set_cell_ctrl(table, row, col, LV_TABLE_CELL_CTRL_TEXT_CROP);
 }
 
+static uint32_t full_table_page_count(void)
+{
+    if (g_table_count == 0U) {
+        return 1U;
+    }
+    return (g_table_count + FULL_TABLE_PAGE_ROWS - 1U) / FULL_TABLE_PAGE_ROWS;
+}
+
+static void update_full_table_page_label(void)
+{
+    if (g_full_table_page_label == nullptr) {
+        return;
+    }
+
+    char buf[96];
+    const uint32_t pages = full_table_page_count();
+    const uint32_t page = (g_full_table_page < pages) ? g_full_table_page : (pages - 1U);
+    const uint32_t start = (g_table_count == 0U) ? 0U : (page * FULL_TABLE_PAGE_ROWS + 1U);
+    uint32_t end = (page + 1U) * FULL_TABLE_PAGE_ROWS;
+    if (end > g_table_count) {
+        end = g_table_count;
+    }
+    snprintf(buf, sizeof(buf), "Page %lu/%lu  Rows %lu-%lu",
+             static_cast<unsigned long>(page + 1U),
+             static_cast<unsigned long>(pages),
+             static_cast<unsigned long>(start),
+             static_cast<unsigned long>(end));
+    lv_label_set_text(g_full_table_page_label, buf);
+}
+
+static void render_full_table_page(void)
+{
+    if (g_full_table == nullptr) {
+        return;
+    }
+
+    const uint32_t pages = full_table_page_count();
+    if (g_full_table_page >= pages) {
+        g_full_table_page = pages - 1U;
+    }
+
+    const uint32_t start_index = g_full_table_page * FULL_TABLE_PAGE_ROWS;
+    uint32_t rows_on_page = 0;
+    if (g_table_count > start_index) {
+        rows_on_page = g_table_count - start_index;
+        if (rows_on_page > FULL_TABLE_PAGE_ROWS) {
+            rows_on_page = FULL_TABLE_PAGE_ROWS;
+        }
+    }
+
+    lv_table_set_col_cnt(g_full_table, 9);
+    lv_table_set_row_cnt(g_full_table, (rows_on_page == 0U) ? 2U : (rows_on_page + 1U));
+    lv_table_set_col_width(g_full_table, 0, 70);
+    lv_table_set_col_width(g_full_table, 1, 120);
+    lv_table_set_col_width(g_full_table, 2, 100);
+    lv_table_set_col_width(g_full_table, 3, 100);
+    lv_table_set_col_width(g_full_table, 4, 90);
+    lv_table_set_col_width(g_full_table, 5, 95);
+    lv_table_set_col_width(g_full_table, 6, 90);
+    lv_table_set_col_width(g_full_table, 7, 100);
+    lv_table_set_col_width(g_full_table, 8, 130);
+
+    set_table_cell(g_full_table, 0, 0, "No.");
+    set_table_cell(g_full_table, 0, 1, "Freq");
+    set_table_cell(g_full_table, 0, 2, "Vin");
+    set_table_cell(g_full_table, 0, 3, "Vout");
+    set_table_cell(g_full_table, 0, 4, "Gain");
+    set_table_cell(g_full_table, 0, 5, "Theory");
+    set_table_cell(g_full_table, 0, 6, "Error");
+    set_table_cell(g_full_table, 0, 7, "Phase");
+    set_table_cell(g_full_table, 0, 8, "Flags");
+
+    if (rows_on_page == 0U) {
+        set_table_cell(g_full_table, 1, 0, "No data yet");
+        for (uint32_t col = 1; col < 9; ++col) {
+            set_table_cell(g_full_table, 1, col, "");
+        }
+        update_full_table_page_label();
+        g_full_table_dirty = false;
+        return;
+    }
+
+    for (uint32_t n = 0; n < rows_on_page; ++n) {
+        const uint32_t i = start_index + n;
+        const uint32_t row = n + 1U;
+        char no[12];
+        char freq[24];
+        char vin[24];
+        char vout[24];
+        char gain[24];
+        char theory[24];
+        char error[24];
+        char phase[24];
+        char flags[32];
+        char freq_num[16];
+
+        snprintf(no, sizeof(no), "%lu", static_cast<unsigned long>(g_table[i].point_index));
+        format_point_flags(flags, sizeof(flags), g_table[i].flags);
+        if ((g_table[i].flags & FREQ_POINT_FLAG_MISSING) != 0U) {
+            set_table_cell(g_full_table, row, 0, no);
+            set_table_cell(g_full_table, row, 1, "--");
+            set_table_cell(g_full_table, row, 2, "--");
+            set_table_cell(g_full_table, row, 3, "--");
+            set_table_cell(g_full_table, row, 4, "--");
+            set_table_cell(g_full_table, row, 5, "--");
+            set_table_cell(g_full_table, row, 6, "--");
+            set_table_cell(g_full_table, row, 7, "--");
+            set_table_cell(g_full_table, row, 8, flags);
+            continue;
+        }
+
+        format_freq(freq_num, sizeof(freq_num), g_table[i].freq_hz);
+        snprintf(freq, sizeof(freq), "%s Hz", freq_num);
+        format_voltage(vin, sizeof(vin), g_table[i].vin_mv);
+        format_voltage(vout, sizeof(vout), g_table[i].vout_mv);
+        format_x1000(gain, sizeof(gain), g_table[i].gain_x1000);
+        format_x1000(theory, sizeof(theory), g_table[i].theory_gain_x1000);
+        format_error(error, sizeof(error), g_table[i].error_x10);
+        format_phase(phase, sizeof(phase), g_table[i].phase_deg_x10);
+        if (g_table[i].theory_gain_x1000 <= 0) {
+            snprintf(theory, sizeof(theory), "----");
+            snprintf(error, sizeof(error), "N/A");
+        }
+        if (!g_table[i].phase_valid) {
+            snprintf(phase, sizeof(phase), "--");
+        }
+
+        set_table_cell(g_full_table, row, 0, no);
+        set_table_cell(g_full_table, row, 1, freq);
+        set_table_cell(g_full_table, row, 2, vin);
+        set_table_cell(g_full_table, row, 3, vout);
+        set_table_cell(g_full_table, row, 4, gain);
+        set_table_cell(g_full_table, row, 5, theory);
+        set_table_cell(g_full_table, row, 6, error);
+        set_table_cell(g_full_table, row, 7, phase);
+        set_table_cell(g_full_table, row, 8, flags);
+    }
+
+    update_full_table_page_label();
+    g_full_table_dirty = false;
+}
+
+static void full_table_prev_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+    if (g_full_table_page > 0U) {
+        --g_full_table_page;
+        render_full_table_page();
+    }
+}
+
+static void full_table_next_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+    if ((g_full_table_page + 1U) < full_table_page_count()) {
+        ++g_full_table_page;
+        render_full_table_page();
+    }
+}
+
 static void create_harmonic_table_page(void)
 {
 #if LVGL_VERSION_MAJOR >= 9
@@ -3041,6 +3314,7 @@ static void create_harmonic_table_page(void)
     g_reconstruction_page_active = false;
     g_spi_test_page_active = false;
     g_full_table = nullptr;
+    g_full_table_page_label = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
@@ -3156,6 +3430,7 @@ static void create_full_table_page(void)
     g_reconstruction_page_active = false;
     g_spi_test_page_active = false;
     g_full_table = nullptr;
+    g_full_table_page_label = nullptr;
     g_top_status = nullptr;
     g_msg = nullptr;
     g_chart = nullptr;
@@ -3176,6 +3451,11 @@ static void create_full_table_page(void)
 
     create_label(screen, "Full Data Table", 24, 14, 320, &lv_font_montserrat_24, COLOR_TEXT);
     create_label(screen, points_buf, 360, 18, 220, &lv_font_montserrat_20, COLOR_GREEN);
+    g_full_table_page_label = create_label(screen, "Page --", 570, 20, 160, &lv_font_montserrat_14, COLOR_YELLOW);
+    lv_obj_t *prev = create_button(screen, "Prev", 735, 12, 70);
+    lv_obj_add_event_cb(prev, full_table_prev_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *next = create_button(screen, "Next", 815, 12, 70);
+    lv_obj_add_event_cb(next, full_table_next_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *back = create_button(screen, "Back", 900, 12, 100);
     lv_obj_add_event_cb(back, back_button_event_cb, LV_EVENT_CLICKED, nullptr);
     create_hline(screen, 55);
@@ -3200,94 +3480,5 @@ static void create_full_table_page(void)
     lv_obj_set_style_pad_top(g_full_table, 6, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(g_full_table, 6, LV_PART_ITEMS);
 
-    lv_table_set_col_cnt(g_full_table, 9);
-    lv_table_set_row_cnt(g_full_table, (g_table_count == 0U) ? 2U : (g_table_count + 1U));
-    lv_table_set_col_width(g_full_table, 0, 70);
-    lv_table_set_col_width(g_full_table, 1, 120);
-    lv_table_set_col_width(g_full_table, 2, 100);
-    lv_table_set_col_width(g_full_table, 3, 100);
-    lv_table_set_col_width(g_full_table, 4, 90);
-    lv_table_set_col_width(g_full_table, 5, 95);
-    lv_table_set_col_width(g_full_table, 6, 90);
-    lv_table_set_col_width(g_full_table, 7, 100);
-    lv_table_set_col_width(g_full_table, 8, 130);
-
-    set_table_cell(g_full_table, 0, 0, "No.");
-    set_table_cell(g_full_table, 0, 1, "Freq");
-    set_table_cell(g_full_table, 0, 2, "Vin");
-    set_table_cell(g_full_table, 0, 3, "Vout");
-    set_table_cell(g_full_table, 0, 4, "Gain");
-    set_table_cell(g_full_table, 0, 5, "Theory");
-    set_table_cell(g_full_table, 0, 6, "Error");
-    set_table_cell(g_full_table, 0, 7, "Phase");
-    set_table_cell(g_full_table, 0, 8, "Flags");
-
-    if (g_table_count == 0U) {
-        set_table_cell(g_full_table, 1, 0, "No data yet");
-        set_table_cell(g_full_table, 1, 1, "");
-        set_table_cell(g_full_table, 1, 2, "");
-        set_table_cell(g_full_table, 1, 3, "");
-        set_table_cell(g_full_table, 1, 4, "");
-        set_table_cell(g_full_table, 1, 5, "");
-        set_table_cell(g_full_table, 1, 6, "");
-        set_table_cell(g_full_table, 1, 7, "");
-        set_table_cell(g_full_table, 1, 8, "");
-        return;
-    }
-
-    for (uint32_t i = 0; i < g_table_count; ++i) {
-        char no[12];
-        char freq[24];
-        char vin[24];
-        char vout[24];
-        char gain[24];
-        char theory[24];
-        char error[24];
-        char phase[24];
-        char flags[32];
-        char freq_num[16];
-
-        snprintf(no, sizeof(no), "%lu", static_cast<unsigned long>(g_table[i].point_index));
-        format_point_flags(flags, sizeof(flags), g_table[i].flags);
-        if ((g_table[i].flags & FREQ_POINT_FLAG_MISSING) != 0U) {
-            const uint32_t row = i + 1U;
-            set_table_cell(g_full_table, row, 0, no);
-            set_table_cell(g_full_table, row, 1, "--");
-            set_table_cell(g_full_table, row, 2, "--");
-            set_table_cell(g_full_table, row, 3, "--");
-            set_table_cell(g_full_table, row, 4, "--");
-            set_table_cell(g_full_table, row, 5, "--");
-            set_table_cell(g_full_table, row, 6, "--");
-            set_table_cell(g_full_table, row, 7, "--");
-            set_table_cell(g_full_table, row, 8, flags);
-            continue;
-        }
-        format_freq(freq_num, sizeof(freq_num), g_table[i].freq_hz);
-        snprintf(freq, sizeof(freq), "%s Hz", freq_num);
-        format_voltage(vin, sizeof(vin), g_table[i].vin_mv);
-        format_voltage(vout, sizeof(vout), g_table[i].vout_mv);
-        format_x1000(gain, sizeof(gain), g_table[i].gain_x1000);
-        format_x1000(theory, sizeof(theory), g_table[i].theory_gain_x1000);
-        format_error(error, sizeof(error), g_table[i].error_x10);
-        format_phase(phase, sizeof(phase), g_table[i].phase_deg_x10);
-        if (g_table[i].theory_gain_x1000 <= 0) {
-            snprintf(theory, sizeof(theory), "----");
-            snprintf(error, sizeof(error), "N/A");
-        }
-        if (!g_table[i].phase_valid) {
-            snprintf(phase, sizeof(phase), "--");
-        }
-
-        const uint32_t row = i + 1U;
-        set_table_cell(g_full_table, row, 0, no);
-        set_table_cell(g_full_table, row, 1, freq);
-        set_table_cell(g_full_table, row, 2, vin);
-        set_table_cell(g_full_table, row, 3, vout);
-        set_table_cell(g_full_table, row, 4, gain);
-        set_table_cell(g_full_table, row, 5, theory);
-        set_table_cell(g_full_table, row, 6, error);
-        set_table_cell(g_full_table, row, 7, phase);
-        set_table_cell(g_full_table, row, 8, flags);
-    }
-    g_full_table_dirty = false;
+    render_full_table_page();
 }

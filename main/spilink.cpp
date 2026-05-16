@@ -21,6 +21,30 @@
 #define ACCEPT_ZERO_CHECKSUM_ADV_WAVE 1
 #endif
 
+#ifndef ENABLE_SPILINK_STATUS_LOG
+#define ENABLE_SPILINK_STATUS_LOG 0
+#endif
+
+#ifndef ENABLE_SPILINK_ADV_STATUS_LOG
+#define ENABLE_SPILINK_ADV_STATUS_LOG 0
+#endif
+
+#ifndef ENABLE_SPILINK_POINT_LOG
+#define ENABLE_SPILINK_POINT_LOG 0
+#endif
+
+#ifndef ENABLE_SPILINK_COMMAND_LOG
+#define ENABLE_SPILINK_COMMAND_LOG 0
+#endif
+
+#ifndef ENABLE_SPILINK_STATS_LOG
+#define ENABLE_SPILINK_STATS_LOG 0
+#endif
+
+#ifndef ENABLE_SPILINK_HARMONIC_LOG
+#define ENABLE_SPILINK_HARMONIC_LOG 0
+#endif
+
 namespace {
 
 constexpr char TAG[] = "FreqRespSpiLink";
@@ -239,6 +263,7 @@ const char *CommandName(uint32_t cmd)
     case CMD_ADV_SEND_TO_DDS: return "ADV_SEND_TO_DDS";
     case CMD_ADC_TEST_START: return "ADC_TEST_START";
     case CMD_ADC_TEST_STOP: return "ADC_TEST_STOP";
+    case CMD_SET_ESP_DDS_MODE: return "SET_ESP_DDS_MODE";
     default: return "UNKNOWN";
     }
 }
@@ -567,6 +592,7 @@ bool ParseAdvStatusFrame(const uint8_t *frame, size_t len, adv_status_t *out)
 
 void MaybeLogBasicStatusDiagnostics(const uint8_t *frame, const freqresp_ui_status_t *status)
 {
+#if ENABLE_SPILINK_STATUS_LOG
     if (frame == nullptr || status == nullptr) {
         return;
     }
@@ -634,10 +660,15 @@ void MaybeLogBasicStatusDiagnostics(const uint8_t *frame, const freqresp_ui_stat
              static_cast<unsigned>(dds_retry),
              static_cast<unsigned>(spi_b_bits),
              dds_ack_bad ? " DDS_ACK_BAD" : "");
+#else
+    (void)frame;
+    (void)status;
+#endif
 }
 
 void MaybeLogAdvStatusDiagnostics(const adv_status_t *status)
 {
+#if ENABLE_SPILINK_ADV_STATUS_LOG
     if (status == nullptr) {
         return;
     }
@@ -676,6 +707,9 @@ void MaybeLogAdvStatusDiagnostics(const adv_status_t *status)
              static_cast<unsigned long>(status->last_cmd_reject_reason),
              static_cast<unsigned long>(status->capture_done_count),
              static_cast<unsigned long>(status->recon_done_count));
+#else
+    (void)status;
+#endif
 }
 
 bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk_t *out)
@@ -898,6 +932,7 @@ void PrepareTxBuffer()
         seq = g_cmd_seq;
         portEXIT_CRITICAL(&g_cmd_lock);
 
+#if ENABLE_SPILINK_COMMAND_LOG
         ESP_LOGW(TAG,
                  "ESP->PYNQ CMD seq=%lu cmd=%lu(%s) arg0=%lu arg1=%lu",
                  static_cast<unsigned long>(seq),
@@ -905,6 +940,7 @@ void PrepareTxBuffer()
                  CommandName(pending.cmd),
                  static_cast<unsigned long>(pending.arg0),
                  static_cast<unsigned long>(pending.arg1));
+#endif
     }
 
     size_t o = kFrameHeaderLen;
@@ -972,6 +1008,7 @@ void MaybeUpdatePointQueueHighWater()
 
 void MaybeLogSpiStats()
 {
+#if ENABLE_SPILINK_STATS_LOG
     const TickType_t now = xTaskGetTickCount();
     if (last_log_tick != 0 &&
         (now - last_log_tick) < pdMS_TO_TICKS(1000)) {
@@ -995,6 +1032,7 @@ void MaybeLogSpiStats()
              static_cast<unsigned long>(point_queue_high_water),
              static_cast<unsigned long>(last_point_index),
              static_cast<unsigned long>(last_freq_hz));
+#endif
 }
 
 void MaybeLogInvalidFrame(size_t rx_bits)
@@ -1424,6 +1462,7 @@ void SpiLink_Task(void)
     adv_harmonic_t adv_harmonic = {};
     if (ParseAdvHarmonicFrame(parse_frame, kFrameLen, &adv_harmonic)) {
         ++ok_count;
+#if ENABLE_SPILINK_HARMONIC_LOG
         if (adv_harmonic.index <= 5U) {
             ESP_LOGI(TAG,
                      "ADV harmonic rx: index=%lu freq=%lu amp=%ld flags=0x%08lX",
@@ -1432,6 +1471,7 @@ void SpiLink_Task(void)
                      static_cast<long>(adv_harmonic.amp_mv),
                      static_cast<unsigned long>(adv_harmonic.flags));
         }
+#endif
         if (g_adv_harmonic_queue != nullptr) {
             if (xQueueSend(g_adv_harmonic_queue, &adv_harmonic, 0) != pdTRUE) {
                 ++dropped_harmonic_count;
@@ -1463,6 +1503,7 @@ void SpiLink_Task(void)
 
             last_point_index = status.point_index;
             last_freq_hz = status.current_freq_hz;
+#if ENABLE_SPILINK_POINT_LOG
             ESP_LOGW(TAG,
                      "PYNQ point idx=%lu/%lu freq=%lu vin=%ld vout=%ld gain=%ld phase=%ld flags=0x%08lX phase_valid=%u",
                      static_cast<unsigned long>(status.point_index),
@@ -1474,6 +1515,7 @@ void SpiLink_Task(void)
                      static_cast<long>(status.phase_deg_x10),
                      static_cast<unsigned long>(status.flags),
                      status.phase_valid ? 1U : 0U);
+#endif
             point_queue_item_t point_item = {};
             FillPointQueueItem(&status, &point_item);
             if (xQueueSend(g_point_queue, &point_item, 0) != pdTRUE) {

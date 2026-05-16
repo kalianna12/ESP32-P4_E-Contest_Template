@@ -13,7 +13,11 @@
 #include "freertos/task.h"
 
 #ifndef ENABLE_DDS_DIRECT_VERBOSE_ACK
-#define ENABLE_DDS_DIRECT_VERBOSE_ACK 1
+#define ENABLE_DDS_DIRECT_VERBOSE_ACK 0
+#endif
+
+#ifndef ENABLE_DDS_DIRECT_ACK_ERROR_LOG
+#define ENABLE_DDS_DIRECT_ACK_ERROR_LOG 0
 #endif
 
 namespace {
@@ -184,6 +188,7 @@ void LogAck(const char *tag)
     }
 
     if (!IsAckFrame(ack)) {
+#if ENABLE_DDS_DIRECT_ACK_ERROR_LOG
         ESP_LOGW(TAG,
                  "%s ack invalid: head=%02X %02X %02X %02X chk=%02X expect=%02X",
                  tag,
@@ -193,6 +198,9 @@ void LogAck(const char *tag)
                  g_rx[3],
                  g_rx[kChecksumOffset],
                  Checksum(g_rx));
+#else
+        (void)tag;
+#endif
         return;
     }
 
@@ -373,6 +381,36 @@ bool DdsDirect_Init(void)
              DDS_SPI_CLOCK_HZ,
              static_cast<unsigned>(kFrameLen));
     return true;
+}
+
+bool DdsDirect_SetBasicFreq(uint32_t freq_hz)
+{
+    if (freq_hz == 0U) {
+        ESP_LOGE(TAG, "Invalid basic DDS freq: 0");
+        return false;
+    }
+    if (!EnsureReady()) {
+        return false;
+    }
+
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+
+    const uint32_t seq = NextSeq();
+    BeginFrame(0xD1, seq);
+    PutU32(g_tx, 8, 1U);       // DDS_CMD_SET_FREQ
+    PutU32(g_tx, 12, freq_hz);
+    PutU32(g_tx, 16, 1000U);   // nominal amplitude field, kept for D1 compatibility
+    FinishFrame();
+    const bool ok = TransferFrame("D1");
+
+    xSemaphoreGive(g_lock);
+
+    if (!ok) {
+        ESP_LOGW(TAG, "DDS basic set failed: seq=0x%08lX freq=%lu",
+                 static_cast<unsigned long>(seq),
+                 static_cast<unsigned long>(freq_hz));
+    }
+    return ok;
 }
 
 bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t sample_rate_hz)
