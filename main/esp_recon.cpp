@@ -30,6 +30,7 @@ constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
 constexpr uint32_t kMaxLockedHarmonics = 100U;
 constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
+constexpr uint32_t kReconDdsActualPlaybackRateHz = 125000U;
 constexpr uint32_t kYieldEveryBins = 16U;
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
@@ -928,22 +929,30 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
 
 static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
                                            float *dst,
-                                           uint32_t dst_n,
-                                           uint32_t *playback_sample_rate_hz)
+                                           uint32_t dst_capacity,
+                                           uint32_t *playback_sample_rate_hz,
+                                           uint32_t *playback_sample_count)
 {
-    if (out == nullptr || dst == nullptr || dst_n < 8U || out->harmonic_count == 0U ||
+    if (out == nullptr || dst == nullptr || dst_capacity < 8U || out->harmonic_count == 0U ||
         out->dominant_freq_hz == 0U) {
         return false;
     }
 
     uint32_t cycles = static_cast<uint32_t>(
-        ((static_cast<uint64_t>(out->dominant_freq_hz) * dst_n) +
-         (kReconDdsPlaybackRateHz / 2U)) /
-        kReconDdsPlaybackRateHz);
+        (static_cast<uint64_t>(out->dominant_freq_hz) * dst_capacity) /
+        kReconDdsActualPlaybackRateHz);
     if (cycles == 0U) {
         cycles = 1U;
     }
-    if (cycles >= dst_n / 2U) {
+
+    uint32_t dst_n = static_cast<uint32_t>(
+        ((static_cast<uint64_t>(cycles) * kReconDdsActualPlaybackRateHz) +
+         (out->dominant_freq_hz / 2U)) /
+        out->dominant_freq_hz);
+    if (dst_n > dst_capacity) {
+        dst_n = dst_capacity;
+    }
+    if (dst_n < 8U || cycles >= dst_n / 2U) {
         return false;
     }
 
@@ -983,6 +992,9 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
 
     if (playback_sample_rate_hz != nullptr) {
         *playback_sample_rate_hz = kReconDdsPlaybackRateHz;
+    }
+    if (playback_sample_count != nullptr) {
+        *playback_sample_count = dst_n;
     }
     return true;
 }
@@ -1111,10 +1123,13 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
     uint32_t playback_sample_rate_hz = sample_rate_hz;
+    uint32_t periodic_sample_count = kOutN;
 #if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE && ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
-    if (BuildPeriodicWaveFromHarmonics(out, w->synth, kOutN, &playback_sample_rate_hz)) {
+    if (BuildPeriodicWaveFromHarmonics(out, w->synth, kOutN,
+                                       &playback_sample_rate_hz,
+                                       &periodic_sample_count)) {
         output_src = w->synth;
-        output_count = kOutN;
+        output_count = periodic_sample_count;
         out->sample_rate_hz = kReconDdsPlaybackRateHz;
     } else
 #endif

@@ -46,6 +46,9 @@ constexpr uint32_t kMaxSampleCount = 4096;
 constexpr uint32_t kDefaultSampleCount = 4096;
 constexpr uint32_t kDefaultSampleRateHz = 100000;
 constexpr uint32_t kSamplesPerChunk = 30;
+constexpr uint32_t kSquareTestSampleCount = 4000;
+constexpr uint32_t kSquareTestPeriodSamples = 80;
+constexpr uint32_t kSquareTestHalfPeriodSamples = kSquareTestPeriodSamples / 2U;
 
 spi_device_handle_t g_dds_spi = nullptr;
 SemaphoreHandle_t g_lock = nullptr;
@@ -455,10 +458,12 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
 bool DdsDirect_SendSquareTest(void)
 {
     static int16_t samples[kDefaultSampleCount];
-    for (uint32_t i = 0; i < kDefaultSampleCount; ++i) {
-        samples[i] = (i & 32U) ? static_cast<int16_t>(6000) : static_cast<int16_t>(-6000);
+    for (uint32_t i = 0; i < kSquareTestSampleCount; ++i) {
+        samples[i] = ((i % kSquareTestPeriodSamples) >= kSquareTestHalfPeriodSamples)
+                         ? static_cast<int16_t>(6000)
+                         : static_cast<int16_t>(-6000);
     }
-    return DdsDirect_SendWave(samples, kDefaultSampleCount, kDefaultSampleRateHz);
+    return DdsDirect_SendWave(samples, kSquareTestSampleCount, kDefaultSampleRateHz);
 }
 
 bool DdsDirect_SendTriangleTest(void)
