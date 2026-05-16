@@ -116,6 +116,38 @@ static void NormalizeToInt16(const float *src, uint32_t n, int32_t target_peak, 
     *out_max = mx;
 }
 
+static void MakeLoopContinuous(float *x, uint32_t n)
+{
+    if (x == nullptr || n < 2U) {
+        return;
+    }
+
+    // The DAC repeats the 1024-point RAM forever. If the captured/rebuilt
+    // frame does not contain an integer number of periods, sample[n-1] jumps
+    // back to sample[0] at wrap and the scope shows a notch. Remove the linear
+    // end-to-start mismatch first.
+    const float end_error = x[n - 1U] - x[0];
+    for (uint32_t i = 0; i < n; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(n - 1U);
+        x[i] -= end_error * t;
+    }
+
+    // Then crossfade a small wrap region. This is deliberately conservative:
+    // it only touches the first/last 16 samples and is meant to hide the loop
+    // boundary, not reshape the waveform.
+    constexpr uint32_t kFade = 16U;
+    if (n <= kFade * 2U) {
+        return;
+    }
+    for (uint32_t i = 0; i < kFade; ++i) {
+        const float a = static_cast<float>(i + 1U) / static_cast<float>(kFade + 1U);
+        const uint32_t tail = n - kFade + i;
+        const float blended = x[tail] * (1.0f - a) + x[i] * a;
+        x[tail] = blended;
+    }
+    x[n - 1U] = x[0];
+}
+
 static bool InterpolateModel(const circuit_model_t *model, uint32_t freq_hz,
                              float *gain, float *phase_rad)
 {
@@ -357,6 +389,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     InverseDft(sample_count, w);
 #endif
 
+    MakeLoopContinuous(w->tr, sample_count);
     NormalizeToInt16(w->tr, sample_count, ESP_RECON_TARGET_PEAK, w->wave,
                      &out->out_min, &out->out_max);
     out->out_vpp = out->out_max - out->out_min;
