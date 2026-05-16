@@ -869,11 +869,12 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
     uint32_t playback_sample_rate_hz = sample_rate_hz;
+    constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 #if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE && ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
     if (BuildPeriodicWaveFromHarmonics(out, w->synth, kOutN, &playback_sample_rate_hz)) {
         output_src = w->synth;
         output_count = kOutN;
-        out->sample_rate_hz = playback_sample_rate_hz;
+        out->sample_rate_hz = kReconDdsPlaybackRateHz;
     } else
 #endif
     {
@@ -888,7 +889,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
         }
         MakeLoopContinuous(w->tr, output_count);
         output_src = w->tr;
-        out->sample_rate_hz = sample_rate_hz;
+        out->sample_rate_hz = kReconDdsPlaybackRateHz;
     }
 
 #if ESP_RECON_OUTPUT_SMOOTH_ENABLE
