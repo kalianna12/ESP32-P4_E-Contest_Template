@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define MAX_POINTS 1200
+#define MAX_POINTS 2000
 #define MODEL_POINTS_MAX 128
 #define ADC_TEST_SAMPLE_MAX 256
 #define ADV_HARMONIC_MAX 50

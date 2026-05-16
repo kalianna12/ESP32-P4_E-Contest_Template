@@ -21,7 +21,7 @@ extern "C" {
 // 1: DFT/IFFT, magnitude compensation only; keep captured phase. Recommended first.
 // 2: DFT/IFFT, magnitude + phase compensation.
 #ifndef ESP_RECON_STAGE
-#define ESP_RECON_STAGE 1
+#define ESP_RECON_STAGE 2
 #endif
 
 #ifndef ESP_RECON_TARGET_PEAK
