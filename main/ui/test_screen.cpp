@@ -2535,7 +2535,7 @@ static void capture_buffer_print_summary(uint32_t total_count)
     const int32_t mean = (g_cap_received_count == 0U) ? 0 :
         static_cast<int32_t>(sum / static_cast<int64_t>(g_cap_received_count));
 
-    ESP_LOGI(TAG_UI,
+    ESP_LOGW(TAG_UI,
              "CAP COMPLETE min=%d max=%d vpp=%ld mean=%ld zero_count=%lu received=%lu/%lu",
              static_cast<int>(cap_min),
              static_cast<int>(cap_max),
@@ -2554,10 +2554,10 @@ static void capture_buffer_print_summary(uint32_t total_count)
             break;
         }
     }
-    ESP_LOGI(TAG_UI, "%s", first_line);
+    ESP_LOGW(TAG_UI, "%s", first_line);
 
     for (uint32_t i = 0; i < n; i += 64U) {
-        ESP_LOGI(TAG_UI, "CAP[%04lu]=%d",
+        ESP_LOGW(TAG_UI, "CAP[%04lu]=%d",
                  static_cast<unsigned long>(i),
                  static_cast<int>(g_cap_samples[i]));
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -2627,6 +2627,13 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
                      static_cast<unsigned long>(missing_chunks),
                      static_cast<unsigned long>(g_cap_received_count),
                      static_cast<unsigned long>(total));
+            ESP_LOGW(TAG_UI,
+                     "CAP frame meta: min=%ld max=%ld vpp=%ld mean=%ld flags=0x%08lX",
+                     static_cast<long>(chunk->min_mv),
+                     static_cast<long>(chunk->max_mv),
+                     static_cast<long>(chunk->vpp_mv),
+                     static_cast<long>(chunk->mean_mv),
+                     static_cast<unsigned long>(chunk->flags));
             capture_buffer_print_summary(total);
             if (g_cap_send_square_after_complete) {
                 g_cap_send_square_after_complete = false;
@@ -2636,9 +2643,15 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
         } else {
             g_cap_send_square_after_complete = false;
             ESP_LOGW(TAG_UI,
-                     "CAP incomplete at done: received=%lu/%lu",
+                     "CAP incomplete at done: received=%lu/%lu idx=%lu/%lu start=%lu flags=0x%08lX s0=%d s1=%d",
                      static_cast<unsigned long>(g_cap_received_count),
-                     static_cast<unsigned long>(total));
+                     static_cast<unsigned long>(total),
+                     static_cast<unsigned long>(chunk->chunk_index),
+                     static_cast<unsigned long>(chunk->chunk_count),
+                     static_cast<unsigned long>(chunk->start_sample_index),
+                     static_cast<unsigned long>(chunk->flags),
+                     static_cast<int>(chunk->samples[0]),
+                     static_cast<int>(chunk->samples[1]));
         }
     }
 }

@@ -106,6 +106,7 @@ uint32_t dropped_adv_wave_count = 0;
 uint32_t dropped_harmonic_count = 0;
 uint32_t recovered_header_count = 0;
 uint32_t adv_wave_checksum_warn_count = 0;
+uint32_t adv_wave_reject_warn_count = 0;
 uint32_t point_queue_high_water = 0;
 uint32_t last_point_index = 0;
 uint32_t last_freq_hz = 0;
@@ -529,6 +530,16 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     if (rx_checksum != expected_checksum) {
 #if ACCEPT_ZERO_CHECKSUM_ADV_WAVE
         if (rx_checksum != 0U) {
+            if (adv_wave_reject_warn_count < 8U) {
+                ++adv_wave_reject_warn_count;
+                ESP_LOGW(TAG,
+                         "ADV 0x15 reject checksum: seq=%lu chunk=%lu expected=%02X got=%02X warn=%lu",
+                         static_cast<unsigned long>(GetU32(frame, 4)),
+                         static_cast<unsigned long>(GetU32(frame, 12)),
+                         expected_checksum,
+                         rx_checksum,
+                         static_cast<unsigned long>(adv_wave_reject_warn_count));
+            }
             return false;
         }
 #else
@@ -559,13 +570,32 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     out->mean_mv = GetI32(frame, 40);
     out->vpp_mv = GetI32(frame, 44);
     out->flags = GetU32(frame, 48);
+    const uint32_t expected_chunk_count =
+        (out->total_sample_count + 29U) / 30U;
+    const uint32_t expected_start_index = out->chunk_index * 30U;
     if (out->wave_type > 1U ||
         out->chunk_count == 0U ||
         out->chunk_count > 64U ||
         out->total_sample_count == 0U ||
         out->total_sample_count > 1024U ||
         out->start_sample_index >= out->total_sample_count ||
-        out->chunk_index >= out->chunk_count) {
+        out->chunk_index >= out->chunk_count ||
+        out->chunk_count != expected_chunk_count ||
+        out->start_sample_index != expected_start_index) {
+        if (adv_wave_reject_warn_count < 8U) {
+            ++adv_wave_reject_warn_count;
+            ESP_LOGW(TAG,
+                     "ADV 0x15 reject fields: seq=%lu idx=%lu/%lu start=%lu exp_chunks=%lu exp_start=%lu total=%lu flags=0x%08lX warn=%lu",
+                     static_cast<unsigned long>(out->seq),
+                     static_cast<unsigned long>(out->chunk_index),
+                     static_cast<unsigned long>(out->chunk_count),
+                     static_cast<unsigned long>(out->start_sample_index),
+                     static_cast<unsigned long>(expected_chunk_count),
+                     static_cast<unsigned long>(expected_start_index),
+                     static_cast<unsigned long>(out->total_sample_count),
+                     static_cast<unsigned long>(out->flags),
+                     static_cast<unsigned long>(adv_wave_reject_warn_count));
+        }
         return false;
     }
     for (size_t i = 0; i < 30U; ++i) {
@@ -934,6 +964,7 @@ void SpiLink_Init(void)
     dropped_harmonic_count = 0;
     recovered_header_count = 0;
     adv_wave_checksum_warn_count = 0;
+    adv_wave_reject_warn_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
@@ -997,6 +1028,7 @@ void SpiLink_ClearMeasurementCache(void)
     dropped_adv_wave_count = 0;
     dropped_harmonic_count = 0;
     recovered_header_count = 0;
+    adv_wave_reject_warn_count = 0;
     point_queue_high_water = 0;
     last_point_index = 0;
     last_freq_hz = 0;
