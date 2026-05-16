@@ -1758,6 +1758,18 @@ static void adv_direct_triangle_event_cb(lv_event_t *event)
                    ok ? COLOR_GREEN : COLOR_RED);
 }
 
+static void adv_spi_echo_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    set_adv_result("DDS SPI ECHO TX", COLOR_YELLOW);
+    const bool ok = DdsDirect_SpiEchoTest();
+    set_adv_result(ok ? "DDS SPI ECHO DONE" : "DDS SPI ECHO FAIL",
+                   ok ? COLOR_GREEN : COLOR_RED);
+}
+
 static void adv_back_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -2036,24 +2048,26 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 464, 178, 95);
     lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 579, 178, 95);
     lv_obj_t *btn_cap_direct_square = create_button(screen, "CAP+SQ", 874, 178, 115);
+    lv_obj_t *btn_spi_echo = create_button(screen, "SPI ECHO", 464, 214, 120);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_triangle, adv_direct_triangle_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_cap_direct_square, adv_capture_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_spi_echo, adv_spi_echo_event_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *btn_harmonic = create_button(screen, "Harmonics", 694, 178, 160);
     lv_obj_add_event_cb(btn_harmonic, open_harmonic_table_event_cb, LV_EVENT_CLICKED, nullptr);
 
-    create_hline(screen, 230);
+    create_hline(screen, 265);
 
-    create_label(screen, "Harmonics", 24, 250, 220, &lv_font_montserrat_20, COLOR_BLUE);
+    create_label(screen, "Harmonics", 24, 280, 220, &lv_font_montserrat_20, COLOR_BLUE);
     for (uint32_t i = 0; i <= ADV_HARMONIC_MAIN_ROWS; ++i) {
         g_adv_harmonic_rows[i] = create_label(screen,
                                               "",
                                               24,
-                                              285 + static_cast<int32_t>(i * 18U),
+                                              312 + static_cast<int32_t>(i * 18U),
                                               560,
                                               &lv_font_montserrat_14,
                                               i == 0U ? COLOR_SUBTEXT : COLOR_TEXT);

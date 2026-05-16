@@ -7,6 +7,7 @@
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -17,10 +18,16 @@ constexpr char TAG[] = "DdsDirect";
 
 constexpr spi_host_device_t DDS_SPI_HOST = SPI2_HOST;
 constexpr gpio_num_t DDS_SPI_SCLK = GPIO_NUM_33;
-constexpr gpio_num_t DDS_SPI_MOSI = GPIO_NUM_54;
+// GPIO54 produced unstable MOSI on the ESP32-P4 board in hardware echo tests.
+// Keep the DDS-side pin at PmodB1/W14 and wire this clean GPIO to that pin.
+// Do not use GPIO7/GPIO8 here: they are the board I2C SDA/SCL for touch.
+constexpr gpio_num_t DDS_SPI_MOSI = GPIO_NUM_5;
 constexpr gpio_num_t DDS_SPI_MISO = GPIO_NUM_48;
 constexpr gpio_num_t DDS_SPI_CS = GPIO_NUM_32;
 constexpr int DDS_SPI_CLOCK_HZ = 1 * 1000 * 1000;
+constexpr uint8_t DDS_SPI_MODE = 0;
+constexpr bool DDS_SPI_USE_BITBANG = true;
+constexpr uint32_t DDS_SPI_BITBANG_HALF_PERIOD_US = 2;
 
 constexpr uint8_t kMagic0 = 0xA5;
 constexpr uint8_t kMagic1 = 0x5A;
@@ -70,6 +77,58 @@ uint8_t Checksum(const uint8_t *frame)
     return chk;
 }
 
+bool IsAckFrame(const uint8_t *frame)
+{
+    return frame[0] == kMagic0 && frame[1] == kMagic1 && frame[2] == 0xD2 &&
+           frame[3] == kPayloadLen && frame[kChecksumOffset] == Checksum(frame);
+}
+
+bool IsEchoFrame(const uint8_t *frame)
+{
+    return frame[0] == kMagic0 && frame[1] == kMagic1 && frame[2] == 0xE1 &&
+           frame[3] == kPayloadLen && frame[kChecksumOffset] == Checksum(frame);
+}
+
+bool RecoverOneBitLeftShiftedAck(uint8_t *fixed)
+{
+    fixed[0] = static_cast<uint8_t>(0x80U | (g_rx[0] >> 1));
+    for (size_t i = 1; i < kFrameLen; ++i) {
+        fixed[i] = static_cast<uint8_t>((g_rx[i] >> 1) | ((g_rx[i - 1] & 0x01U) << 7));
+    }
+    return IsAckFrame(fixed);
+}
+
+void DdsGpioDelay()
+{
+    esp_rom_delay_us(DDS_SPI_BITBANG_HALF_PERIOD_US);
+}
+
+void ConfigureDdsBitbangPins()
+{
+    gpio_config_t out_cfg = {};
+    out_cfg.pin_bit_mask = BIT64(DDS_SPI_SCLK) | BIT64(DDS_SPI_MOSI) | BIT64(DDS_SPI_CS);
+    out_cfg.mode = GPIO_MODE_OUTPUT;
+    out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    out_cfg.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&out_cfg);
+
+    gpio_config_t in_cfg = {};
+    in_cfg.pin_bit_mask = BIT64(DDS_SPI_MISO);
+    in_cfg.mode = GPIO_MODE_INPUT;
+    in_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    in_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    in_cfg.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&in_cfg);
+
+    gpio_set_drive_capability(DDS_SPI_SCLK, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(DDS_SPI_MOSI, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(DDS_SPI_CS, GPIO_DRIVE_CAP_3);
+    gpio_set_level(DDS_SPI_SCLK, 0);
+    gpio_set_level(DDS_SPI_MOSI, 0);
+    gpio_set_level(DDS_SPI_CS, 1);
+}
+
 uint32_t NextSeq()
 {
     ++g_seq;
@@ -97,8 +156,37 @@ void FinishFrame()
 
 void LogAck(const char *tag)
 {
-    if (g_rx[0] != kMagic0 || g_rx[1] != kMagic1 || g_rx[2] != 0xD2 ||
-        g_rx[3] != kPayloadLen || g_rx[kChecksumOffset] != Checksum(g_rx)) {
+    const uint8_t *ack = g_rx;
+    uint8_t shifted_ack[kFrameLen];
+    bool recovered_shift = false;
+
+    if (IsEchoFrame(ack)) {
+        ESP_LOGW(TAG,
+                 "%s echo count=%lu rx=%02X %02X %02X %02X %02X %02X %02X %02X rchk=%02X cchk=%02X status=0x%02X",
+                 tag,
+                 static_cast<unsigned long>(GetU32(ack, 4)),
+                 ack[8],
+                 ack[9],
+                 ack[10],
+                 ack[11],
+                 ack[12],
+                 ack[13],
+                 ack[14],
+                 ack[15],
+                 ack[16],
+                 ack[17],
+                 ack[18]);
+        return;
+    }
+
+    if (!IsAckFrame(ack)) {
+        if (RecoverOneBitLeftShiftedAck(shifted_ack)) {
+            ack = shifted_ack;
+            recovered_shift = true;
+        }
+    }
+
+    if (!IsAckFrame(ack)) {
         ESP_LOGW(TAG,
                  "%s ack invalid: head=%02X %02X %02X %02X chk=%02X expect=%02X",
                  tag,
@@ -111,17 +199,52 @@ void LogAck(const char *tag)
         return;
     }
 
-    ESP_LOGI(TAG,
-             "%s ack seq=0x%08lX cmd=0x%08lX freq=%lu flags=0x%08lX",
+    ESP_LOGW(TAG,
+             "%s ack%s seq=0x%08lX cmd=0x%08lX freq=0x%08lX/%lu flags=0x%08lX",
              tag,
-             static_cast<unsigned long>(GetU32(g_rx, 4)),
-             static_cast<unsigned long>(GetU32(g_rx, 8)),
-             static_cast<unsigned long>(GetU32(g_rx, 12)),
-             static_cast<unsigned long>(GetU32(g_rx, 16)));
+             recovered_shift ? " recovered_1bit" : "",
+             static_cast<unsigned long>(GetU32(ack, 4)),
+             static_cast<unsigned long>(GetU32(ack, 8)),
+             static_cast<unsigned long>(GetU32(ack, 12)),
+             static_cast<unsigned long>(GetU32(ack, 12)),
+             static_cast<unsigned long>(GetU32(ack, 16)));
 }
 
 bool TransferFrame(const char *tag)
 {
+    if (DDS_SPI_USE_BITBANG) {
+        std::memset(g_rx, 0x00, kFrameLen);
+
+        gpio_set_level(DDS_SPI_SCLK, 0);
+        gpio_set_level(DDS_SPI_MOSI, 0);
+        gpio_set_level(DDS_SPI_CS, 1);
+        DdsGpioDelay();
+        gpio_set_level(DDS_SPI_CS, 0);
+        DdsGpioDelay();
+
+        for (size_t byte = 0; byte < kFrameLen; ++byte) {
+            uint8_t rx_byte = 0;
+            for (int bit = 7; bit >= 0; --bit) {
+                gpio_set_level(DDS_SPI_MOSI, (g_tx[byte] >> bit) & 0x01);
+                DdsGpioDelay();
+                gpio_set_level(DDS_SPI_SCLK, 1);
+                DdsGpioDelay();
+                rx_byte |= static_cast<uint8_t>((gpio_get_level(DDS_SPI_MISO) & 0x01) << bit);
+                gpio_set_level(DDS_SPI_SCLK, 0);
+                DdsGpioDelay();
+            }
+            g_rx[byte] = rx_byte;
+        }
+
+        gpio_set_level(DDS_SPI_MOSI, 0);
+        DdsGpioDelay();
+        gpio_set_level(DDS_SPI_CS, 1);
+        DdsGpioDelay();
+
+        LogAck(tag);
+        return true;
+    }
+
     spi_transaction_t trans = {};
     trans.length = kFrameLen * 8;
     trans.tx_buffer = g_tx;
@@ -163,7 +286,7 @@ bool DdsDirect_Init(void)
     if (g_ready) {
         return true;
     }
-    if (g_dds_spi != nullptr) {
+    if (!DDS_SPI_USE_BITBANG && g_dds_spi != nullptr) {
         g_ready = true;
         return true;
     }
@@ -189,6 +312,20 @@ bool DdsDirect_Init(void)
         return false;
     }
 
+    if (DDS_SPI_USE_BITBANG) {
+        ConfigureDdsBitbangPins();
+        g_ready = true;
+        ESP_LOGW(TAG,
+                 "DDS direct bitbang SPI ready: SCLK=%d MOSI=%d MISO=%d CS=%d half=%luus len=%u",
+                 static_cast<int>(DDS_SPI_SCLK),
+                 static_cast<int>(DDS_SPI_MOSI),
+                 static_cast<int>(DDS_SPI_MISO),
+                 static_cast<int>(DDS_SPI_CS),
+                 static_cast<unsigned long>(DDS_SPI_BITBANG_HALF_PERIOD_US),
+                 static_cast<unsigned>(kFrameLen));
+        return true;
+    }
+
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = DDS_SPI_MOSI;
     bus_cfg.miso_io_num = DDS_SPI_MISO;
@@ -209,9 +346,11 @@ bool DdsDirect_Init(void)
 
     spi_device_interface_config_t dev_cfg = {};
     dev_cfg.clock_speed_hz = DDS_SPI_CLOCK_HZ;
-    dev_cfg.mode = 0;
+    dev_cfg.mode = DDS_SPI_MODE;
     dev_cfg.spics_io_num = DDS_SPI_CS;
     dev_cfg.queue_size = 1;
+    dev_cfg.cs_ena_pretrans = 4;
+    dev_cfg.cs_ena_posttrans = 4;
 
     err = spi_bus_add_device(DDS_SPI_HOST, &dev_cfg, &g_dds_spi);
     if (err != ESP_OK) {
@@ -222,11 +361,12 @@ bool DdsDirect_Init(void)
 
     g_ready = true;
     ESP_LOGI(TAG,
-             "DDS direct SPI ready: host=SPI2 SCLK=%d MOSI=%d MISO=%d CS=%d mode=0 clk=%dHz len=%u",
+             "DDS direct SPI ready: host=SPI2 SCLK=%d MOSI=%d MISO=%d CS=%d mode=%u clk=%dHz len=%u",
              static_cast<int>(DDS_SPI_SCLK),
              static_cast<int>(DDS_SPI_MOSI),
              static_cast<int>(DDS_SPI_MISO),
              static_cast<int>(DDS_SPI_CS),
+             static_cast<unsigned>(DDS_SPI_MODE),
              DDS_SPI_CLOCK_HZ,
              static_cast<unsigned>(kFrameLen));
     return true;
@@ -284,7 +424,7 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
 
     xSemaphoreGive(g_lock);
 
-    ESP_LOGI(TAG,
+    ESP_LOGW(TAG,
              "DDS direct send %s: seq=0x%08lX samples=%lu rate=%lu chunks=%lu",
              ok ? "done" : "failed",
              static_cast<unsigned long>(seq),
@@ -318,6 +458,46 @@ bool DdsDirect_SendTriangleTest(void)
         samples[i] = ClampI16(value);
     }
     return DdsDirect_SendWave(samples, kDefaultSampleCount, kDefaultSampleRateHz);
+}
+
+bool DdsDirect_SpiEchoTest(void)
+{
+    if (!EnsureReady()) {
+        return false;
+    }
+
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+
+    bool ok = true;
+    const uint32_t seq_base = NextSeq();
+    for (uint32_t n = 0; ok && n < 8U; ++n) {
+        BeginFrame(0xE0, seq_base + n);
+        PutU32(g_tx, 8, 0x11223300U | n);
+        PutU32(g_tx, 12, 0x55667700U | n);
+        for (size_t i = 20; i < 64; ++i) {
+            g_tx[i] = static_cast<uint8_t>(0xA0U + n + i);
+        }
+        FinishFrame();
+        ok = TransferFrame("SPIE");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // One extra transaction clocks back the echo for the last frame.
+    if (ok) {
+        BeginFrame(0xE0, seq_base + 8U);
+        PutU32(g_tx, 8, 0xCAFEBABEU);
+        PutU32(g_tx, 12, 0x12345678U);
+        FinishFrame();
+        ok = TransferFrame("SPIE");
+    }
+
+    xSemaphoreGive(g_lock);
+
+    ESP_LOGW(TAG,
+             "DDS SPI echo test %s: seq=0x%08lX frames=9",
+             ok ? "done" : "failed",
+             static_cast<unsigned long>(seq_base));
+    return ok;
 }
 
 bool ReconFromCapture_NoFftPassthrough(void)
