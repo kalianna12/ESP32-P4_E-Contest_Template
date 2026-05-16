@@ -49,6 +49,36 @@ extern "C" {
 #define ESP_RECON_HARMONIC_MAX 50U
 #endif
 
+typedef enum {
+    ESP_RECON_MODE_AUTO = 0,
+    ESP_RECON_MODE_SQUARE = 1,
+    ESP_RECON_MODE_ARB = 2,
+    ESP_RECON_MODE_TRI_SINE = 3,
+} esp_recon_mode_t;
+
+typedef enum {
+    ESP_RECON_SHAPE_UNKNOWN = 0,
+    ESP_RECON_SHAPE_SINE = 1,
+    ESP_RECON_SHAPE_TRIANGLE = 2,
+    ESP_RECON_SHAPE_SQUARE = 3,
+    ESP_RECON_SHAPE_ARB = 4,
+} esp_recon_detected_shape_t;
+
+enum {
+    ESP_RECON_QUALITY_WARN_SPIKES = 0x00000001U,
+    ESP_RECON_QUALITY_WARN_AMDF = 0x00000002U,
+    ESP_RECON_QUALITY_UNSTABLE = 0x00010000U,
+};
+
+typedef struct {
+    uint32_t spike_count;
+    uint32_t spike_replaced_count;
+    uint32_t max_consecutive_spikes;
+    uint32_t amdf_confidence_x1000;
+    float amdf_score;
+    uint32_t flags;
+} esp_recon_quality_t;
+
 typedef struct {
     uint32_t index;
     uint32_t bin;
@@ -72,6 +102,9 @@ typedef struct {
     uint32_t dominant_bin;
     uint32_t dominant_freq_hz;
     uint32_t harmonic_count;
+    esp_recon_mode_t mode;
+    esp_recon_detected_shape_t detected_shape;
+    esp_recon_quality_t quality;
     esp_recon_harmonic_t harmonics[ESP_RECON_HARMONIC_MAX];
 } esp_recon_result_t;
 
@@ -87,6 +120,8 @@ bool EspRecon_SendFromCapture(const int16_t *capture,
                               const circuit_model_t *model);
 
 uint32_t EspRecon_GetLastHarmonics(esp_recon_harmonic_t *out, uint32_t max_count);
+void EspRecon_SetMode(esp_recon_mode_t mode);
+esp_recon_mode_t EspRecon_GetMode(void);
 
 #ifdef __cplusplus
 }

@@ -111,6 +111,7 @@ static lv_obj_t *g_adv_status = nullptr;
 static lv_obj_t *g_adv_model_line = nullptr;
 static lv_obj_t *g_adv_model_range_line = nullptr;
 static lv_obj_t *g_adv_result = nullptr;
+static lv_obj_t *g_adv_mode_btn = nullptr;
 static lv_obj_t *g_adv_output_chart = nullptr;
 static lv_chart_series_t *g_adv_output_series = nullptr;
 static lv_obj_t *g_adv_recon_chart = nullptr;
@@ -130,6 +131,8 @@ static uint32_t g_last_adv_recon_done_count = 0;
 static bool g_adv_capture_pending = false;
 static bool g_adv_recon_pending = false;
 static bool g_adv_dds_pending = false;
+static bool g_adv_recapture_attempted = false;
+static esp_recon_result_t g_last_recon_result = {};
 static uint32_t g_latest_adv_capture_count = 0;
 static uint32_t g_latest_adv_recon_count = 0;
 static uint32_t g_adv_capture_req_base = 0;
@@ -216,6 +219,9 @@ static void render_harmonic_table_page(void);
 static bool harmonic_index_on_current_table_page(uint32_t index);
 static void format_point_flags(char *buf, size_t len, uint32_t flags);
 static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
+static const char *recon_mode_name(esp_recon_mode_t mode);
+static const char *recon_shape_name(esp_recon_detected_shape_t shape);
+static void update_adv_mode_button_label(void);
 #if ENABLE_BASIC_ESP_DDS_CONTROL
 static void request_basic_dds_freq(uint32_t freq_hz);
 #endif
@@ -586,6 +592,44 @@ static void set_ta_freq(lv_obj_t *ta, uint32_t value)
     char buf[16];
     format_freq(buf, sizeof(buf), value);
     lv_textarea_set_text(ta, buf);
+}
+
+static const char *recon_mode_name(esp_recon_mode_t mode)
+{
+    switch (mode) {
+    case ESP_RECON_MODE_AUTO: return "AUTO";
+    case ESP_RECON_MODE_SQUARE: return "SQUARE";
+    case ESP_RECON_MODE_ARB: return "ARB";
+    case ESP_RECON_MODE_TRI_SINE: return "TRI/SINE";
+    default: return "?";
+    }
+}
+
+static const char *recon_shape_name(esp_recon_detected_shape_t shape)
+{
+    switch (shape) {
+    case ESP_RECON_SHAPE_SINE: return "SINE";
+    case ESP_RECON_SHAPE_TRIANGLE: return "TRI";
+    case ESP_RECON_SHAPE_SQUARE: return "SQUARE";
+    case ESP_RECON_SHAPE_ARB: return "ARB";
+    default: return "UNKNOWN";
+    }
+}
+
+static void update_adv_mode_button_label(void)
+{
+    if (g_adv_mode_btn == nullptr) {
+        return;
+    }
+
+    lv_obj_t *label = lv_obj_get_child(g_adv_mode_btn, 0);
+    if (label == nullptr) {
+        return;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "MODE %s", recon_mode_name(EspRecon_GetMode()));
+    lv_label_set_text(label, buf);
 }
 
 static void set_msg(const char *text, uint32_t color)
@@ -1831,6 +1875,7 @@ static void adv_capture_event_cb(lv_event_t *event)
 
     g_adv_capture_pending = true;
     g_adv_recon_pending = false;
+    g_adv_recapture_attempted = false;
     g_cap_send_square_after_complete = false;
     g_adv_capture_req_base = g_latest_adv_capture_count;
     g_adv_output_captured = false;
@@ -1850,6 +1895,7 @@ static void adv_capture_direct_square_event_cb(lv_event_t *event)
 
     g_adv_capture_pending = true;
     g_adv_recon_pending = false;
+    g_adv_recapture_attempted = false;
     g_cap_send_square_after_complete = true;
     g_adv_capture_req_base = g_latest_adv_capture_count;
     g_adv_output_captured = false;
@@ -1984,6 +2030,31 @@ static void process_dds_direct_result(void)
                        ok ? COLOR_GREEN : COLOR_RED);
     } else if (job == DDS_DIRECT_JOB_RECON) {
         if (ok) {
+            EspRecon_BuildFromCapture(g_cap_samples,
+                                      kCapSampleCount,
+                                      100000U,
+                                      g_circuit_model.valid ? &g_circuit_model : nullptr,
+                                      &g_last_recon_result);
+            if ((g_last_recon_result.quality.flags & ESP_RECON_QUALITY_UNSTABLE) != 0U &&
+                !g_adv_recapture_attempted) {
+                g_adv_recapture_attempted = true;
+                ESP_LOGW(TAG_UI,
+                         "CAP unstable, recapture recommended: spikes=%lu repl=%lu conf=%lu flags=0x%08lX mode=%s shape=%s",
+                         static_cast<unsigned long>(g_last_recon_result.quality.spike_count),
+                         static_cast<unsigned long>(g_last_recon_result.quality.spike_replaced_count),
+                         static_cast<unsigned long>(g_last_recon_result.quality.amdf_confidence_x1000),
+                         static_cast<unsigned long>(g_last_recon_result.quality.flags),
+                         recon_mode_name(g_last_recon_result.mode),
+                         recon_shape_name(g_last_recon_result.detected_shape));
+                g_adv_capture_pending = true;
+                g_adv_capture_req_base = g_latest_adv_capture_count;
+                g_adv_output_captured = false;
+                g_adv_reconstruction_ready = false;
+                SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+                set_adv_result("CAP unstable / recapture", COLOR_YELLOW);
+                return;
+            }
+
             esp_recon_harmonic_t harmonics[ESP_RECON_HARMONIC_MAX] = {};
             const uint32_t count = EspRecon_GetLastHarmonics(harmonics, ESP_RECON_HARMONIC_MAX);
             memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
@@ -2009,6 +2080,14 @@ static void process_dds_direct_result(void)
             if (g_adv_harmonic_table != nullptr) {
                 render_harmonic_table_page();
             }
+            ESP_LOGW(TAG_UI,
+                     "RECON quality mode=%s shape=%s spikes=%lu repl=%lu conf=%lu flags=0x%08lX",
+                     recon_mode_name(g_last_recon_result.mode),
+                     recon_shape_name(g_last_recon_result.detected_shape),
+                     static_cast<unsigned long>(g_last_recon_result.quality.spike_count),
+                     static_cast<unsigned long>(g_last_recon_result.quality.spike_replaced_count),
+                     static_cast<unsigned long>(g_last_recon_result.quality.amdf_confidence_x1000),
+                     static_cast<unsigned long>(g_last_recon_result.quality.flags));
         }
         set_adv_result(ok ? "ESP RECON DDS DONE" : "ESP RECON DDS FAIL",
                        ok ? COLOR_GREEN : COLOR_RED);
@@ -2049,7 +2128,29 @@ static void adv_esp_recon_event_cb(lv_event_t *event)
         return;
     }
 
+    g_adv_recapture_attempted = false;
     start_dds_direct_job(DDS_DIRECT_JOB_RECON, "ESP RECON DDS TX");
+}
+
+static void adv_recon_mode_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    esp_recon_mode_t mode = EspRecon_GetMode();
+    if (mode == ESP_RECON_MODE_AUTO) {
+        mode = ESP_RECON_MODE_SQUARE;
+    } else if (mode == ESP_RECON_MODE_SQUARE) {
+        mode = ESP_RECON_MODE_ARB;
+    } else if (mode == ESP_RECON_MODE_ARB) {
+        mode = ESP_RECON_MODE_TRI_SINE;
+    } else {
+        mode = ESP_RECON_MODE_AUTO;
+    }
+    EspRecon_SetMode(mode);
+    update_adv_mode_button_label();
+    set_adv_result(recon_mode_name(mode), COLOR_YELLOW);
 }
 
 static void adv_spi_echo_event_cb(lv_event_t *event)
@@ -2341,10 +2442,13 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_esp_recon = create_button(screen, "ESP RECON", 164, 178, 150);
     lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 334, 178, 95);
     lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 449, 178, 95);
+    g_adv_mode_btn = create_button(screen, "MODE AUTO", 564, 214, 160);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_esp_recon, adv_esp_recon_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_triangle, adv_direct_triangle_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_adv_mode_btn, adv_recon_mode_event_cb, LV_EVENT_CLICKED, nullptr);
+    update_adv_mode_button_label();
 
 #if ENABLE_ADV_FPGA_RECON_BUTTONS
     lv_obj_t *btn_reconstruct = create_button(screen, "FPGA RECON", 564, 178, 150);
@@ -3070,7 +3174,7 @@ void test_screen_update_adv_status(const adv_status_t *status)
             (status->recon_debug_mode == 3U) ? 'T' : 'F';
         snprintf(buf,
                  sizeof(buf),
-                 "ADV:%lu E:%lu F:%lu/%lu Y:%ld X:%ld R:%c I:%s\nG:%lu %s M:%lu A:%lu D4:%ld/%ld V:%lu Z:%lu\nS:%lu/%lu F:%ld S:%ld MD:%02lX C:%02lX",
+                 "ADV:%lu E:%lu F:%lu/%lu Y:%ld X:%ld R:%c I:%s\nG:%lu %s M:%lu A:%lu D4:%ld/%ld V:%lu Z:%lu\nS:%lu/%lu F:%ld S:%ld MD:%02lX C:%02lX\nRM:%s RS:%s Q:%s C:%lu",
                  static_cast<unsigned long>(status->adv_state),
                  static_cast<unsigned long>(status->error_code),
                  static_cast<unsigned long>(status->fft_overflow_count),
@@ -3092,7 +3196,12 @@ void test_screen_update_adv_status(const adv_status_t *status)
                  static_cast<long>(status->d4_src_first),
                  static_cast<long>(status->d4_src_second),
                  static_cast<unsigned long>(status->d4_src_mode & 0xFFU),
-                 static_cast<unsigned long>(status->core_dbg_flags & 0xFFU));
+                 static_cast<unsigned long>(status->core_dbg_flags & 0xFFU),
+                 recon_mode_name(g_last_recon_result.mode),
+                 recon_shape_name(g_last_recon_result.detected_shape),
+                 ((g_last_recon_result.quality.flags & ESP_RECON_QUALITY_UNSTABLE) != 0U) ? "BAD" :
+                 ((g_last_recon_result.quality.flags != 0U) ? "WARN" : "OK"),
+                 static_cast<unsigned long>(g_last_recon_result.quality.amdf_confidence_x1000));
         lv_label_set_text(g_adv_status, buf);
         lv_obj_set_style_text_color(g_adv_status,
                                     lv_color_hex(COLOR_GREEN),

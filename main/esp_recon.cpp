@@ -42,6 +42,7 @@ constexpr uint32_t kYieldEveryBins = 16U;
 
 static esp_recon_harmonic_t g_last_harmonics[ESP_RECON_HARMONIC_MAX] = {};
 static uint32_t g_last_harmonic_count = 0;
+static esp_recon_mode_t g_recon_mode = ESP_RECON_MODE_AUTO;
 
 struct Work {
     float xr[kN];
@@ -51,6 +52,13 @@ struct Work {
     int16_t wave[kOutN];
     int16_t clean_capture[kN];
 };
+
+typedef struct {
+    uint32_t spike_count;
+    uint32_t spike_replaced_count;
+    uint32_t max_consecutive_spikes;
+    int32_t rms;
+} clean_capture_stats_t;
 
 static Work *AllocWork()
 {
@@ -192,11 +200,15 @@ static int32_t EstimateRms(const int16_t *capture, uint32_t n, int32_t mean)
     return static_cast<int32_t>(sqrtf(static_cast<float>(sum_sq) / static_cast<float>(n)));
 }
 
-static void BuildCleanCapture(const int16_t *capture,
-                              uint32_t n,
-                              int32_t mean,
-                              int16_t *clean)
+static void BuildCleanCaptureAndStats(const int16_t *capture,
+                                      uint32_t n,
+                                      int32_t mean,
+                                      int16_t *clean,
+                                      clean_capture_stats_t *stats)
 {
+    if (stats != nullptr) {
+        *stats = {};
+    }
     if (capture == nullptr || clean == nullptr || n == 0U) {
         return;
     }
@@ -208,16 +220,162 @@ static void BuildCleanCapture(const int16_t *capture,
 
     const int32_t rms = EstimateRms(capture, n, mean);
     const int32_t spike_threshold = rms * 4;
+    const int32_t hi = mean + spike_threshold;
+    const int32_t lo = mean - spike_threshold;
+    uint32_t consecutive_spikes = 0U;
+
+    if (stats != nullptr) {
+        stats->rms = rms;
+    }
 
     for (uint32_t i = 1; i + 1U < n; ++i) {
         const int16_t median = Median3(clean[i - 1U], clean[i], clean[i + 1U]);
-        const int32_t diff = static_cast<int32_t>(clean[i]) - static_cast<int32_t>(median);
+        const int32_t raw = static_cast<int32_t>(capture[i]);
+        const int32_t diff = raw - static_cast<int32_t>(median);
         const int32_t abs_diff = (diff < 0) ? -diff : diff;
-        if (abs_diff > spike_threshold) {
+        const bool isolated_spike = (abs_diff > spike_threshold) || raw > hi || raw < lo;
+        if (isolated_spike) {
             clean[i] = static_cast<int16_t>(
                 (static_cast<int32_t>(clean[i - 1U]) + static_cast<int32_t>(clean[i + 1U])) / 2);
+            ++consecutive_spikes;
+            if (stats != nullptr) {
+                ++stats->spike_count;
+                ++stats->spike_replaced_count;
+                if (consecutive_spikes > stats->max_consecutive_spikes) {
+                    stats->max_consecutive_spikes = consecutive_spikes;
+                }
+            }
+        } else {
+            consecutive_spikes = 0U;
         }
     }
+}
+
+static uint32_t EstimateAmdfConfidenceX1000(float score, int32_t rms, uint32_t period_samples)
+{
+    if (score <= 0.0f || rms <= 0 || period_samples == 0U) {
+        return 0U;
+    }
+
+    const float norm = score / static_cast<float>(rms);
+    float confidence = 1400.0f - norm * 180.0f;
+    if (period_samples < 16U) {
+        confidence -= 200.0f;
+    }
+    if (confidence < 0.0f) {
+        confidence = 0.0f;
+    }
+    if (confidence > 1000.0f) {
+        confidence = 1000.0f;
+    }
+    return static_cast<uint32_t>(lrintf(confidence));
+}
+
+static void EvaluateCaptureQuality(const clean_capture_stats_t *stats,
+                                   float amdf_score,
+                                   uint32_t amdf_confidence_x1000,
+                                   esp_recon_quality_t *quality)
+{
+    if (quality == nullptr) {
+        return;
+    }
+
+    quality->flags = 0U;
+    quality->amdf_score = amdf_score;
+    quality->amdf_confidence_x1000 = amdf_confidence_x1000;
+    if (stats != nullptr) {
+        quality->spike_count = stats->spike_count;
+        quality->spike_replaced_count = stats->spike_replaced_count;
+        quality->max_consecutive_spikes = stats->max_consecutive_spikes;
+    }
+
+    if (quality->spike_replaced_count > 0U) {
+        quality->flags |= ESP_RECON_QUALITY_WARN_SPIKES;
+    }
+    if (quality->amdf_confidence_x1000 < 500U) {
+        quality->flags |= ESP_RECON_QUALITY_WARN_AMDF;
+    }
+    if (quality->spike_replaced_count > (kN / 100U) ||
+        quality->max_consecutive_spikes >= 4U ||
+        quality->amdf_confidence_x1000 < 250U) {
+        quality->flags |= ESP_RECON_QUALITY_UNSTABLE;
+    }
+}
+
+static esp_recon_detected_shape_t DetectReconShape(const float *raw_amp,
+                                                   uint32_t max_harmonic,
+                                                   uint32_t f0_hz)
+{
+    (void)f0_hz;
+    if (raw_amp == nullptr || max_harmonic == 0U || raw_amp[1] <= 1.0f) {
+        return ESP_RECON_SHAPE_UNKNOWN;
+    }
+
+    const float h1 = raw_amp[1];
+    const float h2 = (max_harmonic >= 2U) ? raw_amp[2] : 0.0f;
+    const float h3 = (max_harmonic >= 3U) ? raw_amp[3] : 0.0f;
+    const float h5 = (max_harmonic >= 5U) ? raw_amp[5] : 0.0f;
+    const float h7 = (max_harmonic >= 7U) ? raw_amp[7] : 0.0f;
+    const float odd_sum = h3 + h5 + h7;
+    const float even_sum = h2 + ((max_harmonic >= 4U) ? raw_amp[4] : 0.0f) +
+                           ((max_harmonic >= 6U) ? raw_amp[6] : 0.0f);
+
+    if (h3 < h1 * 0.12f && h5 < h1 * 0.06f) {
+        return ESP_RECON_SHAPE_SINE;
+    }
+    if (odd_sum > h1 * 0.35f && even_sum < odd_sum * 0.25f) {
+        if (h3 > h5 && h5 > h7 * 0.7f) {
+            return ESP_RECON_SHAPE_TRIANGLE;
+        }
+        return ESP_RECON_SHAPE_SQUARE;
+    }
+    if (even_sum > h1 * 0.10f) {
+        return ESP_RECON_SHAPE_ARB;
+    }
+    return ESP_RECON_SHAPE_TRIANGLE;
+}
+
+static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
+                               esp_recon_detected_shape_t detected_shape,
+                               uint32_t harmonic,
+                               float amp,
+                               float h1_amp,
+                               uint32_t *kept_count)
+{
+    if (harmonic == 0U || kept_count == nullptr) {
+        return false;
+    }
+    if (*kept_count >= 20U) {
+        return false;
+    }
+
+    const esp_recon_mode_t effective_mode =
+        (mode == ESP_RECON_MODE_AUTO) ?
+        ((detected_shape == ESP_RECON_SHAPE_SQUARE) ? ESP_RECON_MODE_SQUARE :
+         (detected_shape == ESP_RECON_SHAPE_ARB) ? ESP_RECON_MODE_ARB :
+         ESP_RECON_MODE_TRI_SINE)
+        : mode;
+
+    bool keep = false;
+    if (effective_mode == ESP_RECON_MODE_SQUARE) {
+        if ((harmonic & 1U) != 0U && harmonic <= 19U) {
+            keep = true;
+        } else if ((harmonic & 1U) == 0U && amp >= h1_amp * 0.20f) {
+            keep = true;
+        }
+    } else if (effective_mode == ESP_RECON_MODE_ARB) {
+        keep = harmonic <= 20U;
+    } else {
+        keep = ((harmonic & 1U) != 0U) && harmonic <= 9U;
+        if (detected_shape == ESP_RECON_SHAPE_SINE && harmonic > 3U) {
+            keep = false;
+        }
+    }
+
+    if (keep) {
+        ++(*kept_count);
+    }
+    return keep;
 }
 
 static float AmdfScore(const int16_t *capture, uint32_t n, int32_t mean, uint32_t lag)
@@ -587,11 +745,6 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
     float raw_phase[ESP_RECON_HARMONIC_MAX + 1U] = {};
 
     for (uint32_t harmonic = 1U; harmonic <= max_harmonic; ++harmonic) {
-#if ESP_RECON_SYNTH_ODD_HARMONICS_ONLY
-        if ((harmonic & 1U) == 0U) {
-            continue;
-        }
-#endif
         float re = 0.0f;
         float im = 0.0f;
         DftAtLockedHarmonic(capture, use_n, mean, period_samples,
@@ -603,6 +756,8 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         }
     }
 
+    out->detected_shape = DetectReconShape(raw_amp, max_harmonic, f0_hz);
+
     const float amp_floor =
         fmaxf(kHarmonicAbsoluteFloor, raw_amp[1] * kHarmonicRelativeFloor);
     out->harmonic_count = 0U;
@@ -612,12 +767,8 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         sample_rate_hz);
     out->dominant_freq_hz = f0_hz;
 
+    uint32_t kept_count = 0U;
     for (uint32_t harmonic = 1U; harmonic <= max_harmonic; ++harmonic) {
-#if ESP_RECON_SYNTH_ODD_HARMONICS_ONLY
-        if ((harmonic & 1U) == 0U) {
-            continue;
-        }
-#endif
         if (raw_amp[harmonic] < amp_floor) {
             continue;
         }
@@ -650,6 +801,15 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         comp_phase = WrapPhaseRad(comp_phase + phase);
 #endif
 
+        if (!ShouldKeepHarmonic(out->mode,
+                                out->detected_shape,
+                                harmonic,
+                                comp_amp,
+                                raw_amp[1],
+                                &kept_count)) {
+            continue;
+        }
+
         esp_recon_harmonic_t h = {};
         h.index = harmonic;
         h.bin = static_cast<uint32_t>(
@@ -668,14 +828,14 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         }
 
         ESP_LOGW(TAG,
-                 "H%lu locked freq=%luHz raw_amp=%.1f amp=%.1f phase=%.1fdeg H=%.3f inv=%.2f",
+                 "H%lu locked freq=%luHz raw_amp=%.1f amp=%.1f phase=%.1fdeg shape=%u mode=%u",
                  static_cast<unsigned long>(harmonic),
                  static_cast<unsigned long>(freq_hz),
                  static_cast<double>(raw_amp[harmonic]),
                  static_cast<double>(comp_amp),
                  static_cast<double>(h.phase_deg_x10) / 10.0,
-                 static_cast<double>(gain),
-                 static_cast<double>(inv_gain));
+                 static_cast<unsigned>(out->detected_shape),
+                 static_cast<unsigned>(out->mode));
     }
 
     if (use_n_out != nullptr) {
@@ -841,6 +1001,8 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     memset(out, 0, sizeof(*out));
     out->sample_count = sample_count;
     out->sample_rate_hz = sample_rate_hz;
+    out->mode = g_recon_mode;
+    out->detected_shape = ESP_RECON_SHAPE_UNKNOWN;
     CaptureStats(capture, sample_count, out);
     g_last_harmonic_count = 0;
 
@@ -854,8 +1016,9 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     uint32_t locked_period = 0U;
     uint32_t locked_use_n = 0U;
     float amdf_best = 0.0f;
+    clean_capture_stats_t clean_stats = {};
 
-    BuildCleanCapture(capture, sample_count, out->cap_mean, w->clean_capture);
+    BuildCleanCaptureAndStats(capture, sample_count, out->cap_mean, w->clean_capture, &clean_stats);
 
 #if ESP_RECON_STAGE == 0
     for (uint32_t i = 0; i < sample_count; ++i) {
@@ -896,7 +1059,6 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     }
 
 #if !ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
-    // Keep DC removed. Positive and negative bins are both compensated.
     if (!locked_harmonics) {
         w->xr[0] = 0.0f;
         w->xi[0] = 0.0f;
@@ -934,6 +1096,16 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     }
 #endif
 #endif
+
+    out->quality.spike_count = clean_stats.spike_count;
+    out->quality.spike_replaced_count = clean_stats.spike_replaced_count;
+    out->quality.max_consecutive_spikes = clean_stats.max_consecutive_spikes;
+    out->quality.amdf_confidence_x1000 =
+        EstimateAmdfConfidenceX1000(amdf_best, clean_stats.rms, locked_period);
+    EvaluateCaptureQuality(&clean_stats,
+                           amdf_best,
+                           out->quality.amdf_confidence_x1000,
+                           &out->quality);
 
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
@@ -979,7 +1151,13 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     memcpy(out->samples, w->wave, output_count * sizeof(out->samples[0]));
 
     ESP_LOGW(TAG,
-             "recon stage=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu use_n=%lu out_n=%lu f0=%luHz period=%lu locked=%u play_rate=%luHz",
+             "recon mode=%u shape=%u spikes=%lu repl=%lu conf=%lu flags=0x%08lX stage=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu use_n=%lu out_n=%lu f0=%luHz period=%lu locked=%u play_rate=%luHz",
+             static_cast<unsigned>(out->mode),
+             static_cast<unsigned>(out->detected_shape),
+             static_cast<unsigned long>(out->quality.spike_count),
+             static_cast<unsigned long>(out->quality.spike_replaced_count),
+             static_cast<unsigned long>(out->quality.amdf_confidence_x1000),
+             static_cast<unsigned long>(out->quality.flags),
              ESP_RECON_STAGE,
              static_cast<long>(out->cap_min),
              static_cast<long>(out->cap_max),
@@ -1030,4 +1208,14 @@ uint32_t EspRecon_GetLastHarmonics(esp_recon_harmonic_t *out, uint32_t max_count
         memcpy(out, g_last_harmonics, count * sizeof(out[0]));
     }
     return count;
+}
+
+void EspRecon_SetMode(esp_recon_mode_t mode)
+{
+    g_recon_mode = mode;
+}
+
+esp_recon_mode_t EspRecon_GetMode(void)
+{
+    return g_recon_mode;
 }
