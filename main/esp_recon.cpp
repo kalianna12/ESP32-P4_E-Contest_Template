@@ -19,16 +19,16 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr float kTwoPi = 2.0f * kPi;
 constexpr float kMinGain = 0.05f;
 constexpr float kMaxInvGain = 5.0f;
-constexpr float kMinHarmonicGain = 0.15f;
-constexpr float kHarmonicRelativeFloor = 0.05f;
-constexpr float kHarmonicAbsoluteFloor = 20.0f;
+constexpr float kMinHarmonicGain = 0.10f;
+constexpr float kHarmonicRelativeFloor = 0.015f;
+constexpr float kHarmonicAbsoluteFloor = 8.0f;
 constexpr uint32_t kF0MinHz = 100U;
 constexpr uint32_t kF0MaxHz = 20000U;
 constexpr uint32_t kAmdfLagMinFloor = 8U;
 constexpr uint32_t kAmdfLagMaxCeil = 2000U;
 constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
-constexpr uint32_t kMaxLockedHarmonics = 20U;
+constexpr uint32_t kMaxLockedHarmonics = 40U;
 constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 constexpr uint32_t kYieldEveryBins = 16U;
 
@@ -345,7 +345,7 @@ static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
     if (harmonic == 0U || kept_count == nullptr) {
         return false;
     }
-    if (*kept_count >= 20U) {
+    if (*kept_count >= 40U) {
         return false;
     }
 
@@ -358,13 +358,13 @@ static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
 
     bool keep = false;
     if (effective_mode == ESP_RECON_MODE_SQUARE) {
-        if ((harmonic & 1U) != 0U && harmonic <= 19U) {
+        if ((harmonic & 1U) != 0U && harmonic <= 39U) {
             keep = true;
         } else if ((harmonic & 1U) == 0U && amp >= h1_amp * 0.20f) {
             keep = true;
         }
     } else if (effective_mode == ESP_RECON_MODE_ARB) {
-        keep = harmonic <= 20U;
+        keep = harmonic <= 40U;
     } else {
         keep = ((harmonic & 1U) != 0U) && harmonic <= 9U;
         if (detected_shape == ESP_RECON_SHAPE_SINE && harmonic > 3U) {
