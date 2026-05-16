@@ -509,15 +509,3 @@ bool DdsDirect_SpiEchoTest(void)
              static_cast<unsigned long>(seq_base));
     return ok;
 }
-
-bool ReconFromCapture_NoFftPassthrough(void)
-{
-    ESP_LOGW(TAG, "ReconFromCapture_NoFftPassthrough reserved; not implemented yet");
-    return false;
-}
-
-bool ReconFromCapture_FftCompensate(void)
-{
-    ESP_LOGW(TAG, "ReconFromCapture_FftCompensate reserved; not implemented yet");
-    return false;
-}

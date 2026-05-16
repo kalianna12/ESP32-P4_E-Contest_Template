@@ -3,6 +3,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "dds_direct_link.h"
+#include "esp_recon.h"
 #include "heavyfit.h"
 #include "lvgl.h"
 #include "spilink.h"
@@ -28,6 +29,18 @@
 
 #ifndef ENABLE_CAP_VERBOSE_LOG
 #define ENABLE_CAP_VERBOSE_LOG 0
+#endif
+
+#ifndef ENABLE_ADV_FPGA_RECON_BUTTONS
+#define ENABLE_ADV_FPGA_RECON_BUTTONS 0
+#endif
+
+#ifndef ENABLE_ADV_SPI_ECHO_BUTTON
+#define ENABLE_ADV_SPI_ECHO_BUTTON 0
+#endif
+
+#ifndef ENABLE_ADV_CAP_AUTO_SQUARE
+#define ENABLE_ADV_CAP_AUTO_SQUARE 0
 #endif
 
 #define TEST_SCREEN_W 1024
@@ -1781,6 +1794,7 @@ typedef enum {
     DDS_DIRECT_JOB_SQUARE = 1,
     DDS_DIRECT_JOB_TRIANGLE = 2,
     DDS_DIRECT_JOB_ECHO = 3,
+    DDS_DIRECT_JOB_RECON = 4,
 } dds_direct_job_t;
 
 static void dds_direct_task_entry(void *arg)
@@ -1794,6 +1808,11 @@ static void dds_direct_task_entry(void *arg)
         ok = DdsDirect_SendTriangleTest();
     } else if (job == DDS_DIRECT_JOB_ECHO) {
         ok = DdsDirect_SpiEchoTest();
+    } else if (job == DDS_DIRECT_JOB_RECON) {
+        ok = EspRecon_SendFromCapture(g_cap_samples,
+                                      kCapSampleCount,
+                                      100000U,
+                                      g_circuit_model.valid ? &g_circuit_model : nullptr);
     }
 
     g_dds_direct_result = ok ? job : (job | 0x80000000U);
@@ -1816,9 +1835,9 @@ static bool start_dds_direct_job(dds_direct_job_t job, const char *busy_text)
     const BaseType_t created = xTaskCreatePinnedToCore(
         dds_direct_task_entry,
         "dds_direct_tx",
-        4096,
+        8192,
         reinterpret_cast<void *>(static_cast<uintptr_t>(job)),
-        3,
+        2,
         &g_dds_direct_task,
         1);
     if (created != pdPASS) {
@@ -1849,6 +1868,26 @@ static void process_dds_direct_result(void)
     } else if (job == DDS_DIRECT_JOB_ECHO) {
         set_adv_result(ok ? "DDS SPI ECHO DONE" : "DDS SPI ECHO FAIL",
                        ok ? COLOR_GREEN : COLOR_RED);
+    } else if (job == DDS_DIRECT_JOB_RECON) {
+        if (ok) {
+            esp_recon_harmonic_t harmonics[ESP_RECON_HARMONIC_MAX] = {};
+            const uint32_t count = EspRecon_GetLastHarmonics(harmonics, ESP_RECON_HARMONIC_MAX);
+            memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
+            memset(g_adv_harmonics, 0, sizeof(g_adv_harmonics));
+            g_adv_harmonic_count = count;
+            for (uint32_t i = 0; i < count && i < ADV_HARMONIC_MAX; ++i) {
+                g_adv_harmonics[i].seq = 0U;
+                g_adv_harmonics[i].index = harmonics[i].index;
+                g_adv_harmonics[i].freq_hz = harmonics[i].freq_hz;
+                g_adv_harmonics[i].amp_mv = harmonics[i].amp_mv;
+                g_adv_harmonics[i].phase_deg_x10 = harmonics[i].phase_deg_x10;
+                g_adv_harmonics[i].flags = harmonics[i].flags;
+                g_adv_harmonic_valid[i] = true;
+            }
+            refresh_harmonic_rows();
+        }
+        set_adv_result(ok ? "ESP RECON DDS DONE" : "ESP RECON DDS FAIL",
+                       ok ? COLOR_GREEN : COLOR_RED);
     }
 }
 
@@ -1868,6 +1907,25 @@ static void adv_direct_triangle_event_cb(lv_event_t *event)
     }
 
     start_dds_direct_job(DDS_DIRECT_JOB_TRIANGLE, "DDS DIRECT TRI TX");
+}
+
+static void adv_esp_recon_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    if (!g_cap_complete || g_cap_samples == nullptr) {
+        set_adv_result("CAP FIRST", COLOR_RED);
+        return;
+    }
+
+    if (!g_circuit_model.valid && ESP_RECON_STAGE != 0) {
+        set_adv_result("MODEL FIRST", COLOR_RED);
+        return;
+    }
+
+    start_dds_direct_job(DDS_DIRECT_JOB_RECON, "ESP RECON DDS TX");
 }
 
 static void adv_spi_echo_event_cb(lv_event_t *event)
@@ -2144,7 +2202,7 @@ static void create_reconstruction_page(void)
     update_adv_model_line();
 
     create_label(screen,
-                 "CAP / RECON / DDS",
+                 "CAP / ESP RECON / DDS",
                  24,
                  150,
                  590,
@@ -2152,21 +2210,32 @@ static void create_reconstruction_page(void)
                  COLOR_SUBTEXT);
 
     lv_obj_t *btn_capture = create_button(screen, "CAP", 24, 178, 120);
-    lv_obj_t *btn_reconstruct = create_button(screen, "RECON+DDS", 164, 178, 150);
-    lv_obj_t *btn_send = create_button(screen, "DDS RETRY", 334, 178, 110);
-    lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 464, 178, 95);
-    lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 579, 178, 95);
-    lv_obj_t *btn_cap_direct_square = create_button(screen, "CAP+SQ", 874, 178, 115);
-    lv_obj_t *btn_spi_echo = create_button(screen, "SPI ECHO", 464, 214, 120);
+    lv_obj_t *btn_esp_recon = create_button(screen, "ESP RECON", 164, 178, 150);
+    lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 334, 178, 95);
+    lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 449, 178, 95);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_esp_recon, adv_esp_recon_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_triangle, adv_direct_triangle_event_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(btn_cap_direct_square, adv_capture_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(btn_spi_echo, adv_spi_echo_event_cb, LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t *btn_harmonic = create_button(screen, "Harmonics", 694, 178, 160);
+#if ENABLE_ADV_FPGA_RECON_BUTTONS
+    lv_obj_t *btn_reconstruct = create_button(screen, "FPGA RECON", 564, 178, 150);
+    lv_obj_t *btn_send = create_button(screen, "DDS RETRY", 734, 178, 110);
+    lv_obj_add_event_cb(btn_reconstruct, adv_reconstruct_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_send, adv_send_event_cb, LV_EVENT_CLICKED, nullptr);
+#endif
+
+#if ENABLE_ADV_CAP_AUTO_SQUARE
+    lv_obj_t *btn_cap_direct_square = create_button(screen, "CAP+SQ", 864, 178, 115);
+    lv_obj_add_event_cb(btn_cap_direct_square, adv_capture_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
+#endif
+
+#if ENABLE_ADV_SPI_ECHO_BUTTON
+    lv_obj_t *btn_spi_echo = create_button(screen, "SPI ECHO", 564, 214, 120);
+    lv_obj_add_event_cb(btn_spi_echo, adv_spi_echo_event_cb, LV_EVENT_CLICKED, nullptr);
+#endif
+
+    lv_obj_t *btn_harmonic = create_button(screen, "Harmonics", 564, 178, 160);
     lv_obj_add_event_cb(btn_harmonic, open_harmonic_table_event_cb, LV_EVENT_CLICKED, nullptr);
 
     create_hline(screen, 265);
