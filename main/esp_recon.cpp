@@ -30,7 +30,7 @@ constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
 constexpr uint32_t kMaxLockedHarmonics = 100U;
 constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
-constexpr uint32_t kReconDdsActualPlaybackRateHz = 125000U;
+constexpr uint32_t kReconDdsActualPlaybackRateHz = 100000U;
 constexpr uint32_t kYieldEveryBins = 16U;
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN

@@ -49,6 +49,9 @@ constexpr uint32_t kSamplesPerChunk = 30;
 constexpr uint32_t kSquareTestSampleCount = 4000;
 constexpr uint32_t kSquareTestPeriodSamples = 80;
 constexpr uint32_t kSquareTestHalfPeriodSamples = kSquareTestPeriodSamples / 2U;
+constexpr uint32_t kTriangleTestSampleCount = 4000;
+constexpr uint32_t kTriangleTestPeriodSamples = 80;
+constexpr uint32_t kTriangleTestHalfPeriodSamples = kTriangleTestPeriodSamples / 2U;
 
 spi_device_handle_t g_dds_spi = nullptr;
 SemaphoreHandle_t g_lock = nullptr;
@@ -470,17 +473,21 @@ bool DdsDirect_SendTriangleTest(void)
 {
     static int16_t samples[kDefaultSampleCount];
     constexpr int32_t amp = 6000;
-    for (uint32_t i = 0; i < kDefaultSampleCount; ++i) {
-        const uint32_t phase = i & 63U;
+    for (uint32_t i = 0; i < kTriangleTestSampleCount; ++i) {
+        const uint32_t phase = i % kTriangleTestPeriodSamples;
         int32_t value = 0;
-        if (phase < 32U) {
-            value = -amp + static_cast<int32_t>((phase * (2U * amp)) / 31U);
+        if (phase < kTriangleTestHalfPeriodSamples) {
+            value = -amp + static_cast<int32_t>(
+                               (phase * (2U * amp)) /
+                               (kTriangleTestHalfPeriodSamples - 1U));
         } else {
-            value = amp - static_cast<int32_t>(((phase - 32U) * (2U * amp)) / 31U);
+            value = amp - static_cast<int32_t>(
+                              (((phase - kTriangleTestHalfPeriodSamples) * (2U * amp)) /
+                               (kTriangleTestHalfPeriodSamples - 1U)));
         }
         samples[i] = ClampI16(value);
     }
-    return DdsDirect_SendWave(samples, kDefaultSampleCount, kDefaultSampleRateHz);
+    return DdsDirect_SendWave(samples, kTriangleTestSampleCount, kDefaultSampleRateHz);
 }
 
 bool DdsDirect_SpiEchoTest(void)
