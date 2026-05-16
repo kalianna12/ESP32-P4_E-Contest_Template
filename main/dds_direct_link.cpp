@@ -436,12 +436,19 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
     xSemaphoreGive(g_lock);
 
     ESP_LOGW(TAG,
-             "DDS direct send %s: seq=0x%08lX samples=%lu rate=%lu chunks=%lu",
+             "DDS direct send %s: seq=0x%08lX samples=%lu rate=%lu chunks=%lu ack_head=%02X %02X %02X %02X ack_cmd=0x%08lX ack_freq=%lu ack_flags=0x%08lX",
              ok ? "done" : "failed",
              static_cast<unsigned long>(seq),
              static_cast<unsigned long>(sample_count),
              static_cast<unsigned long>(sample_rate_hz),
-             static_cast<unsigned long>(chunk_count));
+             static_cast<unsigned long>(chunk_count),
+             g_rx[0],
+             g_rx[1],
+             g_rx[2],
+             g_rx[3],
+             static_cast<unsigned long>(GetU32(g_rx, 8)),
+             static_cast<unsigned long>(GetU32(g_rx, 12)),
+             static_cast<unsigned long>(GetU32(g_rx, 16)));
     return ok;
 }
 
