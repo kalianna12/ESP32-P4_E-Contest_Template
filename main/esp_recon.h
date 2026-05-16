@@ -30,9 +30,10 @@ extern "C" {
 #define ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH 1
 #endif
 
-// When harmonic synth is enabled, keep only odd harmonics. This is best for square-wave reconstruction.
+// When harmonic synth is enabled, keep only odd harmonics. Formal unknown
+// periodic waves should allow all integer harmonics by default.
 #ifndef ESP_RECON_SYNTH_ODD_HARMONICS_ONLY
-#define ESP_RECON_SYNTH_ODD_HARMONICS_ONLY 1
+#define ESP_RECON_SYNTH_ODD_HARMONICS_ONLY 0
 #endif
 
 // Optional circular 3-tap output smoothing after harmonic synthesis / IFFT fallback.
