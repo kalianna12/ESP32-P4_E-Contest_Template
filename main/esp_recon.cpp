@@ -28,7 +28,7 @@ constexpr uint32_t kAmdfLagMinFloor = 8U;
 constexpr uint32_t kAmdfLagMaxCeil = 2000U;
 constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
-constexpr uint32_t kMaxLockedHarmonics = 40U;
+constexpr uint32_t kMaxLockedHarmonics = 200U;
 constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 constexpr uint32_t kYieldEveryBins = 16U;
 
@@ -345,7 +345,7 @@ static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
     if (harmonic == 0U || kept_count == nullptr) {
         return false;
     }
-    if (*kept_count >= 40U) {
+    if (*kept_count >= 100U) {
         return false;
     }
 
@@ -358,7 +358,7 @@ static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
 
     bool keep = false;
     if (effective_mode == ESP_RECON_MODE_SQUARE) {
-        if ((harmonic & 1U) != 0U && harmonic <= 39U) {
+        if ((harmonic & 1U) != 0U && harmonic <= 199U) {
             keep = true;
         } else if ((harmonic & 1U) == 0U && amp >= h1_amp * 0.20f) {
             keep = true;
