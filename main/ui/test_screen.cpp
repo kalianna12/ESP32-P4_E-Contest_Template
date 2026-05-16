@@ -26,6 +26,10 @@
 #define ENABLE_HEAVY_FILTER_FIT 1
 #endif
 
+#ifndef ENABLE_CAP_VERBOSE_LOG
+#define ENABLE_CAP_VERBOSE_LOG 0
+#endif
+
 #define TEST_SCREEN_W 1024
 #define TEST_SCREEN_H 600
 
@@ -121,11 +125,17 @@ static circuit_model_t g_circuit_model = {};
 static filter_fit_result_t g_last_fit = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
-static int16_t g_cap_samples[1024] = {};
-static bool g_cap_valid[1024] = {};
+static constexpr uint32_t kCapSampleCount = 1024U;
+static int16_t *g_cap_samples = nullptr;
+static uint8_t *g_cap_valid = nullptr;
 static uint32_t g_cap_received_count = 0;
+static uint64_t g_cap_chunk_mask = 0;
+static uint32_t g_cap_expected_chunks = 0;
 static bool g_cap_complete = false;
 static bool g_cap_send_square_after_complete = false;
+static TaskHandle_t g_dds_direct_task = nullptr;
+static volatile bool g_dds_direct_busy = false;
+static volatile uint32_t g_dds_direct_result = 0;
 static bool g_model_saved_for_current_sweep = false;
 static bool g_fit_done_for_current_sweep = false;
 static bool g_fit_pending = false;
@@ -167,6 +177,7 @@ static void update_adv_model_line(void);
 static void render_basic_status(const freqresp_ui_status_t *s);
 static void process_pending_fit_request(void);
 static void process_heavyfit_result(void);
+static void process_dds_direct_result(void);
 static bool chart_point_visible(uint32_t index);
 static void create_full_table_page(void);
 static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
@@ -193,13 +204,39 @@ static bool ensure_ui_work_buffers(void)
             heap_caps_calloc(1, sizeof(heavyfit_output_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
         );
     }
+    if (g_cap_samples == nullptr) {
+        g_cap_samples = static_cast<int16_t *>(
+            heap_caps_calloc(kCapSampleCount, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+        if (g_cap_samples == nullptr) {
+            g_cap_samples = static_cast<int16_t *>(
+                heap_caps_calloc(kCapSampleCount, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+            );
+        }
+    }
+    if (g_cap_valid == nullptr) {
+        g_cap_valid = static_cast<uint8_t *>(
+            heap_caps_calloc(kCapSampleCount, sizeof(uint8_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        );
+        if (g_cap_valid == nullptr) {
+            g_cap_valid = static_cast<uint8_t *>(
+                heap_caps_calloc(kCapSampleCount, sizeof(uint8_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+            );
+        }
+    }
 
-    if (g_table == nullptr || g_fit_input_work_ptr == nullptr || g_fit_output_work_ptr == nullptr) {
+    if (g_table == nullptr ||
+        g_fit_input_work_ptr == nullptr ||
+        g_fit_output_work_ptr == nullptr ||
+        g_cap_samples == nullptr ||
+        g_cap_valid == nullptr) {
         ESP_LOGE(TAG_UI,
-                 "UI PSRAM buffer alloc failed: table=%p fit_in=%p fit_out=%p psram=%u internal=%u dma=%u",
+                 "UI buffer alloc failed: table=%p fit_in=%p fit_out=%p cap=%p valid=%p psram=%u internal=%u dma=%u",
                  g_table,
                  g_fit_input_work_ptr,
                  g_fit_output_work_ptr,
+                 g_cap_samples,
+                 g_cap_valid,
                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                  heap_caps_get_free_size(MALLOC_CAP_DMA));
@@ -607,9 +644,15 @@ static void ClearAllSweepData(void)
     g_fit_result_quality = FIT_RESULT_NONE;
     g_adv_output_captured = false;
     g_adv_reconstruction_ready = false;
-    memset(g_cap_samples, 0, sizeof(g_cap_samples));
-    memset(g_cap_valid, 0, sizeof(g_cap_valid));
+    if (g_cap_samples != nullptr) {
+        memset(g_cap_samples, 0, kCapSampleCount * sizeof(g_cap_samples[0]));
+    }
+    if (g_cap_valid != nullptr) {
+        memset(g_cap_valid, 0, kCapSampleCount * sizeof(g_cap_valid[0]));
+    }
     g_cap_received_count = 0;
+    g_cap_chunk_mask = 0;
+    g_cap_expected_chunks = 0;
     g_cap_complete = false;
     g_cap_send_square_after_complete = false;
     g_adv_harmonic_count = 0;
@@ -1734,16 +1777,88 @@ static void adv_send_event_cb(lv_event_t *event)
     set_adv_result("DDS REQ / WAIT", COLOR_YELLOW);
 }
 
+typedef enum {
+    DDS_DIRECT_JOB_SQUARE = 1,
+    DDS_DIRECT_JOB_TRIANGLE = 2,
+    DDS_DIRECT_JOB_ECHO = 3,
+} dds_direct_job_t;
+
+static void dds_direct_task_entry(void *arg)
+{
+    const uint32_t job = reinterpret_cast<uintptr_t>(arg);
+    bool ok = false;
+
+    if (job == DDS_DIRECT_JOB_SQUARE) {
+        ok = DdsDirect_SendSquareTest();
+    } else if (job == DDS_DIRECT_JOB_TRIANGLE) {
+        ok = DdsDirect_SendTriangleTest();
+    } else if (job == DDS_DIRECT_JOB_ECHO) {
+        ok = DdsDirect_SpiEchoTest();
+    }
+
+    g_dds_direct_result = ok ? job : (job | 0x80000000U);
+    g_dds_direct_busy = false;
+    g_dds_direct_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+static bool start_dds_direct_job(dds_direct_job_t job, const char *busy_text)
+{
+    if (g_dds_direct_busy) {
+        set_adv_result("DDS DIRECT BUSY", COLOR_YELLOW);
+        return false;
+    }
+
+    g_dds_direct_busy = true;
+    g_dds_direct_result = 0;
+    set_adv_result(busy_text, COLOR_YELLOW);
+
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        dds_direct_task_entry,
+        "dds_direct_tx",
+        4096,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(job)),
+        3,
+        &g_dds_direct_task,
+        1);
+    if (created != pdPASS) {
+        g_dds_direct_busy = false;
+        g_dds_direct_task = nullptr;
+        set_adv_result("DDS DIRECT TASK FAIL", COLOR_RED);
+        return false;
+    }
+    return true;
+}
+
+static void process_dds_direct_result(void)
+{
+    const uint32_t result = g_dds_direct_result;
+    if (result == 0U) {
+        return;
+    }
+    g_dds_direct_result = 0;
+
+    const bool ok = (result & 0x80000000U) == 0U;
+    const uint32_t job = result & 0x7FFFFFFFU;
+    if (job == DDS_DIRECT_JOB_SQUARE) {
+        set_adv_result(ok ? "DDS DIRECT SQ DONE" : "DDS DIRECT SQ FAIL",
+                       ok ? COLOR_GREEN : COLOR_RED);
+    } else if (job == DDS_DIRECT_JOB_TRIANGLE) {
+        set_adv_result(ok ? "DDS DIRECT TRI DONE" : "DDS DIRECT TRI FAIL",
+                       ok ? COLOR_GREEN : COLOR_RED);
+    } else if (job == DDS_DIRECT_JOB_ECHO) {
+        set_adv_result(ok ? "DDS SPI ECHO DONE" : "DDS SPI ECHO FAIL",
+                       ok ? COLOR_GREEN : COLOR_RED);
+    }
+}
+
 static void adv_direct_square_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
 
-    set_adv_result("DDS DIRECT TX", COLOR_YELLOW);
-    const bool ok = DdsDirect_SendSquareTest();
-    set_adv_result(ok ? "DDS DIRECT SQ DONE" : "DDS DIRECT SQ FAIL",
-                   ok ? COLOR_GREEN : COLOR_RED);
+    start_dds_direct_job(DDS_DIRECT_JOB_SQUARE, "DDS DIRECT SQ TX");
 }
 
 static void adv_direct_triangle_event_cb(lv_event_t *event)
@@ -1752,10 +1867,7 @@ static void adv_direct_triangle_event_cb(lv_event_t *event)
         return;
     }
 
-    set_adv_result("DDS DIRECT TX", COLOR_YELLOW);
-    const bool ok = DdsDirect_SendTriangleTest();
-    set_adv_result(ok ? "DDS DIRECT TRI DONE" : "DDS DIRECT TRI FAIL",
-                   ok ? COLOR_GREEN : COLOR_RED);
+    start_dds_direct_job(DDS_DIRECT_JOB_TRIANGLE, "DDS DIRECT TRI TX");
 }
 
 static void adv_spi_echo_event_cb(lv_event_t *event)
@@ -1764,10 +1876,7 @@ static void adv_spi_echo_event_cb(lv_event_t *event)
         return;
     }
 
-    set_adv_result("DDS SPI ECHO TX", COLOR_YELLOW);
-    const bool ok = DdsDirect_SpiEchoTest();
-    set_adv_result(ok ? "DDS SPI ECHO DONE" : "DDS SPI ECHO FAIL",
-                   ok ? COLOR_GREEN : COLOR_RED);
+    start_dds_direct_job(DDS_DIRECT_JOB_ECHO, "DDS SPI ECHO TX");
 }
 
 static void adv_back_event_cb(lv_event_t *event)
@@ -2248,6 +2357,7 @@ void test_screen_create(void)
             SpiLink_UiPump();
             process_pending_fit_request();
             process_heavyfit_result();
+            process_dds_direct_result();
         }, 20, nullptr);
     }
 
@@ -2394,11 +2504,15 @@ static int32_t adv_chart_value_from_sample(int16_t sample)
 
 static void capture_buffer_print_summary(uint32_t total_count)
 {
+    if (g_cap_samples == nullptr || g_cap_valid == nullptr) {
+        return;
+    }
+
     int16_t cap_min = 32767;
     int16_t cap_max = -32768;
     int64_t sum = 0;
     uint32_t zero_count = 0;
-    const uint32_t n = (total_count > 1024U) ? 1024U : total_count;
+    const uint32_t n = (total_count > kCapSampleCount) ? kCapSampleCount : total_count;
 
     for (uint32_t i = 0; i < n; ++i) {
         if (!g_cap_valid[i]) {
@@ -2455,15 +2569,24 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
     if (chunk == nullptr || chunk->wave_type != 0U) {
         return;
     }
+    if (!ensure_ui_work_buffers()) {
+        return;
+    }
 
     if (chunk->chunk_index == 0U) {
-        memset(g_cap_samples, 0, sizeof(g_cap_samples));
-        memset(g_cap_valid, 0, sizeof(g_cap_valid));
+        memset(g_cap_samples, 0, kCapSampleCount * sizeof(g_cap_samples[0]));
+        memset(g_cap_valid, 0, kCapSampleCount * sizeof(g_cap_valid[0]));
         g_cap_received_count = 0;
+        g_cap_chunk_mask = 0;
+        g_cap_expected_chunks = chunk->chunk_count;
         g_cap_complete = false;
     }
 
-    const uint32_t total = (chunk->total_sample_count > 1024U) ? 1024U : chunk->total_sample_count;
+    const uint32_t total = (chunk->total_sample_count > kCapSampleCount) ? kCapSampleCount : chunk->total_sample_count;
+    if (chunk->chunk_index < 64U) {
+        g_cap_chunk_mask |= (1ULL << chunk->chunk_index);
+    }
+#if ENABLE_CAP_VERBOSE_LOG
     ESP_LOGI(TAG_UI,
              "CAP chunk idx=%lu/%lu start=%lu count<=30 flags=0x%08lX total=%lu",
              static_cast<unsigned long>(chunk->chunk_index),
@@ -2471,6 +2594,7 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
              static_cast<unsigned long>(chunk->start_sample_index),
              static_cast<unsigned long>(chunk->flags),
              static_cast<unsigned long>(chunk->total_sample_count));
+#endif
 
     for (uint32_t i = 0; i < 30U; ++i) {
         const uint32_t sample_index = chunk->start_sample_index + i;
@@ -2489,13 +2613,25 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
     if (!g_cap_complete && total != 0U && (g_cap_received_count >= total || is_done)) {
         g_cap_complete = (g_cap_received_count >= total);
         if (g_cap_complete) {
+            uint32_t missing_chunks = 0;
+            const uint32_t expected_chunks =
+                (g_cap_expected_chunks == 0U || g_cap_expected_chunks > 64U) ? chunk->chunk_count : g_cap_expected_chunks;
+            for (uint32_t i = 0; i < expected_chunks && i < 64U; ++i) {
+                if ((g_cap_chunk_mask & (1ULL << i)) == 0ULL) {
+                    ++missing_chunks;
+                }
+            }
+            ESP_LOGW(TAG_UI,
+                     "CAP chunks complete: chunks=%lu missing=%lu samples=%lu/%lu",
+                     static_cast<unsigned long>(expected_chunks),
+                     static_cast<unsigned long>(missing_chunks),
+                     static_cast<unsigned long>(g_cap_received_count),
+                     static_cast<unsigned long>(total));
             capture_buffer_print_summary(total);
             if (g_cap_send_square_after_complete) {
                 g_cap_send_square_after_complete = false;
                 set_adv_result("CAP OK / DDS DIRECT TX", COLOR_YELLOW);
-                const bool ok = DdsDirect_SendSquareTest();
-                set_adv_result(ok ? "CAP OK / DDS DIRECT DONE" : "CAP OK / DDS DIRECT FAIL",
-                               ok ? COLOR_GREEN : COLOR_RED);
+                start_dds_direct_job(DDS_DIRECT_JOB_SQUARE, "CAP OK / DDS DIRECT TX");
             }
         } else {
             g_cap_send_square_after_complete = false;

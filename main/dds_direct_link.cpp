@@ -12,6 +12,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#ifndef ENABLE_DDS_DIRECT_VERBOSE_ACK
+#define ENABLE_DDS_DIRECT_VERBOSE_ACK 0
+#endif
+
 namespace {
 
 constexpr char TAG[] = "DdsDirect";
@@ -199,6 +203,11 @@ void LogAck(const char *tag)
         return;
     }
 
+#if !ENABLE_DDS_DIRECT_VERBOSE_ACK
+    (void)tag;
+    (void)recovered_shift;
+    return;
+#else
     ESP_LOGW(TAG,
              "%s ack%s seq=0x%08lX cmd=0x%08lX freq=0x%08lX/%lu flags=0x%08lX",
              tag,
@@ -208,6 +217,7 @@ void LogAck(const char *tag)
              static_cast<unsigned long>(GetU32(ack, 12)),
              static_cast<unsigned long>(GetU32(ack, 12)),
              static_cast<unsigned long>(GetU32(ack, 16)));
+#endif
 }
 
 bool TransferFrame(const char *tag)

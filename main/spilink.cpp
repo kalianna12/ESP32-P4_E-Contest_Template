@@ -17,6 +17,10 @@
 #define ENABLE_SPI_STRING_TEST 0
 #endif
 
+#ifndef ACCEPT_ZERO_CHECKSUM_ADV_WAVE
+#define ACCEPT_ZERO_CHECKSUM_ADV_WAVE 1
+#endif
+
 namespace {
 
 constexpr char TAG[] = "FreqRespSpiLink";
@@ -98,6 +102,7 @@ uint32_t err_count = 0;
 uint32_t timeout_count = 0;
 uint32_t bad_first_byte_count = 0;
 uint32_t dropped_point_count = 0;
+uint32_t dropped_adv_wave_count = 0;
 uint32_t dropped_harmonic_count = 0;
 uint32_t recovered_header_count = 0;
 uint32_t adv_wave_checksum_warn_count = 0;
@@ -522,6 +527,13 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     const uint8_t expected_checksum = Checksum(frame, kFrameHeaderLen + kPayloadLen);
     const uint8_t rx_checksum = frame[kFrameHeaderLen + kPayloadLen];
     if (rx_checksum != expected_checksum) {
+#if ACCEPT_ZERO_CHECKSUM_ADV_WAVE
+        if (rx_checksum != 0U) {
+            return false;
+        }
+#else
+        return false;
+#endif
         if (adv_wave_checksum_warn_count < 8U) {
             ++adv_wave_checksum_warn_count;
             ESP_LOGW(TAG,
@@ -547,6 +559,15 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     out->mean_mv = GetI32(frame, 40);
     out->vpp_mv = GetI32(frame, 44);
     out->flags = GetU32(frame, 48);
+    if (out->wave_type > 1U ||
+        out->chunk_count == 0U ||
+        out->chunk_count > 64U ||
+        out->total_sample_count == 0U ||
+        out->total_sample_count > 1024U ||
+        out->start_sample_index >= out->total_sample_count ||
+        out->chunk_index >= out->chunk_count) {
+        return false;
+    }
     for (size_t i = 0; i < 30U; ++i) {
         out->samples[i] = GetI16(frame, 52 + i * 2U);
     }
@@ -763,7 +784,7 @@ void MaybeLogSpiStats()
              static_cast<unsigned long>(timeout_count),
              static_cast<unsigned long>(bad_first_byte_count),
              static_cast<unsigned long>(dropped_point_count),
-             static_cast<unsigned long>(dropped_harmonic_count),
+             static_cast<unsigned long>(dropped_harmonic_count + dropped_adv_wave_count),
              static_cast<unsigned long>(recovered_header_count),
              static_cast<unsigned>(point_waiting),
              static_cast<unsigned long>(point_queue_high_water),
@@ -909,6 +930,7 @@ void SpiLink_Init(void)
     err_count = 0;
     timeout_count = 0;
     dropped_point_count = 0;
+    dropped_adv_wave_count = 0;
     dropped_harmonic_count = 0;
     recovered_header_count = 0;
     adv_wave_checksum_warn_count = 0;
@@ -972,6 +994,7 @@ void SpiLink_ClearMeasurementCache(void)
         xQueueReset(g_adv_harmonic_queue);
     }
     dropped_point_count = 0;
+    dropped_adv_wave_count = 0;
     dropped_harmonic_count = 0;
     recovered_header_count = 0;
     point_queue_high_water = 0;
@@ -1166,7 +1189,11 @@ void SpiLink_Task(void)
     if (ParseAdvWaveChunkFrame(parse_frame, kFrameLen, &adv_chunk)) {
         ++ok_count;
         if (kMaxAdvWavesPerPump != 0U && g_adv_wave_queue != nullptr) {
-            xQueueSend(g_adv_wave_queue, &adv_chunk, 0);
+            if (xQueueSend(g_adv_wave_queue, &adv_chunk, 0) != pdTRUE) {
+                ++dropped_adv_wave_count;
+            }
+        } else {
+            ++dropped_adv_wave_count;
         }
         MaybeLogSpiStats();
         return;
