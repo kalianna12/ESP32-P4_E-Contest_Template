@@ -1,7 +1,6 @@
 #include "dds_direct_link.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 
 #include "driver/gpio.h"
@@ -43,9 +42,6 @@ constexpr uint32_t kMaxSampleCount = 4096;
 constexpr uint32_t kDefaultSampleCount = 4096;
 constexpr uint32_t kDefaultSampleRateHz = 100000;
 constexpr uint32_t kSamplesPerChunk = 30;
-constexpr uint8_t kFramePoll = 0xD0;
-constexpr uint32_t kAckReadyDone = 0x00000003U;
-constexpr uint32_t kAckPlaying = 0x00000008U;
 
 spi_device_handle_t g_dds_spi = nullptr;
 SemaphoreHandle_t g_lock = nullptr;
@@ -107,48 +103,6 @@ bool RecoverOneBitLeftShiftedAck(uint8_t *fixed)
     return IsAckFrame(fixed);
 }
 
-struct AckInfo {
-    bool valid;
-    bool echo;
-    bool recovered_shift;
-    uint32_t seq;
-    uint32_t cmd;
-    uint32_t freq;
-    uint32_t flags;
-};
-
-AckInfo ParseAck()
-{
-    AckInfo info = {};
-    const uint8_t *ack = g_rx;
-    uint8_t shifted_ack[kFrameLen];
-
-    if (IsEchoFrame(ack)) {
-        info.echo = true;
-        info.seq = GetU32(ack, 4);
-        info.cmd = GetU32(ack, 8);
-        info.freq = GetU32(ack, 12);
-        info.flags = GetU32(ack, 16);
-        return info;
-    }
-
-    if (!IsAckFrame(ack) && RecoverOneBitLeftShiftedAck(shifted_ack)) {
-        ack = shifted_ack;
-        info.recovered_shift = true;
-    }
-
-    if (!IsAckFrame(ack)) {
-        return info;
-    }
-
-    info.valid = true;
-    info.seq = GetU32(ack, 4);
-    info.cmd = GetU32(ack, 8);
-    info.freq = GetU32(ack, 12);
-    info.flags = GetU32(ack, 16);
-    return info;
-}
-
 void DdsGpioDelay()
 {
     esp_rom_delay_us(DDS_SPI_BITBANG_HALF_PERIOD_US);
@@ -207,20 +161,29 @@ void FinishFrame()
 
 void LogAck(const char *tag)
 {
-    const AckInfo ack = ParseAck();
+    const uint8_t *ack = g_rx;
+    uint8_t shifted_ack[kFrameLen];
+    bool recovered_shift = false;
 
-    if (ack.echo) {
+    if (IsEchoFrame(ack)) {
         ESP_LOGW(TAG,
                  "%s echo count=%lu cmd=0x%08lX freq=0x%08lX flags=0x%08lX",
                  tag,
-                 static_cast<unsigned long>(ack.seq),
-                 static_cast<unsigned long>(ack.cmd),
-                 static_cast<unsigned long>(ack.freq),
-                 static_cast<unsigned long>(ack.flags));
+                 static_cast<unsigned long>(GetU32(ack, 4)),
+                 static_cast<unsigned long>(GetU32(ack, 8)),
+                 static_cast<unsigned long>(GetU32(ack, 12)),
+                 static_cast<unsigned long>(GetU32(ack, 16)));
         return;
     }
 
-    if (!ack.valid) {
+    if (!IsAckFrame(ack)) {
+        if (RecoverOneBitLeftShiftedAck(shifted_ack)) {
+            ack = shifted_ack;
+            recovered_shift = true;
+        }
+    }
+
+    if (!IsAckFrame(ack)) {
         ESP_LOGW(TAG,
                  "%s ack invalid: head=%02X %02X %02X %02X chk=%02X expect=%02X",
                  tag,
@@ -235,21 +198,22 @@ void LogAck(const char *tag)
 
 #if !ENABLE_DDS_DIRECT_VERBOSE_ACK
     (void)tag;
+    (void)recovered_shift;
     return;
 #else
     ESP_LOGW(TAG,
              "%s ack%s seq=0x%08lX cmd=0x%08lX freq=0x%08lX/%lu flags=0x%08lX",
              tag,
-             ack.recovered_shift ? " recovered_1bit" : "",
-             static_cast<unsigned long>(ack.seq),
-             static_cast<unsigned long>(ack.cmd),
-             static_cast<unsigned long>(ack.freq),
-             static_cast<unsigned long>(ack.freq),
-             static_cast<unsigned long>(ack.flags));
+             recovered_shift ? " recovered_1bit" : "",
+             static_cast<unsigned long>(GetU32(ack, 4)),
+             static_cast<unsigned long>(GetU32(ack, 8)),
+             static_cast<unsigned long>(GetU32(ack, 12)),
+             static_cast<unsigned long>(GetU32(ack, 12)),
+             static_cast<unsigned long>(GetU32(ack, 16)));
 #endif
 }
 
-bool TransferFrameRaw(const char *tag, bool log_ack)
+bool TransferFrame(const char *tag)
 {
     if (DDS_SPI_USE_BITBANG) {
         std::memset(g_rx, 0x00, kFrameLen);
@@ -280,9 +244,7 @@ bool TransferFrameRaw(const char *tag, bool log_ack)
         gpio_set_level(DDS_SPI_CS, 1);
         DdsGpioDelay();
 
-        if (log_ack) {
-            LogAck(tag);
-        }
+        LogAck(tag);
         return true;
     }
 
@@ -297,58 +259,8 @@ bool TransferFrameRaw(const char *tag, bool log_ack)
         return false;
     }
 
-    if (log_ack) {
-        LogAck(tag);
-    }
+    LogAck(tag);
     return true;
-}
-
-bool TransferFrame(const char *tag)
-{
-    return TransferFrameRaw(tag, true);
-}
-
-bool TransferFrameStrictAck(const char *tag,
-                            uint32_t seq,
-                            uint32_t expected_cmd,
-                            uint32_t expected_freq,
-                            uint32_t required_flags)
-{
-    if (!TransferFrameRaw(tag, false)) {
-        return false;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    char poll_tag[16];
-    std::snprintf(poll_tag, sizeof(poll_tag), "%s/ACK", tag);
-    BeginFrame(kFramePoll, seq);
-    FinishFrame();
-    if (!TransferFrameRaw(poll_tag, true)) {
-        return false;
-    }
-
-    const AckInfo ack = ParseAck();
-    const bool ok = ack.valid &&
-                    ack.seq == seq &&
-                    ack.cmd == expected_cmd &&
-                    ack.freq == expected_freq &&
-                    ((ack.flags & required_flags) == required_flags);
-    if (!ok) {
-        ESP_LOGE(TAG,
-                 "%s strict ack mismatch: want seq=0x%08lX cmd=0x%08lX freq=%lu flags&0x%08lX got valid=%u seq=0x%08lX cmd=0x%08lX freq=%lu flags=0x%08lX",
-                 tag,
-                 static_cast<unsigned long>(seq),
-                 static_cast<unsigned long>(expected_cmd),
-                 static_cast<unsigned long>(expected_freq),
-                 static_cast<unsigned long>(required_flags),
-                 ack.valid ? 1U : 0U,
-                 static_cast<unsigned long>(ack.seq),
-                 static_cast<unsigned long>(ack.cmd),
-                 static_cast<unsigned long>(ack.freq),
-                 static_cast<unsigned long>(ack.flags));
-    }
-    return ok;
 }
 
 bool EnsureReady()
@@ -486,7 +398,7 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
     PutU32(g_tx, 8, sample_count);
     PutU32(g_tx, 12, sample_rate_hz);
     FinishFrame();
-    ok = TransferFrameStrictAck("D3", seq, 0x000000D3U, sample_rate_hz, kAckReadyDone);
+    ok = TransferFrame("D3");
     vTaskDelay(pdMS_TO_TICKS(1));
 
     const uint32_t chunk_count = (sample_count + kSamplesPerChunk - 1U) / kSamplesPerChunk;
@@ -503,18 +415,14 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
             PutI16(g_tx, 20 + i * 2U, samples[start_index + i]);
         }
         FinishFrame();
-        ok = TransferFrameStrictAck("D4", seq, 0x000000D4U, start_index, kAckReadyDone);
+        ok = TransferFrame("D4");
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     if (ok) {
         BeginFrame(0xD5, seq);
         FinishFrame();
-        ok = TransferFrameStrictAck("D5",
-                                    seq,
-                                    0x000000D5U,
-                                    sample_rate_hz,
-                                    kAckReadyDone | kAckPlaying);
+        ok = TransferFrame("D5");
     }
 
     xSemaphoreGive(g_lock);
