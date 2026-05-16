@@ -487,7 +487,7 @@ static const char *model_kind_text(uint8_t type)
     case MODEL_TYPE_HP2: return "HP2";
     case MODEL_TYPE_BP2: return "BP2";
     case MODEL_TYPE_BS2: return "BS2";
-    default: return "LP1";
+    default: return "UNKNOWN";
     }
 }
 
