@@ -138,11 +138,10 @@ static circuit_model_t g_circuit_model = {};
 static filter_fit_result_t g_last_fit = {};
 static bool g_adv_output_captured = false;
 static bool g_adv_reconstruction_ready = false;
-static constexpr uint32_t kCapSampleCount = 1024U;
+static constexpr uint32_t kCapSampleCount = ESP_RECON_SAMPLE_COUNT;
 static int16_t *g_cap_samples = nullptr;
 static uint8_t *g_cap_valid = nullptr;
 static uint32_t g_cap_received_count = 0;
-static uint64_t g_cap_chunk_mask = 0;
 static uint32_t g_cap_expected_chunks = 0;
 static bool g_cap_complete = false;
 static bool g_cap_send_square_after_complete = false;
@@ -664,7 +663,6 @@ static void ClearAllSweepData(void)
         memset(g_cap_valid, 0, kCapSampleCount * sizeof(g_cap_valid[0]));
     }
     g_cap_received_count = 0;
-    g_cap_chunk_mask = 0;
     g_cap_expected_chunks = 0;
     g_cap_complete = false;
     g_cap_send_square_after_complete = false;
@@ -2646,15 +2644,11 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
         memset(g_cap_samples, 0, kCapSampleCount * sizeof(g_cap_samples[0]));
         memset(g_cap_valid, 0, kCapSampleCount * sizeof(g_cap_valid[0]));
         g_cap_received_count = 0;
-        g_cap_chunk_mask = 0;
         g_cap_expected_chunks = chunk->chunk_count;
         g_cap_complete = false;
     }
 
     const uint32_t total = (chunk->total_sample_count > kCapSampleCount) ? kCapSampleCount : chunk->total_sample_count;
-    if (chunk->chunk_index < 64U) {
-        g_cap_chunk_mask |= (1ULL << chunk->chunk_index);
-    }
 #if ENABLE_CAP_VERBOSE_LOG
     ESP_LOGI(TAG_UI,
              "CAP chunk idx=%lu/%lu start=%lu count<=30 flags=0x%08lX total=%lu",
@@ -2684,9 +2678,17 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk)
         if (g_cap_complete) {
             uint32_t missing_chunks = 0;
             const uint32_t expected_chunks =
-                (g_cap_expected_chunks == 0U || g_cap_expected_chunks > 64U) ? chunk->chunk_count : g_cap_expected_chunks;
-            for (uint32_t i = 0; i < expected_chunks && i < 64U; ++i) {
-                if ((g_cap_chunk_mask & (1ULL << i)) == 0ULL) {
+                (g_cap_expected_chunks == 0U) ? chunk->chunk_count : g_cap_expected_chunks;
+            for (uint32_t i = 0; i < expected_chunks; ++i) {
+                const uint32_t chunk_start = i * 30U;
+                bool chunk_seen = false;
+                for (uint32_t j = 0; j < 30U && (chunk_start + j) < total; ++j) {
+                    if (g_cap_valid[chunk_start + j]) {
+                        chunk_seen = true;
+                        break;
+                    }
+                }
+                if (!chunk_seen) {
                     ++missing_chunks;
                 }
             }

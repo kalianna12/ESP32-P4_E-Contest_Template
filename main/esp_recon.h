@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 #ifndef ESP_RECON_SAMPLE_COUNT
-#define ESP_RECON_SAMPLE_COUNT 1024U
+#define ESP_RECON_SAMPLE_COUNT ADV_CAPTURE_SAMPLE_MAX
 #endif
 
 #ifndef ESP_RECON_OUTPUT_SAMPLE_COUNT
@@ -22,6 +22,22 @@ extern "C" {
 // 2: DFT/IFFT, magnitude + phase compensation.
 #ifndef ESP_RECON_STAGE
 #define ESP_RECON_STAGE 2
+#endif
+
+// 0: legacy full-spectrum IFFT output.
+// 1: synthesize output from detected harmonics only. Recommended for contest demo.
+#ifndef ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
+#define ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH 1
+#endif
+
+// When harmonic synth is enabled, keep only odd harmonics. This is best for square-wave reconstruction.
+#ifndef ESP_RECON_SYNTH_ODD_HARMONICS_ONLY
+#define ESP_RECON_SYNTH_ODD_HARMONICS_ONLY 1
+#endif
+
+// Optional circular 3-tap output smoothing after harmonic synthesis / IFFT fallback.
+#ifndef ESP_RECON_OUTPUT_SMOOTH_ENABLE
+#define ESP_RECON_OUTPUT_SMOOTH_ENABLE 0
 #endif
 
 #ifndef ESP_RECON_TARGET_PEAK

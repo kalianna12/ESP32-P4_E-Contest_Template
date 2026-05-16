@@ -275,6 +275,19 @@ static uint32_t DominantBin(const Work *w, uint32_t n)
     return best;
 }
 
+static void SmoothCircular3Tap(float *x, float *tmp, uint32_t n)
+{
+    if (x == nullptr || tmp == nullptr || n < 3U) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t prev = (i == 0U) ? (n - 1U) : (i - 1U);
+        const uint32_t next = (i + 1U >= n) ? 0U : (i + 1U);
+        tmp[i] = 0.25f * x[prev] + 0.5f * x[i] + 0.25f * x[next];
+    }
+    memcpy(x, tmp, n * sizeof(x[0]));
+}
+
 static float BinMag(const Work *w, uint32_t bin)
 {
     return sqrtf(w->xr[bin] * w->xr[bin] + w->xi[bin] * w->xi[bin]);
@@ -382,6 +395,7 @@ static void LogHarmonics(const Work *w,
 
 static bool BuildPeriodicWaveFromHarmonics(const Work *w,
                                            const esp_recon_result_t *out,
+                                           const circuit_model_t *model,
                                            uint32_t input_n,
                                            uint32_t sample_rate_hz,
                                            float *dst,
@@ -411,14 +425,31 @@ static bool BuildPeriodicWaveFromHarmonics(const Work *w,
             if (harm->index == 0U || harm->bin == 0U || harm->bin >= input_n / 2U) {
                 continue;
             }
+#if ESP_RECON_SYNTH_ODD_HARMONICS_ONLY
+            if ((harm->index & 1U) == 0U) {
+                continue;
+            }
+#endif
             if (harm->index * cycles >= dst_n / 2U) {
                 continue;
             }
-            const float amp = BinMag(w, harm->bin) * 2.0f / static_cast<float>(input_n);
+            float amp = BinMag(w, harm->bin) * 2.0f / static_cast<float>(input_n);
             if (amp < 0.5f) {
                 continue;
             }
-            const float phase_cos = atan2f(-w->xi[harm->bin], w->xr[harm->bin]);
+            const uint32_t freq_hz = (harm->bin * sample_rate_hz) / input_n;
+            float gain = 1.0f;
+            float phase = 0.0f;
+            InterpolateModel(model, freq_hz, &gain, &phase);
+            float inv_gain = 1.0f / gain;
+            if (inv_gain > kMaxInvGain) {
+                inv_gain = kMaxInvGain;
+            }
+            amp *= inv_gain;
+            float phase_cos = atan2f(-w->xi[harm->bin], w->xr[harm->bin]);
+#if ESP_RECON_STAGE >= 2
+            phase_cos = WrapPhaseRad(phase_cos + phase);
+#endif
             const float theta =
                 kTwoPi *
                 static_cast<float>(harm->index * cycles) *
@@ -478,6 +509,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
                static_cast<float>(sample_count)));
     LogHarmonics(w, sample_count, sample_rate_hz, fundamental_bin, out);
 
+#if !ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
     // Keep DC removed. Positive and negative bins are both compensated.
     w->xr[0] = 0.0f;
     w->xi[0] = 0.0f;
@@ -513,12 +545,13 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     }
     InverseDft(sample_count, w);
 #endif
+#endif
 
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
     uint32_t playback_f0_hz = 0U;
-#if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE
-    if (BuildPeriodicWaveFromHarmonics(w, out, sample_count, sample_rate_hz,
+#if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE && ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
+    if (BuildPeriodicWaveFromHarmonics(w, out, model, sample_count, sample_rate_hz,
                                        w->synth, kOutN, &playback_f0_hz)) {
         output_src = w->synth;
         output_count = kOutN;
@@ -529,6 +562,18 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
         output_src = w->tr;
         output_count = sample_count;
     }
+
+#if ESP_RECON_OUTPUT_SMOOTH_ENABLE
+    if (output_count <= kN) {
+        memcpy(w->synth, output_src, output_count * sizeof(w->synth[0]));
+        SmoothCircular3Tap(w->synth, w->tr, output_count);
+        output_src = w->synth;
+    } else if (output_count <= kOutN) {
+        memcpy(w->tr, output_src, output_count * sizeof(w->tr[0]));
+        SmoothCircular3Tap(w->tr, w->synth, output_count);
+        output_src = w->tr;
+    }
+#endif
 
     NormalizeToInt16(output_src, output_count, ESP_RECON_TARGET_PEAK, w->wave,
                      &out->out_min, &out->out_max);

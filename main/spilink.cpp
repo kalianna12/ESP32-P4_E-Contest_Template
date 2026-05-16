@@ -60,7 +60,7 @@ constexpr UBaseType_t kAdvStatusQueueLen = 4;
 constexpr size_t kMaxUiPointsPerPump = 128;
 constexpr size_t kMaxAdvWavesPerPump = 8;
 constexpr size_t kMaxAdvHarmonicsPerPump = 16;
-constexpr UBaseType_t kAdvWaveQueueLen = (kMaxAdvWavesPerPump == 0) ? 0 : 64;
+constexpr UBaseType_t kAdvWaveQueueLen = (kMaxAdvWavesPerPump == 0) ? 0 : 192;
 constexpr UBaseType_t kAdvHarmonicQueueLen = (kMaxAdvHarmonicsPerPump == 0) ? 0 : 64;
 
 static_assert((kRxBufferLen % 64) == 0, "SPI RX buffer length must be a 64-byte multiple");
@@ -742,9 +742,9 @@ bool ParseAdvWaveChunkFrame(const uint8_t *frame, size_t len, adc_waveform_chunk
     const uint32_t expected_start_index = out->chunk_index * 30U;
     if (out->wave_type > 1U ||
         out->chunk_count == 0U ||
-        out->chunk_count > 64U ||
+        out->chunk_count > ((ADV_CAPTURE_SAMPLE_MAX + 29U) / 30U) ||
         out->total_sample_count == 0U ||
-        out->total_sample_count > 1024U ||
+        out->total_sample_count > ADV_CAPTURE_SAMPLE_MAX ||
         out->start_sample_index >= out->total_sample_count ||
         out->chunk_index >= out->chunk_count ||
         out->chunk_count != expected_chunk_count ||
