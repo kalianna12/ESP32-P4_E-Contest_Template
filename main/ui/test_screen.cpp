@@ -1641,7 +1641,7 @@ static void stop_button_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         SpiLink_SetPendingCommand(CMD_STOP, 0U, 0U);
-        set_msg("STOP", COLOR_YELLOW);
+        set_msg("STOP MEAS", COLOR_YELLOW);
 #if ENABLE_FAKE_DATA_TEST
         if (g_fake_timer != nullptr) {
             lv_timer_pause(g_fake_timer);
