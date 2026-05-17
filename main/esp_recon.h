@@ -21,7 +21,7 @@ extern "C" {
 // 1: DFT/IFFT, magnitude compensation only; keep captured phase. Recommended first.
 // 2: DFT/IFFT, magnitude + phase compensation.
 #ifndef ESP_RECON_STAGE
-#define ESP_RECON_STAGE 2
+#define ESP_RECON_STAGE 1
 #endif
 
 // 0: legacy full-spectrum IFFT output.
@@ -39,6 +39,25 @@ extern "C" {
 // Optional circular 3-tap output smoothing after harmonic synthesis / IFFT fallback.
 #ifndef ESP_RECON_OUTPUT_SMOOTH_ENABLE
 #define ESP_RECON_OUTPUT_SMOOTH_ENABLE 0
+#endif
+
+// Reconstructed harmonic phase direction:
+// +1 keeps the current DFT phase convention, -1 mirrors it, 0 forces zero phase.
+// When ESP_RECON_STAGE >= 2, the measured circuit phase compensation uses
+// the same sign so both captured phase and model phase can be flipped together.
+#ifndef ESP_RECON_PHASE_COMP_SIGN
+#define ESP_RECON_PHASE_COMP_SIGN 1
+#endif
+
+// Fundamental-period reference shift used only by harmonic synthesis.
+// Unit: 0.1 degree of the fundamental. Example: 900 = +90.0 deg.
+#ifndef ESP_RECON_PHASE_REFERENCE_DEG_X10
+#define ESP_RECON_PHASE_REFERENCE_DEG_X10 0
+#endif
+
+// Harmonic synthesis basis: 0 = cos(theta + phase), 1 = sin(theta + phase).
+#ifndef ESP_RECON_SYNTH_USE_SIN_BASIS
+#define ESP_RECON_SYNTH_USE_SIN_BASIS 0
 #endif
 
 #ifndef ESP_RECON_TARGET_PEAK

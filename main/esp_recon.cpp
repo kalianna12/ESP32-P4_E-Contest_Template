@@ -32,6 +32,9 @@ constexpr uint32_t kMaxLockedHarmonics = 100U;
 constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 constexpr uint32_t kReconDdsActualPlaybackRateHz = 100000U;
 constexpr uint32_t kYieldEveryBins = 16U;
+constexpr int32_t kPhaseCompSign = ESP_RECON_PHASE_COMP_SIGN;
+constexpr float kSynthReferencePhaseRad =
+    static_cast<float>(ESP_RECON_PHASE_REFERENCE_DEG_X10) * (kPi / 1800.0f);
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
 #define ESP_RECON_HARMONIC_SEARCH_SPAN 3U
@@ -798,9 +801,9 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
             inv_gain = kMaxInvGain;
         }
         float comp_amp = raw_amp[harmonic] * inv_gain;
-        float comp_phase = raw_phase[harmonic];
+        float comp_phase = WrapPhaseRad(static_cast<float>(kPhaseCompSign) * raw_phase[harmonic]);
 #if ESP_RECON_STAGE >= 2
-        comp_phase = WrapPhaseRad(comp_phase + phase);
+        comp_phase = WrapPhaseRad(comp_phase + static_cast<float>(kPhaseCompSign) * phase);
 #endif
 
         if (!ShouldKeepHarmonic(out->mode,
@@ -896,9 +899,10 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
             inv_gain = kMaxInvGain;
         }
         const float amp = mag * inv_gain;
-        float phase_cos = atan2f(-w->xi[peak_bin], w->xr[peak_bin]);
+        float phase_cos = WrapPhaseRad(
+            static_cast<float>(kPhaseCompSign) * atan2f(-w->xi[peak_bin], w->xr[peak_bin]));
 #if ESP_RECON_STAGE >= 2
-        phase_cos = WrapPhaseRad(phase_cos + phase);
+        phase_cos = WrapPhaseRad(phase_cos + static_cast<float>(kPhaseCompSign) * phase);
 #endif
         const int32_t phase_x10 =
             static_cast<int32_t>(lrintf(phase_cos * (1800.0f / kPi)));
@@ -977,12 +981,18 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
             }
             const float phase_cos =
                 static_cast<float>(harm->phase_deg_x10) * (kPi / 1800.0f);
+            const float phase_ref =
+                kSynthReferencePhaseRad * static_cast<float>(harm->index);
             const float theta =
                 kTwoPi *
                 static_cast<float>(harm->index * cycles) *
                 static_cast<float>(i) /
                 static_cast<float>(dst_n);
-            y += amp * cosf(theta + phase_cos);
+#if ESP_RECON_SYNTH_USE_SIN_BASIS
+            y += amp * sinf(theta + phase_cos + phase_ref);
+#else
+            y += amp * cosf(theta + phase_cos + phase_ref);
+#endif
         }
         dst[i] = y;
         if ((i & 127U) == 0U) {
@@ -1090,7 +1100,9 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
             float im = w->xi[k] * inv_gain;
 
 #if ESP_RECON_STAGE >= 2
-            const float comp_phase = (k <= sample_count / 2U) ? -phase : phase;
+            const float signed_phase =
+                static_cast<float>(kPhaseCompSign) * phase;
+            const float comp_phase = (k <= sample_count / 2U) ? -signed_phase : signed_phase;
             const float c = cosf(comp_phase);
             const float s = sinf(comp_phase);
             const float rr = re * c - im * s;
@@ -1167,7 +1179,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     memcpy(out->samples, w->wave, output_count * sizeof(out->samples[0]));
 
     ESP_LOGW(TAG,
-             "recon mode=%u shape=%u spikes=%lu repl=%lu conf=%lu flags=0x%08lX stage=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu use_n=%lu out_n=%lu f0=%luHz period=%lu locked=%u play_rate=%luHz",
+             "recon mode=%u shape=%u spikes=%lu repl=%lu conf=%lu flags=0x%08lX stage=%d phase_sign=%ld ref_x10=%d sin_basis=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu use_n=%lu out_n=%lu f0=%luHz period=%lu locked=%u play_rate=%luHz",
              static_cast<unsigned>(out->mode),
              static_cast<unsigned>(out->detected_shape),
              static_cast<unsigned long>(out->quality.spike_count),
@@ -1175,6 +1187,9 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
              static_cast<unsigned long>(out->quality.amdf_confidence_x1000),
              static_cast<unsigned long>(out->quality.flags),
              ESP_RECON_STAGE,
+             static_cast<long>(kPhaseCompSign),
+             ESP_RECON_PHASE_REFERENCE_DEG_X10,
+             ESP_RECON_SYNTH_USE_SIN_BASIS,
              static_cast<long>(out->cap_min),
              static_cast<long>(out->cap_max),
              static_cast<long>(out->cap_vpp),
