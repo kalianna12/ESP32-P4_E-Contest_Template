@@ -44,7 +44,7 @@ constexpr size_t kFrameLen = 128;
 constexpr size_t kChecksumOffset = 116;
 constexpr uint32_t kMaxSampleCount = 4096;
 constexpr uint32_t kDefaultSampleCount = 4096;
-constexpr uint32_t kDefaultSampleRateHz = 100000;
+constexpr uint32_t kDefaultSampleRateHz = DDS_DIRECT_DEFAULT_PLAYBACK_RATE_HZ;
 constexpr uint32_t kSamplesPerChunk = 30;
 constexpr uint32_t kSquareTestSampleCount = 4000;
 constexpr uint32_t kSquareTestPeriodSamples = 80;
@@ -52,6 +52,12 @@ constexpr uint32_t kSquareTestHalfPeriodSamples = kSquareTestPeriodSamples / 2U;
 constexpr uint32_t kTriangleTestSampleCount = 4000;
 constexpr uint32_t kTriangleTestPeriodSamples = 80;
 constexpr uint32_t kTriangleTestHalfPeriodSamples = kTriangleTestPeriodSamples / 2U;
+
+constexpr dds_direct_playback_rate_t kPlaybackRates[] = {
+    { 100000U, 1250U },
+    { 200000U, 625U },
+    { 500000U, 250U },
+};
 
 spi_device_handle_t g_dds_spi = nullptr;
 SemaphoreHandle_t g_lock = nullptr;
@@ -296,6 +302,16 @@ int16_t ClampI16(int32_t value)
     return static_cast<int16_t>(value);
 }
 
+const dds_direct_playback_rate_t *FindPlaybackRate(uint32_t sample_rate_hz)
+{
+    for (const dds_direct_playback_rate_t &rate : kPlaybackRates) {
+        if (rate.sample_rate_hz == sample_rate_hz) {
+            return &rate;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 bool DdsDirect_Init(void)
@@ -389,6 +405,23 @@ bool DdsDirect_Init(void)
     return true;
 }
 
+uint32_t DdsDirect_DefaultPlaybackRateHz(void)
+{
+    return kDefaultSampleRateHz;
+}
+
+bool DdsDirect_GetPlaybackRate(uint32_t sample_rate_hz, dds_direct_playback_rate_t *out)
+{
+    const dds_direct_playback_rate_t *rate = FindPlaybackRate(sample_rate_hz);
+    if (rate == nullptr) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = *rate;
+    }
+    return true;
+}
+
 bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t sample_rate_hz)
 {
     if (samples == nullptr || sample_count == 0U || sample_count > kMaxSampleCount) {
@@ -398,6 +431,15 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
     }
     if (sample_rate_hz == 0U) {
         sample_rate_hz = kDefaultSampleRateHz;
+    }
+    dds_direct_playback_rate_t playback_rate = {};
+    if (!DdsDirect_GetPlaybackRate(sample_rate_hz, &playback_rate)) {
+        ESP_LOGW(TAG,
+                 "Unsupported DDS playback rate %luHz, fallback to %luHz",
+                 static_cast<unsigned long>(sample_rate_hz),
+                 static_cast<unsigned long>(kDefaultSampleRateHz));
+        sample_rate_hz = kDefaultSampleRateHz;
+        DdsDirect_GetPlaybackRate(sample_rate_hz, &playback_rate);
     }
     if (!EnsureReady()) {
         return false;
@@ -442,11 +484,12 @@ bool DdsDirect_SendWave(const int16_t *samples, uint32_t sample_count, uint32_t 
     xSemaphoreGive(g_lock);
 
     ESP_LOGW(TAG,
-             "DDS direct send %s: seq=0x%08lX samples=%lu rate=%lu chunks=%lu ack_head=%02X %02X %02X %02X ack_cmd=0x%08lX ack_freq=%lu ack_flags=0x%08lX",
+             "DDS direct send %s: seq=0x%08lX samples=%lu rate=%lu step=%lu chunks=%lu ack_head=%02X %02X %02X %02X ack_cmd=0x%08lX ack_freq=%lu ack_flags=0x%08lX",
              ok ? "done" : "failed",
              static_cast<unsigned long>(seq),
              static_cast<unsigned long>(sample_count),
              static_cast<unsigned long>(sample_rate_hz),
+             static_cast<unsigned long>(playback_rate.pynq_step_clks),
              static_cast<unsigned long>(chunk_count),
              g_rx[0],
              g_rx[1],
