@@ -1210,6 +1210,15 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     }
 #endif
 
+#if ESP_RECON_OUTPUT_INVERT
+    if (output_count <= kOutN) {
+        for (uint32_t i = 0; i < output_count; ++i) {
+            w->synth[i] = -output_src[i];
+        }
+        output_src = w->synth;
+    }
+#endif
+
     NormalizeToInt16(output_src, output_count, ESP_RECON_TARGET_PEAK, w->wave,
                      &out->out_min, &out->out_max);
     out->sample_count = output_count;

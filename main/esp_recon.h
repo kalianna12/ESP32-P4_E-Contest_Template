@@ -73,6 +73,10 @@ extern "C" {
 #define ESP_RECON_SYNTH_USE_SIN_BASIS 0
 #endif
 
+#ifndef ESP_RECON_OUTPUT_INVERT
+#define ESP_RECON_OUTPUT_INVERT 1
+#endif
+
 #if ESP_RECON_PHASE_COMP_SIGN < -1 || ESP_RECON_PHASE_COMP_SIGN > 1
 #error "ESP_RECON_PHASE_COMP_SIGN must be -1, 0, or 1"
 #endif
