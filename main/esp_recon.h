@@ -174,6 +174,8 @@ bool EspRecon_SendFromCapture(const int16_t *capture,
 uint32_t EspRecon_GetLastHarmonics(esp_recon_harmonic_t *out, uint32_t max_count);
 void EspRecon_SetMode(esp_recon_mode_t mode);
 esp_recon_mode_t EspRecon_GetMode(void);
+bool EspRecon_SetPlaybackRateHz(uint32_t sample_rate_hz);
+uint32_t EspRecon_GetPlaybackRateHz(void);
 void EspRecon_SetPhaseDebug(const esp_recon_phase_debug_t *config);
 void EspRecon_GetPhaseDebug(esp_recon_phase_debug_t *config);
 void EspRecon_CyclePhaseDebug(void);

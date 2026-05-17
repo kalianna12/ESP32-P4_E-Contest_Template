@@ -35,7 +35,6 @@ constexpr uint32_t kAmdfLagMaxCeil = 2000U;
 constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
 constexpr uint32_t kMaxLockedHarmonics = 100U;
-constexpr uint32_t kReconDdsPlaybackRateHz = DDS_DIRECT_DEFAULT_PLAYBACK_RATE_HZ;
 constexpr uint32_t kYieldEveryBins = 16U;
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
@@ -49,6 +48,7 @@ constexpr uint32_t kYieldEveryBins = 16U;
 static esp_recon_harmonic_t g_last_harmonics[ESP_RECON_HARMONIC_MAX] = {};
 static uint32_t g_last_harmonic_count = 0;
 static esp_recon_mode_t g_recon_mode = ESP_RECON_MODE_AUTO;
+static uint32_t g_recon_dds_playback_rate_hz = DDS_DIRECT_DEFAULT_PLAYBACK_RATE_HZ;
 static esp_recon_phase_debug_t g_phase_debug = {
     ESP_RECON_PHASE_COMP_SIGN,
     ESP_RECON_PHASE_REFERENCE_DEG_X10,
@@ -1050,7 +1050,7 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
         return false;
     }
 
-    const uint32_t playback_rate_hz = kReconDdsPlaybackRateHz;
+    const uint32_t playback_rate_hz = g_recon_dds_playback_rate_hz;
     uint32_t cycles = RoundedPlaybackCycles(out->dominant_freq_hz,
                                             dst_capacity,
                                             playback_rate_hz);
@@ -1132,7 +1132,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     out->sample_count = sample_count;
     out->sample_rate_hz = sample_rate_hz;
     out->capture_sample_rate_hz = sample_rate_hz;
-    out->playback_sample_rate_hz = kReconDdsPlaybackRateHz;
+    out->playback_sample_rate_hz = g_recon_dds_playback_rate_hz;
     out->mode = g_recon_mode;
     out->detected_shape = ESP_RECON_SHAPE_UNKNOWN;
     CaptureStats(capture, sample_count, out);
@@ -1244,7 +1244,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
 
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
-    uint32_t playback_sample_rate_hz = kReconDdsPlaybackRateHz;
+    uint32_t playback_sample_rate_hz = g_recon_dds_playback_rate_hz;
     uint32_t periodic_sample_count = kOutN;
     uint32_t output_cycles = 0U;
 #if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE && ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
@@ -1386,6 +1386,20 @@ void EspRecon_SetMode(esp_recon_mode_t mode)
 esp_recon_mode_t EspRecon_GetMode(void)
 {
     return g_recon_mode;
+}
+
+bool EspRecon_SetPlaybackRateHz(uint32_t sample_rate_hz)
+{
+    if (!DdsDirect_GetPlaybackRate(sample_rate_hz, nullptr)) {
+        return false;
+    }
+    g_recon_dds_playback_rate_hz = sample_rate_hz;
+    return true;
+}
+
+uint32_t EspRecon_GetPlaybackRateHz(void)
+{
+    return g_recon_dds_playback_rate_hz;
 }
 
 void EspRecon_SetPhaseDebug(const esp_recon_phase_debug_t *config)
