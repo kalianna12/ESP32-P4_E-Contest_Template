@@ -113,6 +113,8 @@ static lv_obj_t *g_adv_model_range_line = nullptr;
 static lv_obj_t *g_adv_result = nullptr;
 static lv_obj_t *g_adv_mode_btn = nullptr;
 static lv_obj_t *g_adv_phase_btn = nullptr;
+static lv_obj_t *g_adv_adc_rate_btn = nullptr;
+static lv_obj_t *g_adv_adc_rate_line = nullptr;
 static lv_obj_t *g_adv_output_chart = nullptr;
 static lv_chart_series_t *g_adv_output_series = nullptr;
 static lv_obj_t *g_adv_recon_chart = nullptr;
@@ -129,6 +131,7 @@ static uint32_t g_adv_harmonic_count = 0;
 static uint32_t g_adv_harmonic_table_page = 0;
 static uint32_t g_last_adv_capture_done_count = 0;
 static uint32_t g_last_adv_recon_done_count = 0;
+static uint32_t g_adv_recon_adc_rate_hz = 100000U;
 static bool g_adv_capture_pending = false;
 static bool g_adv_recon_pending = false;
 static bool g_adv_dds_pending = false;
@@ -208,6 +211,7 @@ typedef enum {
 static fit_result_quality_t g_fit_result_quality = FIT_RESULT_NONE;
 
 static void update_adv_model_line(void);
+static void set_adv_result(const char *text, uint32_t color);
 static void render_basic_status(const freqresp_ui_status_t *s);
 static void process_pending_fit_request(void);
 static void process_heavyfit_result(void);
@@ -223,6 +227,10 @@ static void capture_buffer_store_chunk(const adc_waveform_chunk_t *chunk);
 static const char *recon_mode_name(esp_recon_mode_t mode);
 static const char *recon_shape_name(esp_recon_detected_shape_t shape);
 static void update_adv_mode_button_label(void);
+static void update_adv_phase_button_label(void);
+static void update_adv_adc_rate_button_label(void);
+static void update_adv_adc_rate_line(void);
+static uint32_t next_adv_adc_rate_hz(uint32_t rate_hz);
 #if ENABLE_BASIC_ESP_DDS_CONTROL
 static void request_basic_dds_freq(uint32_t freq_hz);
 #endif
@@ -658,6 +666,68 @@ static void update_adv_phase_button_label(void)
         snprintf(buf, sizeof(buf), "PH %s", (cfg.phase_sign < 0) ? "INV" : "NORM");
     }
     lv_label_set_text(label, buf);
+}
+
+static uint32_t next_adv_adc_rate_hz(uint32_t rate_hz)
+{
+    if (rate_hz == 100000U) {
+        return 200000U;
+    }
+    if (rate_hz == 200000U) {
+        return 500000U;
+    }
+    return 100000U;
+}
+
+static void update_adv_adc_rate_button_label(void)
+{
+    if (g_adv_adc_rate_btn == nullptr) {
+        return;
+    }
+
+    lv_obj_t *label = lv_obj_get_child(g_adv_adc_rate_btn, 0);
+    if (label == nullptr) {
+        return;
+    }
+
+    char buf[24];
+    snprintf(buf,
+             sizeof(buf),
+             "ADC %luK",
+             static_cast<unsigned long>(g_adv_recon_adc_rate_hz / 1000U));
+    lv_label_set_text(label, buf);
+}
+
+static void update_adv_adc_rate_line(void)
+{
+    if (g_adv_adc_rate_line == nullptr) {
+        return;
+    }
+
+    char buf[64];
+    snprintf(buf,
+             sizeof(buf),
+             "SRC ADC CH2   FS %lu kSPS",
+             static_cast<unsigned long>(g_adv_recon_adc_rate_hz / 1000U));
+    lv_label_set_text(g_adv_adc_rate_line, buf);
+}
+
+static void adv_adc_rate_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    g_adv_recon_adc_rate_hz = next_adv_adc_rate_hz(g_adv_recon_adc_rate_hz);
+    update_adv_adc_rate_button_label();
+    update_adv_adc_rate_line();
+
+    char buf[32];
+    snprintf(buf,
+             sizeof(buf),
+             "ADC %luK",
+             static_cast<unsigned long>(g_adv_recon_adc_rate_hz / 1000U));
+    set_adv_result(buf, COLOR_YELLOW);
 }
 
 static void set_msg(const char *text, uint32_t color)
@@ -1911,7 +1981,7 @@ static void adv_capture_event_cb(lv_event_t *event)
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     refresh_harmonic_rows();
-    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, g_adv_recon_adc_rate_hz, 0U);
     set_adv_result("CAP REQ / WAIT", COLOR_YELLOW);
 }
 
@@ -1931,7 +2001,7 @@ static void adv_capture_direct_square_event_cb(lv_event_t *event)
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     refresh_harmonic_rows();
-    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+    SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, g_adv_recon_adc_rate_hz, 0U);
     set_adv_result("CAP REQ / DDS DIRECT SQ", COLOR_YELLOW);
 }
 
@@ -1958,7 +2028,7 @@ static void adv_reconstruct_event_cb(lv_event_t *event)
     g_adv_harmonic_count = 0;
     memset(g_adv_harmonic_valid, 0, sizeof(g_adv_harmonic_valid));
     refresh_harmonic_rows();
-    SpiLink_SetPendingCommand(CMD_ADV_RECONSTRUCT, 0U, 0U);
+    SpiLink_SetPendingCommand(CMD_ADV_RECONSTRUCT, g_adv_recon_adc_rate_hz, 0U);
     set_adv_result("RECON+DDS / WAIT", COLOR_YELLOW);
 }
 
@@ -1999,7 +2069,7 @@ static void dds_direct_task_entry(void *arg)
     } else if (job == DDS_DIRECT_JOB_RECON) {
         ok = EspRecon_SendFromCapture(g_cap_samples,
                                       kCapSampleCount,
-                                      100000U,
+                                      g_adv_recon_adc_rate_hz,
                                       g_circuit_model.valid ? &g_circuit_model : nullptr);
     }
 
@@ -2060,7 +2130,7 @@ static void process_dds_direct_result(void)
         if (ok) {
             EspRecon_BuildFromCapture(g_cap_samples,
                                       kCapSampleCount,
-                                      100000U,
+                                      g_adv_recon_adc_rate_hz,
                                       g_circuit_model.valid ? &g_circuit_model : nullptr,
                                       &g_last_recon_result);
             if ((g_last_recon_result.quality.flags & ESP_RECON_QUALITY_UNSTABLE) != 0U &&
@@ -2078,7 +2148,7 @@ static void process_dds_direct_result(void)
                 g_adv_capture_req_base = g_latest_adv_capture_count;
                 g_adv_output_captured = false;
                 g_adv_reconstruction_ready = false;
-                SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, 0U, 0U);
+                SpiLink_SetPendingCommand(CMD_ADV_CAPTURE, g_adv_recon_adc_rate_hz, 0U);
                 set_adv_result("CAP unstable / recapture", COLOR_YELLOW);
                 return;
             }
@@ -2434,6 +2504,8 @@ static void create_reconstruction_page(void)
     g_adv_output_series = nullptr;
     g_adv_recon_chart = nullptr;
     g_adv_recon_series = nullptr;
+    g_adv_adc_rate_btn = nullptr;
+    g_adv_adc_rate_line = nullptr;
     g_adv_harmonic_table = nullptr;
     g_adv_harmonic_table_page_label = nullptr;
     memset(g_adv_harmonic_rows, 0, sizeof(g_adv_harmonic_rows));
@@ -2468,14 +2540,15 @@ static void create_reconstruction_page(void)
                                           &lv_font_montserrat_16,
                                           COLOR_SUBTEXT);
 
-    create_label(screen,
-                 "SRC ADC CH2   FS 100 kSPS",
-                 24,
-                 122,
-                 590,
-                 &lv_font_montserrat_16,
-                 COLOR_SUBTEXT);
+    g_adv_adc_rate_line = create_label(screen,
+                                       "SRC ADC CH2   FS 100 kSPS",
+                                       24,
+                                       122,
+                                       590,
+                                       &lv_font_montserrat_16,
+                                       COLOR_SUBTEXT);
     update_adv_model_line();
+    update_adv_adc_rate_line();
 
     create_label(screen,
                  "CAP / ESP RECON / DDS",
@@ -2489,16 +2562,19 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_esp_recon = create_button(screen, "ESP RECON", 164, 178, 150);
     lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 334, 178, 95);
     lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 449, 178, 95);
+    g_adv_adc_rate_btn = create_button(screen, "ADC 100K", 564, 214, 130);
     g_adv_phase_btn = create_button(screen, "PH NORM", 744, 178, 86);
     g_adv_mode_btn = create_button(screen, "MODE AUTO", 838, 178, 160);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_esp_recon, adv_esp_recon_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_triangle, adv_direct_triangle_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_adv_adc_rate_btn, adv_adc_rate_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(g_adv_phase_btn, adv_phase_debug_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(g_adv_mode_btn, adv_recon_mode_event_cb, LV_EVENT_CLICKED, nullptr);
     update_adv_phase_button_label();
     update_adv_mode_button_label();
+    update_adv_adc_rate_button_label();
 
 #if ENABLE_ADV_FPGA_RECON_BUTTONS
     lv_obj_t *btn_reconstruct = create_button(screen, "FPGA RECON", 564, 178, 150);
@@ -3630,6 +3706,8 @@ static void create_harmonic_table_page(void)
     g_adv_harmonic_table = nullptr;
     g_adv_harmonic_table_page_label = nullptr;
     g_adv_status = nullptr;
+    g_adv_adc_rate_btn = nullptr;
+    g_adv_adc_rate_line = nullptr;
     g_adv_model_line = nullptr;
     g_adv_model_range_line = nullptr;
     g_adv_result = nullptr;

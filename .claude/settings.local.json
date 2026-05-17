@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(idf.py *)",
+      "Bash(where.exe *)",
+      "Bash(/c/Espressif/tools/idf-exe/1.0.3/idf.py.exe *)",
+      "Bash(mkdir -p \"/c/Users/kalianna/Desktop/bit/esp32p4_elec_template\")",
+      "Bash(cp \"build/bootloader/bootloader.bin\" \"/c/Users/kalianna/Desktop/bit/esp32p4_elec_template/\")",
+      "Bash(cp \"build/partition_table/partition-table.bin\" \"/c/Users/kalianna/Desktop/bit/esp32p4_elec_template/\")",
+      "Bash(cp \"build/esp32p4_elec_template.bin\" \"/c/Users/kalianna/Desktop/bit/esp32p4_elec_template/\")",
+      "Bash(cp \"build/flasher_args.json\" \"/c/Users/kalianna/Desktop/bit/esp32p4_elec_template/\")",
+      "Bash(iverilog *)"
+    ]
+  }
+}

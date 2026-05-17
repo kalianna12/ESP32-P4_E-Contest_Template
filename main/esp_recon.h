@@ -142,6 +142,8 @@ typedef struct {
     int16_t samples[ESP_RECON_OUTPUT_SAMPLE_COUNT];
     uint32_t sample_count;
     uint32_t sample_rate_hz;
+    uint32_t capture_sample_rate_hz;
+    uint32_t playback_sample_rate_hz;
     int32_t cap_min;
     int32_t cap_max;
     int32_t cap_mean;

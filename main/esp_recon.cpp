@@ -22,6 +22,12 @@ constexpr float kMaxInvGain = 5.0f;
 constexpr float kMinHarmonicGain = 0.15f;
 constexpr float kHarmonicRelativeFloor = 0.05f;
 constexpr float kHarmonicAbsoluteFloor = 20.0f;
+constexpr uint32_t kSquareMaxKeptHarmonics = 80U;
+constexpr uint32_t kSquareOddMaxHarmonic = 99U;
+constexpr uint32_t kSquareMaxHarmonicFreqHz = 25000U;
+constexpr float kSquareRelativeFloor = 0.010f;
+constexpr float kSquareAbsoluteFloorMv = 5.0f;
+constexpr float kSquareMinHarmonicGain = 0.08f;
 constexpr uint32_t kF0MinHz = 100U;
 constexpr uint32_t kF0MaxHz = 20000U;
 constexpr uint32_t kAmdfLagMinFloor = 8U;
@@ -126,6 +132,46 @@ static int32_t ClampSinBasis(int32_t sin_basis)
 static float PhaseSignFloat(void)
 {
     return static_cast<float>(ClampPhaseSign(g_phase_debug.phase_sign));
+}
+
+static esp_recon_mode_t EffectiveReconMode(esp_recon_mode_t mode,
+                                           esp_recon_detected_shape_t detected_shape)
+{
+    if (mode != ESP_RECON_MODE_AUTO) {
+        return mode;
+    }
+
+    if (detected_shape == ESP_RECON_SHAPE_SQUARE ||
+        detected_shape == ESP_RECON_SHAPE_TRIANGLE) {
+        return ESP_RECON_MODE_SQUARE;
+    }
+    if (detected_shape == ESP_RECON_SHAPE_ARB) {
+        return ESP_RECON_MODE_ARB;
+    }
+    return ESP_RECON_MODE_TRI_SINE;
+}
+
+static bool IsSquareReconMode(esp_recon_mode_t mode,
+                              esp_recon_detected_shape_t detected_shape)
+{
+    return EffectiveReconMode(mode, detected_shape) == ESP_RECON_MODE_SQUARE;
+}
+
+static uint32_t SquareOddHarmonicLimit(uint32_t period_samples)
+{
+    if (period_samples >= 128U) {
+        return kSquareOddMaxHarmonic;
+    }
+    if (period_samples >= 64U) {
+        return 41U;
+    }
+    if (period_samples >= 32U) {
+        return 21U;
+    }
+    if (period_samples >= 12U) {
+        return 9U;
+    }
+    return 5U;
 }
 
 static float SynthReferencePhaseRad(void)
@@ -380,6 +426,8 @@ static esp_recon_detected_shape_t DetectReconShape(const float *raw_amp,
 static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
                                esp_recon_detected_shape_t detected_shape,
                                uint32_t harmonic,
+                               uint32_t period_samples,
+                               uint32_t freq_hz,
                                float amp,
                                float h1_amp,
                                uint32_t *kept_count)
@@ -387,23 +435,23 @@ static bool ShouldKeepHarmonic(esp_recon_mode_t mode,
     if (harmonic == 0U || kept_count == nullptr) {
         return false;
     }
-    if (*kept_count >= 50U) {
+
+    const esp_recon_mode_t effective_mode = EffectiveReconMode(mode, detected_shape);
+    const bool square_mode = (effective_mode == ESP_RECON_MODE_SQUARE);
+    const uint32_t max_kept = square_mode ? kSquareMaxKeptHarmonics : 50U;
+    if (*kept_count >= max_kept) {
         return false;
     }
 
-    const esp_recon_mode_t effective_mode =
-        (mode == ESP_RECON_MODE_AUTO) ?
-        ((detected_shape == ESP_RECON_SHAPE_SQUARE ||
-          detected_shape == ESP_RECON_SHAPE_TRIANGLE) ? ESP_RECON_MODE_SQUARE :
-         (detected_shape == ESP_RECON_SHAPE_ARB) ? ESP_RECON_MODE_ARB :
-         ESP_RECON_MODE_TRI_SINE)
-        : mode;
-
     bool keep = false;
-    if (effective_mode == ESP_RECON_MODE_SQUARE) {
-        if ((harmonic & 1U) != 0U && harmonic <= 99U) {
+    if (square_mode) {
+        const uint32_t odd_limit = SquareOddHarmonicLimit(period_samples);
+        if ((harmonic & 1U) != 0U && harmonic <= odd_limit &&
+            harmonic <= kSquareOddMaxHarmonic &&
+            freq_hz <= kSquareMaxHarmonicFreqHz) {
             keep = true;
-        } else if ((harmonic & 1U) == 0U && amp >= h1_amp * 0.20f) {
+        } else if ((harmonic & 1U) == 0U && amp >= h1_amp * 0.20f &&
+                   freq_hz <= kSquareMaxHarmonicFreqHz) {
             keep = true;
         }
     } else if (effective_mode == ESP_RECON_MODE_ARB) {
@@ -801,7 +849,9 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
 
     out->detected_shape = DetectReconShape(raw_amp, max_harmonic, f0_hz);
 
-    const float amp_floor =
+    const bool square_mode = IsSquareReconMode(out->mode, out->detected_shape);
+    const float amp_floor = square_mode ?
+        fmaxf(kSquareAbsoluteFloorMv, raw_amp[1] * kSquareRelativeFloor) :
         fmaxf(kHarmonicAbsoluteFloor, raw_amp[1] * kHarmonicRelativeFloor);
     out->harmonic_count = 0U;
     g_last_harmonic_count = 0U;
@@ -824,7 +874,8 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         float gain = 1.0f;
         float phase = 0.0f;
         const bool have_model = InterpolateModel(model, freq_hz, &gain, &phase);
-        if (have_model && gain < kMinHarmonicGain) {
+        const float min_gain = square_mode ? kSquareMinHarmonicGain : kMinHarmonicGain;
+        if (have_model && gain < min_gain) {
             ESP_LOGW(TAG,
                      "H%lu drop: freq=%luHz raw_amp=%.1f H=%.3f",
                      static_cast<unsigned long>(harmonic),
@@ -848,6 +899,8 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         if (!ShouldKeepHarmonic(out->mode,
                                 out->detected_shape,
                                 harmonic,
+                                period_samples,
+                                freq_hz,
                                 comp_amp,
                                 raw_amp[1],
                                 &kept_count)) {
@@ -871,15 +924,17 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
             out->harmonics[out->harmonic_count++] = h;
         }
 
-        ESP_LOGW(TAG,
-                 "H%lu locked freq=%luHz raw_amp=%.1f amp=%.1f phase=%.1fdeg shape=%u mode=%u",
-                 static_cast<unsigned long>(harmonic),
-                 static_cast<unsigned long>(freq_hz),
-                 static_cast<double>(raw_amp[harmonic]),
-                 static_cast<double>(comp_amp),
-                 static_cast<double>(h.phase_deg_x10) / 10.0,
-                 static_cast<unsigned>(out->detected_shape),
-                 static_cast<unsigned>(out->mode));
+        if (out->harmonic_count <= 10U) {
+            ESP_LOGW(TAG,
+                     "H%lu locked freq=%luHz raw_amp=%.1f amp=%.1f phase=%.1fdeg shape=%u mode=%u",
+                     static_cast<unsigned long>(harmonic),
+                     static_cast<unsigned long>(freq_hz),
+                     static_cast<double>(raw_amp[harmonic]),
+                     static_cast<double>(comp_amp),
+                     static_cast<double>(h.phase_deg_x10) / 10.0,
+                     static_cast<unsigned>(out->detected_shape),
+                     static_cast<unsigned>(out->mode));
+        }
     }
 
     if (use_n_out != nullptr) {
@@ -930,7 +985,10 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
         float gain = 1.0f;
         float phase = 0.0f;
         const bool have_model = InterpolateModel(model, freq_hz, &gain, &phase);
-        if (have_model && gain < kMinHarmonicGain) {
+        const float min_gain = IsSquareReconMode(out != nullptr ? out->mode : ESP_RECON_MODE_AUTO,
+                                                 out != nullptr ? out->detected_shape : ESP_RECON_SHAPE_UNKNOWN) ?
+                               kSquareMinHarmonicGain : kMinHarmonicGain;
+        if (have_model && gain < min_gain) {
             continue;
         }
         float inv_gain = 1.0f / gain;
@@ -1061,6 +1119,8 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     memset(out, 0, sizeof(*out));
     out->sample_count = sample_count;
     out->sample_rate_hz = sample_rate_hz;
+    out->capture_sample_rate_hz = sample_rate_hz;
+    out->playback_sample_rate_hz = kReconDdsPlaybackRateHz;
     out->mode = g_recon_mode;
     out->detected_shape = ESP_RECON_SHAPE_UNKNOWN;
     CaptureStats(capture, sample_count, out);
@@ -1172,15 +1232,19 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
 
     uint32_t output_count = sample_count;
     const float *output_src = w->tr;
-    uint32_t playback_sample_rate_hz = sample_rate_hz;
+    uint32_t playback_sample_rate_hz = kReconDdsPlaybackRateHz;
     uint32_t periodic_sample_count = kOutN;
+    uint32_t output_cycles = 0U;
 #if ESP_RECON_STAGE >= 1 && ESP_RECON_PERIODIC_SYNTH_ENABLE && ESP_RECON_OUTPUT_USE_HARMONIC_SYNTH
     if (BuildPeriodicWaveFromHarmonics(out, w->synth, kOutN,
                                        &playback_sample_rate_hz,
                                        &periodic_sample_count)) {
         output_src = w->synth;
         output_count = periodic_sample_count;
-        out->sample_rate_hz = kReconDdsPlaybackRateHz;
+        out->playback_sample_rate_hz = playback_sample_rate_hz;
+        out->sample_rate_hz = out->capture_sample_rate_hz;
+        output_cycles = static_cast<uint32_t>((static_cast<uint64_t>(out->dominant_freq_hz) * output_count) /
+                                              out->playback_sample_rate_hz);
     } else
 #endif
     {
@@ -1195,7 +1259,8 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
         }
         MakeLoopContinuous(w->tr, output_count);
         output_src = w->tr;
-        out->sample_rate_hz = kReconDdsPlaybackRateHz;
+        out->playback_sample_rate_hz = playback_sample_rate_hz;
+        out->sample_rate_hz = out->capture_sample_rate_hz;
     }
 
 #if ESP_RECON_OUTPUT_SMOOTH_ENABLE
@@ -1225,8 +1290,14 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     out->out_vpp = out->out_max - out->out_min;
     memcpy(out->samples, w->wave, output_count * sizeof(out->samples[0]));
 
+    const uint32_t actual_out_freq = (out->sample_count != 0U && output_cycles != 0U) ?
+        static_cast<uint32_t>((static_cast<uint64_t>(output_cycles) * out->playback_sample_rate_hz +
+                               out->sample_count / 2U) / out->sample_count) : 0U;
+    const uint32_t window_ms = (out->capture_sample_rate_hz != 0U) ?
+        static_cast<uint32_t>((static_cast<uint64_t>(sample_count) * 1000ULL) /
+                              out->capture_sample_rate_hz) : 0U;
     ESP_LOGW(TAG,
-             "recon mode=%u shape=%u spikes=%lu repl=%lu conf=%lu flags=0x%08lX stage=%d phase_sign=%ld ref_x10=%d sin_basis=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu use_n=%lu out_n=%lu f0=%luHz period=%lu locked=%u play_rate=%luHz",
+             "recon mode=%u shape=%u spikes=%lu repl=%lu conf=%lu flags=0x%08lX stage=%d phase_sign=%ld ref_x10=%d sin_basis=%d cap=[%ld,%ld] vpp=%ld mean=%ld out=[%ld,%ld] vpp=%ld in_n=%lu use_n=%lu out_n=%lu capture_rate=%luHz playback_rate=%luHz window=%lums f0=%luHz period=%lu output_cycles=%lu actual_out=%luHz locked=%u",
              static_cast<unsigned>(out->mode),
              static_cast<unsigned>(out->detected_shape),
              static_cast<unsigned long>(out->quality.spike_count),
@@ -1247,10 +1318,14 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
              static_cast<unsigned long>(sample_count),
              static_cast<unsigned long>(locked_use_n),
              static_cast<unsigned long>(out->sample_count),
+             static_cast<unsigned long>(out->capture_sample_rate_hz),
+             static_cast<unsigned long>(out->playback_sample_rate_hz),
+             static_cast<unsigned long>(window_ms),
              static_cast<unsigned long>(out->dominant_freq_hz),
              static_cast<unsigned long>(locked_period),
-             locked_harmonics ? 1U : 0U,
-             static_cast<unsigned long>(out->sample_rate_hz));
+             static_cast<unsigned long>(output_cycles),
+             static_cast<unsigned long>(actual_out_freq),
+             locked_harmonics ? 1U : 0U);
 
     heap_caps_free(w);
     return true;
@@ -1273,7 +1348,9 @@ bool EspRecon_SendFromCapture(const int16_t *capture,
     }
 
     const bool built = EspRecon_BuildFromCapture(capture, sample_count, sample_rate_hz, model, result);
-    const bool sent = built && DdsDirect_SendWave(result->samples, result->sample_count, result->sample_rate_hz);
+    const bool sent = built && DdsDirect_SendWave(result->samples,
+                                                  result->sample_count,
+                                                  result->playback_sample_rate_hz);
     heap_caps_free(result);
     return sent;
 }
