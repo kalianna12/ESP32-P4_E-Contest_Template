@@ -21,7 +21,7 @@ extern "C" {
 // 1: DFT/IFFT, magnitude compensation only; keep captured phase. Recommended first.
 // 2: DFT/IFFT, magnitude + phase compensation.
 #ifndef ESP_RECON_STAGE
-#define ESP_RECON_STAGE 1
+#define ESP_RECON_STAGE 2
 #endif
 
 // 0: legacy full-spectrum IFFT output.
@@ -41,10 +41,23 @@ extern "C" {
 #define ESP_RECON_OUTPUT_SMOOTH_ENABLE 0
 #endif
 
+// ============================================================
+// Phase / waveform-shape debug knobs
+// ============================================================
+// Use these three macros to locate phase reference or sin/cos convention errors
+// when reconstructed peaks/valleys do not line up with the original waveform.
+//
+// Suggested quick tests:
+//   1) ESP_RECON_PHASE_COMP_SIGN = -1
+//   2) ESP_RECON_PHASE_REFERENCE_DEG_X10 = 900 or -900
+//   3) ESP_RECON_SYNTH_USE_SIN_BASIS = 1
+//
 // Reconstructed harmonic phase direction:
-// +1 keeps the current DFT phase convention, -1 mirrors it, 0 forces zero phase.
-// When ESP_RECON_STAGE >= 2, the measured circuit phase compensation uses
-// the same sign so both captured phase and model phase can be flipped together.
+//   +1 keeps the current DFT phase convention
+//   -1 mirrors the captured harmonic phase
+//    0 forces zero phase for all harmonics
+// When ESP_RECON_STAGE >= 2, measured circuit phase compensation uses the same
+// sign so captured phase and model phase flip together.
 #ifndef ESP_RECON_PHASE_COMP_SIGN
 #define ESP_RECON_PHASE_COMP_SIGN 1
 #endif
@@ -58,6 +71,14 @@ extern "C" {
 // Harmonic synthesis basis: 0 = cos(theta + phase), 1 = sin(theta + phase).
 #ifndef ESP_RECON_SYNTH_USE_SIN_BASIS
 #define ESP_RECON_SYNTH_USE_SIN_BASIS 0
+#endif
+
+#if ESP_RECON_PHASE_COMP_SIGN < -1 || ESP_RECON_PHASE_COMP_SIGN > 1
+#error "ESP_RECON_PHASE_COMP_SIGN must be -1, 0, or 1"
+#endif
+
+#if ESP_RECON_SYNTH_USE_SIN_BASIS != 0 && ESP_RECON_SYNTH_USE_SIN_BASIS != 1
+#error "ESP_RECON_SYNTH_USE_SIN_BASIS must be 0 or 1"
 #endif
 
 #ifndef ESP_RECON_TARGET_PEAK
@@ -108,6 +129,12 @@ typedef struct {
 } esp_recon_harmonic_t;
 
 typedef struct {
+    int32_t phase_sign;
+    int32_t reference_deg_x10;
+    int32_t sin_basis;
+} esp_recon_phase_debug_t;
+
+typedef struct {
     int16_t samples[ESP_RECON_OUTPUT_SAMPLE_COUNT];
     uint32_t sample_count;
     uint32_t sample_rate_hz;
@@ -141,6 +168,9 @@ bool EspRecon_SendFromCapture(const int16_t *capture,
 uint32_t EspRecon_GetLastHarmonics(esp_recon_harmonic_t *out, uint32_t max_count);
 void EspRecon_SetMode(esp_recon_mode_t mode);
 esp_recon_mode_t EspRecon_GetMode(void);
+void EspRecon_SetPhaseDebug(const esp_recon_phase_debug_t *config);
+void EspRecon_GetPhaseDebug(esp_recon_phase_debug_t *config);
+void EspRecon_CyclePhaseDebug(void);
 
 #ifdef __cplusplus
 }

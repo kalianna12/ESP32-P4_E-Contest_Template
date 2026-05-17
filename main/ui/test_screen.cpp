@@ -112,6 +112,7 @@ static lv_obj_t *g_adv_model_line = nullptr;
 static lv_obj_t *g_adv_model_range_line = nullptr;
 static lv_obj_t *g_adv_result = nullptr;
 static lv_obj_t *g_adv_mode_btn = nullptr;
+static lv_obj_t *g_adv_phase_btn = nullptr;
 static lv_obj_t *g_adv_output_chart = nullptr;
 static lv_chart_series_t *g_adv_output_series = nullptr;
 static lv_obj_t *g_adv_recon_chart = nullptr;
@@ -629,6 +630,33 @@ static void update_adv_mode_button_label(void)
 
     char buf[32];
     snprintf(buf, sizeof(buf), "MODE %s", recon_mode_name(EspRecon_GetMode()));
+    lv_label_set_text(label, buf);
+}
+
+static void update_adv_phase_button_label(void)
+{
+    if (g_adv_phase_btn == nullptr) {
+        return;
+    }
+
+    lv_obj_t *label = lv_obj_get_child(g_adv_phase_btn, 0);
+    if (label == nullptr) {
+        return;
+    }
+
+    esp_recon_phase_debug_t cfg = {};
+    EspRecon_GetPhaseDebug(&cfg);
+    char buf[40];
+    if (cfg.sin_basis != 0) {
+        snprintf(buf, sizeof(buf), "PH SIN");
+    } else if (cfg.phase_sign == 0) {
+        snprintf(buf, sizeof(buf), "PH ZERO");
+    } else if (cfg.reference_deg_x10 != 0) {
+        snprintf(buf, sizeof(buf), "PH R%ld",
+                 static_cast<long>(cfg.reference_deg_x10 / 10));
+    } else {
+        snprintf(buf, sizeof(buf), "PH %s", (cfg.phase_sign < 0) ? "INV" : "NORM");
+    }
     lv_label_set_text(label, buf);
 }
 
@@ -2153,6 +2181,25 @@ static void adv_recon_mode_event_cb(lv_event_t *event)
     set_adv_result(recon_mode_name(mode), COLOR_YELLOW);
 }
 
+static void adv_phase_debug_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    EspRecon_CyclePhaseDebug();
+    update_adv_phase_button_label();
+
+    esp_recon_phase_debug_t cfg = {};
+    EspRecon_GetPhaseDebug(&cfg);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "PH s=%ld r=%ld sin=%ld",
+             static_cast<long>(cfg.phase_sign),
+             static_cast<long>(cfg.reference_deg_x10),
+             static_cast<long>(cfg.sin_basis));
+    set_adv_result(buf, COLOR_YELLOW);
+}
+
 static void adv_spi_echo_event_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
@@ -2442,12 +2489,15 @@ static void create_reconstruction_page(void)
     lv_obj_t *btn_esp_recon = create_button(screen, "ESP RECON", 164, 178, 150);
     lv_obj_t *btn_direct_square = create_button(screen, "DIR SQ", 334, 178, 95);
     lv_obj_t *btn_direct_triangle = create_button(screen, "DIR TRI", 449, 178, 95);
-    g_adv_mode_btn = create_button(screen, "MODE AUTO", 744, 178, 160);
+    g_adv_phase_btn = create_button(screen, "PH NORM", 744, 178, 86);
+    g_adv_mode_btn = create_button(screen, "MODE AUTO", 838, 178, 160);
     lv_obj_add_event_cb(btn_capture, adv_capture_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_esp_recon, adv_esp_recon_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_square, adv_direct_square_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btn_direct_triangle, adv_direct_triangle_event_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_adv_phase_btn, adv_phase_debug_event_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(g_adv_mode_btn, adv_recon_mode_event_cb, LV_EVENT_CLICKED, nullptr);
+    update_adv_phase_button_label();
     update_adv_mode_button_label();
 
 #if ENABLE_ADV_FPGA_RECON_BUTTONS

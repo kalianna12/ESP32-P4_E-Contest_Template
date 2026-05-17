@@ -32,9 +32,6 @@ constexpr uint32_t kMaxLockedHarmonics = 100U;
 constexpr uint32_t kReconDdsPlaybackRateHz = 100000U;
 constexpr uint32_t kReconDdsActualPlaybackRateHz = 100000U;
 constexpr uint32_t kYieldEveryBins = 16U;
-constexpr int32_t kPhaseCompSign = ESP_RECON_PHASE_COMP_SIGN;
-constexpr float kSynthReferencePhaseRad =
-    static_cast<float>(ESP_RECON_PHASE_REFERENCE_DEG_X10) * (kPi / 1800.0f);
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
 #define ESP_RECON_HARMONIC_SEARCH_SPAN 3U
@@ -47,6 +44,21 @@ constexpr float kSynthReferencePhaseRad =
 static esp_recon_harmonic_t g_last_harmonics[ESP_RECON_HARMONIC_MAX] = {};
 static uint32_t g_last_harmonic_count = 0;
 static esp_recon_mode_t g_recon_mode = ESP_RECON_MODE_AUTO;
+static esp_recon_phase_debug_t g_phase_debug = {
+    ESP_RECON_PHASE_COMP_SIGN,
+    ESP_RECON_PHASE_REFERENCE_DEG_X10,
+    ESP_RECON_SYNTH_USE_SIN_BASIS,
+};
+
+constexpr esp_recon_phase_debug_t kPhaseDebugPresets[] = {
+    { 1, 0, 0 },
+    { -1, 0, 0 },
+    { 0, 0, 0 },
+    { 1, 900, 0 },
+    { 1, -900, 0 },
+    { 1, 0, 1 },
+};
+static uint32_t g_phase_debug_preset = 0;
 
 struct Work {
     float xr[kN];
@@ -93,6 +105,32 @@ static float WrapPhaseRad(float phase)
         phase += kTwoPi;
     }
     return phase;
+}
+
+static int32_t ClampPhaseSign(int32_t sign)
+{
+    if (sign > 0) {
+        return 1;
+    }
+    if (sign < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int32_t ClampSinBasis(int32_t sin_basis)
+{
+    return sin_basis != 0 ? 1 : 0;
+}
+
+static float PhaseSignFloat(void)
+{
+    return static_cast<float>(ClampPhaseSign(g_phase_debug.phase_sign));
+}
+
+static float SynthReferencePhaseRad(void)
+{
+    return static_cast<float>(g_phase_debug.reference_deg_x10) * (kPi / 1800.0f);
 }
 
 static uint32_t ClampU32(uint32_t v, uint32_t lo, uint32_t hi)
@@ -801,9 +839,10 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
             inv_gain = kMaxInvGain;
         }
         float comp_amp = raw_amp[harmonic] * inv_gain;
-        float comp_phase = WrapPhaseRad(static_cast<float>(kPhaseCompSign) * raw_phase[harmonic]);
+        const float phase_sign = PhaseSignFloat();
+        float comp_phase = WrapPhaseRad(phase_sign * raw_phase[harmonic]);
 #if ESP_RECON_STAGE >= 2
-        comp_phase = WrapPhaseRad(comp_phase + static_cast<float>(kPhaseCompSign) * phase);
+        comp_phase = WrapPhaseRad(comp_phase + phase_sign * phase);
 #endif
 
         if (!ShouldKeepHarmonic(out->mode,
@@ -899,10 +938,10 @@ static bool ExtractLockedHarmonics(const int16_t *capture,
             inv_gain = kMaxInvGain;
         }
         const float amp = mag * inv_gain;
-        float phase_cos = WrapPhaseRad(
-            static_cast<float>(kPhaseCompSign) * atan2f(-w->xi[peak_bin], w->xr[peak_bin]));
+        const float phase_sign = PhaseSignFloat();
+        float phase_cos = WrapPhaseRad(phase_sign * atan2f(-w->xi[peak_bin], w->xr[peak_bin]));
 #if ESP_RECON_STAGE >= 2
-        phase_cos = WrapPhaseRad(phase_cos + static_cast<float>(kPhaseCompSign) * phase);
+        phase_cos = WrapPhaseRad(phase_cos + phase_sign * phase);
 #endif
         const int32_t phase_x10 =
             static_cast<int32_t>(lrintf(phase_cos * (1800.0f / kPi)));
@@ -982,17 +1021,15 @@ static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
             const float phase_cos =
                 static_cast<float>(harm->phase_deg_x10) * (kPi / 1800.0f);
             const float phase_ref =
-                kSynthReferencePhaseRad * static_cast<float>(harm->index);
+                SynthReferencePhaseRad() * static_cast<float>(harm->index);
             const float theta =
                 kTwoPi *
                 static_cast<float>(harm->index * cycles) *
                 static_cast<float>(i) /
                 static_cast<float>(dst_n);
-#if ESP_RECON_SYNTH_USE_SIN_BASIS
-            y += amp * sinf(theta + phase_cos + phase_ref);
-#else
-            y += amp * cosf(theta + phase_cos + phase_ref);
-#endif
+            const float synth_phase = theta + phase_cos + phase_ref;
+            y += (ClampSinBasis(g_phase_debug.sin_basis) != 0) ?
+                 (amp * sinf(synth_phase)) : (amp * cosf(synth_phase));
         }
         dst[i] = y;
         if ((i & 127U) == 0U) {
@@ -1100,8 +1137,9 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
             float im = w->xi[k] * inv_gain;
 
 #if ESP_RECON_STAGE >= 2
+            const float phase_sign = PhaseSignFloat();
             const float signed_phase =
-                static_cast<float>(kPhaseCompSign) * phase;
+                phase_sign * phase;
             const float comp_phase = (k <= sample_count / 2U) ? -signed_phase : signed_phase;
             const float c = cosf(comp_phase);
             const float s = sinf(comp_phase);
@@ -1187,9 +1225,9 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
              static_cast<unsigned long>(out->quality.amdf_confidence_x1000),
              static_cast<unsigned long>(out->quality.flags),
              ESP_RECON_STAGE,
-             static_cast<long>(kPhaseCompSign),
-             ESP_RECON_PHASE_REFERENCE_DEG_X10,
-             ESP_RECON_SYNTH_USE_SIN_BASIS,
+             static_cast<long>(g_phase_debug.phase_sign),
+             static_cast<int>(g_phase_debug.reference_deg_x10),
+             static_cast<int>(g_phase_debug.sin_basis),
              static_cast<long>(out->cap_min),
              static_cast<long>(out->cap_max),
              static_cast<long>(out->cap_vpp),
@@ -1249,4 +1287,30 @@ void EspRecon_SetMode(esp_recon_mode_t mode)
 esp_recon_mode_t EspRecon_GetMode(void)
 {
     return g_recon_mode;
+}
+
+void EspRecon_SetPhaseDebug(const esp_recon_phase_debug_t *config)
+{
+    if (config == nullptr) {
+        return;
+    }
+    g_phase_debug.phase_sign = ClampPhaseSign(config->phase_sign);
+    g_phase_debug.reference_deg_x10 = config->reference_deg_x10;
+    g_phase_debug.sin_basis = ClampSinBasis(config->sin_basis);
+}
+
+void EspRecon_GetPhaseDebug(esp_recon_phase_debug_t *config)
+{
+    if (config == nullptr) {
+        return;
+    }
+    *config = g_phase_debug;
+}
+
+void EspRecon_CyclePhaseDebug(void)
+{
+    constexpr uint32_t preset_count =
+        sizeof(kPhaseDebugPresets) / sizeof(kPhaseDebugPresets[0]);
+    g_phase_debug_preset = (g_phase_debug_preset + 1U) % preset_count;
+    EspRecon_SetPhaseDebug(&kPhaseDebugPresets[g_phase_debug_preset]);
 }
