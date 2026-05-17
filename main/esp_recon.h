@@ -176,6 +176,8 @@ void EspRecon_SetMode(esp_recon_mode_t mode);
 esp_recon_mode_t EspRecon_GetMode(void);
 bool EspRecon_SetPlaybackRateHz(uint32_t sample_rate_hz);
 uint32_t EspRecon_GetPlaybackRateHz(void);
+bool EspRecon_SetOutputGainX1000(uint32_t gain_x1000);
+uint32_t EspRecon_GetOutputGainX1000(void);
 void EspRecon_SetPhaseDebug(const esp_recon_phase_debug_t *config);
 void EspRecon_GetPhaseDebug(esp_recon_phase_debug_t *config);
 void EspRecon_CyclePhaseDebug(void);

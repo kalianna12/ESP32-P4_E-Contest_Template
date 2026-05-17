@@ -36,6 +36,7 @@ constexpr uint32_t kAmdfClosePercent = 115U;
 constexpr uint32_t kMinLockedCycles = 3U;
 constexpr uint32_t kMaxLockedHarmonics = 100U;
 constexpr uint32_t kYieldEveryBins = 16U;
+constexpr uint32_t kReconOutputGainDefaultX1000 = 1000U;
 
 #ifndef ESP_RECON_HARMONIC_SEARCH_SPAN
 #define ESP_RECON_HARMONIC_SEARCH_SPAN 3U
@@ -49,6 +50,7 @@ static esp_recon_harmonic_t g_last_harmonics[ESP_RECON_HARMONIC_MAX] = {};
 static uint32_t g_last_harmonic_count = 0;
 static esp_recon_mode_t g_recon_mode = ESP_RECON_MODE_AUTO;
 static uint32_t g_recon_dds_playback_rate_hz = DDS_DIRECT_DEFAULT_PLAYBACK_RATE_HZ;
+static uint32_t g_recon_output_gain_x1000 = kReconOutputGainDefaultX1000;
 static esp_recon_phase_debug_t g_phase_debug = {
     ESP_RECON_PHASE_COMP_SIGN,
     ESP_RECON_PHASE_REFERENCE_DEG_X10,
@@ -1039,6 +1041,30 @@ static uint32_t RoundedPlaybackCycles(uint32_t freq_hz,
         playback_rate_hz);
 }
 
+static bool IsOutputGainValid(uint32_t gain_x1000)
+{
+    return gain_x1000 == 250U ||
+           gain_x1000 == 500U ||
+           gain_x1000 == 1000U ||
+           gain_x1000 == 2000U ||
+           gain_x1000 == 4000U;
+}
+
+static int32_t ReconTargetPeak(void)
+{
+    uint32_t target_peak =
+        static_cast<uint32_t>((static_cast<uint64_t>(ESP_RECON_TARGET_PEAK) *
+                               g_recon_output_gain_x1000 + 500U) /
+                              1000U);
+    if (target_peak == 0U) {
+        target_peak = 1U;
+    }
+    if (target_peak > 32767U) {
+        target_peak = 32767U;
+    }
+    return static_cast<int32_t>(target_peak);
+}
+
 static bool BuildPeriodicWaveFromHarmonics(const esp_recon_result_t *out,
                                            float *dst,
                                            uint32_t dst_capacity,
@@ -1297,7 +1323,7 @@ bool EspRecon_BuildFromCapture(const int16_t *capture,
     }
 #endif
 
-    NormalizeToInt16(output_src, output_count, ESP_RECON_TARGET_PEAK, w->wave,
+    NormalizeToInt16(output_src, output_count, ReconTargetPeak(), w->wave,
                      &out->out_min, &out->out_max);
     out->sample_count = output_count;
     out->out_vpp = out->out_max - out->out_min;
@@ -1400,6 +1426,20 @@ bool EspRecon_SetPlaybackRateHz(uint32_t sample_rate_hz)
 uint32_t EspRecon_GetPlaybackRateHz(void)
 {
     return g_recon_dds_playback_rate_hz;
+}
+
+bool EspRecon_SetOutputGainX1000(uint32_t gain_x1000)
+{
+    if (!IsOutputGainValid(gain_x1000)) {
+        return false;
+    }
+    g_recon_output_gain_x1000 = gain_x1000;
+    return true;
+}
+
+uint32_t EspRecon_GetOutputGainX1000(void)
+{
+    return g_recon_output_gain_x1000;
 }
 
 void EspRecon_SetPhaseDebug(const esp_recon_phase_debug_t *config)
